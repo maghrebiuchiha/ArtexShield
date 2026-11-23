@@ -69,20 +69,67 @@ ODD_METHODS = {"TRACE", "TRACK", "CONNECT", "DEBUG"}
 SOFT_METHODS = {"PROPFIND"}
 
 PAYLOADS = [(re.compile(p, re.I), label) for p, label in [
-    # Last branch: a tautology after OR/AND, numeric (or 1=1) or quoted with or without spaces ('or'1'='1).
-    (r"union\s+(all\s+)?select|information_schema|\b(pg_)?sleep\s*\(\s*\d|benchmark\s*\(|waitfor\s+delay"
-     r"|'\s*(or|and)\s+['\d]|xp_cmdshell|extractvalue\s*\(|updatexml\s*\("
+    # Search boxes take free text, so each SQL form needs the part that prose
+    # does not have. A book title, a recipe or a question about SQL is not
+    # an injection; the injection itself still is.
+    # - UNION SELECT followed by what a select list starts with (NULL, a
+    #   number list, @@, a quote, a call, a column then FROM), not by a word
+    #   ("student union select committee"). Straight after a breakout (a
+    #   quote, a bracket or a number before UNION) any select list counts,
+    #   and so does INTO OUTFILE anywhere.
+    # - FROM information_schema, not the bare name ("information_schema.tables size").
+    # - SLEEP( and BENCHMARK( as MySQL needs them, with no space before the
+    #   bracket and not a method (`time.sleep(5)`); a year in brackets after
+    #   "sleep" is a book ("Why We Sleep (2017)"). pg_sleep allows the space.
+    # - WAITFOR DELAY followed by its quoted time, not by "sql server example".
+    # - A quote closing a string, then OR/AND, then a comparison between
+    #   literals ('1'='1, 1=1, a LIKE), a comment, a function call, TRUE/FALSE, or a
+    #   number left for the app's own closing quote to finish (`' or '1`,
+    #   `' or '1--`). Quoted titles joined by "and" have none. A bare number
+    #   left dangling at the end (`' or 1`) is not counted: that is how prose
+    #   ends ("'Brave New World' or 1984"), and in SQL it is a syntax error.
+    #   Nor is a column on the left (`status='open' and owner='sam'`): that is
+    #   a filter someone typed, and tautologies compare literals.
+    # - A tautology after OR/AND: numeric (or 1=1) or quoted, spaced or not ('or'1'='1).
+    (r"union\s+(?:all\s+|distinct\s+)?select\s*(?:null\b|\d+\s*(?:[,)#;'\"\x00]|--|/\*|from\b|into\b|$)|\*|@@"
+     r"|0x[0-9a-f]|['\"(]|[\w$]+(?:\(|\s*\)*\s*(?:,|--|#|/\*|;))|[\w$.]+\s+from\b)"
+     r"|(?:['\")]|\b\d+)\s*union\s+(?:all\s+|distinct\s+)?select\b|\binto\s+(?:out|dump)file\b"
+     r"|from\s+information_schema\b|(?<![\w.])sleep\(\s*\d|(?<![\w.])pg_sleep\s*\(\s*\d"
+     r"|(?<![\w.])benchmark\(\s*\d+\s*,|waitfor\s+(?:delay|time)\s+['\"]"
+     r"|['\"]\s*\)?\s*(?:or|and)\s+\(?\s*(?:(?:['\"][^'\"]{0,20}['\"]|\d+)\s*(?:=|<>|!=|[<>]\s*\d)|\d+\s*\)*\s*(?:--|#|/\*|;)"
+     r"|\d+\s+(?:or|and)\s|\d+\s+like\s+\d|['\"][^'\"\s]{0,20}['\"]\s+like\s+['\"]"
+     r"|(?:true|false)\s*\)*\s*(?:--|#|/\*|;|\x00|$)|[\w$]+\(|['\"]\d+[^'\"\x00]{0,20}(?:\x00|$))"
+     r"|xp_cmdshell|extractvalue\s*\(|updatexml\s*\("
      r"|\b(?:or|and)(?:\s+\d+\s*=\s*\d+|\s*(?P<q>['\"])[^'\"]{0,20}(?P=q)\s*=\s*(?P=q))", "payload:sqli"),
-    # Last branch: any DOM event handler, but only where an attribute can be:
-    # inside a tag, or straight after a quote that closes one. Without that
-    # `?online=1` and a forum search for "use onclick= in html" would match.
-    (r"<script|javascript:|on(error|load|mouseover|focus)\s*=|<svg[\s/]|<iframe"
-     r"|(?:<[a-z][^<>]{0,256}[\s/\"']|[\"']\s*)on(?:abort|animation(?:end|iteration|start)|auxclick|before\w+|blur|cancel|canplay\w*|change|click"
-     r"|close|contextmenu|copy|cut|dblclick|drag\w*|drop|ended|error|focus(?:in|out)?|formdata|hashchange|input"
-     r"|invalid|key(?:down|press|up)|load\w*|message|mouse\w+|page(?:hide|show)|paste|pointer\w+|popstate|reset"
-     r"|resize|scroll\w*|search|select\w*|show|submit|toggle|touch\w+|transition\w+|unload|wheel)\s*=",
+    # The same for markup: a tag or URL scheme counts with code behind it.
+    # - <script with a src, or with code (a call, an assignment) or a closing
+    #   </script> after it; "how to use <script tags" and "the <script> tag" have neither.
+    # - javascript: followed by code (a call, backtick, =, ; or //), not by a
+    #   book subtitle ("javascript: the good parts"). javascript:void(0) alone does nothing.
+    # - An event handler with code after the =: the four common ones anywhere
+    #   but after a dot (`window.onload = ...` is a script, not an attribute),
+    #   any handler inside a tag or straight after a quote that closes one.
+    #   Without the context `?online=1` would match; without the code
+    #   "img onerror= fallback image" would.
+    # - <iframe with a src or srcdoc; a bare <iframe> or <svg> is a question about HTML.
+    (r"<script\b[^<>]{0,256}\bsrc\s*=|<script\b[^<>]{0,256}>\s*(?:[\w.$\[\]'\"]{1,64}(?:[(`]|\s*=)|</script)"
+     r"|<script\b[^<>]{0,256}>[\s\S]{0,256}?</script"
+     r"|javascript\s*:(?!\s*void\s*\(\s*0\s*\)\s*;?\s*(?:$|[\s\"'>\x00]))\s*\S{0,64}?[(`=;/]"
+     r"|(?<![\w.])on(?:error|load|mouseover|focus)\s*=\s*\S{0,64}?[(`=;]"
+     r"|(?:<[a-z][^<>]{0,256}[\s/\"']|[\"']\s*)on(?:abort|animation(?:end|iteration|start)|auxclick|before\w+|begin"
+     r"|blur|cancel|canplay\w*|change|click|close|contextmenu|copy|cut|dblclick|drag\w*|drop|end|ended|error|finish"
+     r"|focus(?:in|out)?|formdata|hashchange|input|invalid|key(?:down|press|up)|load\w*|message|mouse\w+"
+     r"|page(?:hide|show)|paste|pointer\w+|popstate|repeat|reset|resize|scroll\w*|search|select\w*|show|start"
+     r"|submit|toggle|touch\w+|transition\w+|unload|wheel)\s*=\s*\S{0,64}?[(`=;]"
+     r"|<iframe\b[^<>]{0,256}\bsrc(?:doc)?\s*=",
      "payload:xss"),
-    (r"\.\./\.\./|\.\.\\\.\.\\|/etc/(passwd|shadow)|win\.ini|/proc/self/", "payload:traversal"),
+    # Three levels up, or up into a place worth reading (/etc, the Windows
+    # directory, WEB-INF, a dotfile), or two levels up to a server-side or
+    # config file. Two levels to a module ("cannot find module '../../utils'",
+    # "../../theme.css") is how code imports things.
+    (r"(?:\.\.[/\\]){3}|(?:\.\.[/\\])+(?:etc|proc|sys|boot|windows|winnt|inetpub|web-inf|root|\.env|\.git|\.ssh|\.aws"
+     r"|\.htpasswd)\b|(?:\.\.[/\\]){2}[\w./\\-]{0,128}?\.(?:php\d?|phtml|aspx?|jsp|cgi|ini|conf|cfg|config|xml|ya?ml"
+     r"|env|log|bak|sql|key|pem)\b|/etc/(?:passwd|shadow)|win\.ini|/proc/self/", "payload:traversal"),
     # Shell separators also join ordinary lists (`fields=name|id|price`, `color=red;id=5`),
     # so a short word after a single separator counts only with an argument behind it.
     # Command substitution and doubled operators have no such innocent reading.
