@@ -10,14 +10,16 @@ import statistics
 import threading
 import time
 from collections import OrderedDict, deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from .signatures import (ASSESSMENT_UA, BROWSER_UA, CRAWLER_UA, HARD_UA, MISSING_SENSITIVE, ODD_METHODS,
                          OOB, PAYLOADS, RECON_PATHS, SENSITIVE_PATHS, SOFT_METHODS, SOFT_UA)
-from .util import (_decode, _extension, _hop_ip, _in_nets, _induced, _nets, _norm_path, _prefixes,
-                   _track_key, _ts, _under, _url_text, _usable_ip)
+from .util import (_decode, _extension, _file_lock, _hop_ip, _in_nets, _induced, _is_network, _nets, _norm_path,
+                   _prefixes, _read_state, _strip_sql_comments, _track_key, _ts, _under, _url_text, _usable_ip,
+                   _wider, _write_atomic)
 
 _Hit = Tuple[str, float, bool]       # label, points, soft?
 _MISSING_MEMORY = 128                # missing paths remembered per client, so repeats are not recounted
@@ -88,10 +90,30 @@ class Config:
     # signal that one request is refused. True: score it like any other, which
     # lets anyone who can show your visitors an image tag get them blocked.
     score_induced: bool = False
+    max_blocks: int = 100000         # most blocks held; past it the ones nearest expiry go first
+    # IPv6: one host can own a /56 or a /48 and move to a fresh /64 for every
+    # request. When this many /64s inside one /56 are blocked at once the /56 is
+    # blocked, and the same again from /56 to /48. 0 switches it off.
+    v6_escalate_after: int = 8
+    # Guessing below enum_404_threshold a minute used to cost nothing for ever.
+    # A client gets this many newly missing paths per slow_enum_window; each one
+    # past that scores slow_enum_points. 0 switches it off.
+    slow_enum_budget: int = 60
+    slow_enum_window: float = 3600.0
+    slow_enum_points: float = 10.0
 
     def __post_init__(self):
         if self.mode not in ("monitor", "enforce"):
             raise ValueError("mode must be 'monitor' or 'enforce'")
+        for name, least in (("rate_limit", 1), ("cadence_samples", 2), ("enum_404_threshold", 1), ("max_tracks", 1),
+                            ("max_blocks", 1), ("v6_escalate_after", 0), ("slow_enum_budget", 0)):
+            if getattr(self, name) < least:
+                raise ValueError(f"{name} must be at least {least}")
+        if self.v6_escalate_after == 1:
+            raise ValueError("v6_escalate_after must be 0 (off) or at least 2")
+        for name in ("half_life", "rate_window", "enum_window", "slow_enum_window", "block_ttl"):
+            if not getattr(self, name) > 0:
+                raise ValueError(f"{name} must be positive")
         _prefixes(self.exempt_paths, "exempt_paths")
         _prefixes(self.enum_ignore_prefixes, "enum_ignore_prefixes")
         if not 0 < self.throttle_score <= self.block_score:
@@ -125,15 +147,16 @@ class Decision:
 
 
 class _Track:
-    __slots__ = ("hard", "soft_points", "updated", "times", "not_found", "missing", "soft", "strikes",
+    __slots__ = ("hard", "soft_points", "updated", "times", "not_found", "slow", "missing", "soft", "strikes",
                  "throttled_until")
 
-    def __init__(self, now: float):
+    def __init__(self, now: float, history: int = 512, slow_budget: int = 0):
         self.hard = 0.0              # points from signals that repeat on every hit
         self.soft_points = 0.0       # points from once-per-half-life signals, capped at Config.soft_cap
         self.updated = now
-        self.times: deque = deque(maxlen=512)
+        self.times: deque = deque(maxlen=history)       # sized so that the flood limit can be reached
         self.not_found: deque = deque(maxlen=512)       # when each newly missing path was first asked for
+        self.slow: deque = deque(maxlen=max(slow_budget, 1))        # the same, kept for the hourly allowance
         self.missing: "OrderedDict[int, float]" = OrderedDict()     # missing paths already counted -> last asked
         self.soft: Dict[str, float] = {}
         self.strikes = 0
@@ -150,8 +173,16 @@ class Shield:
         self.clock = clock
         self.log = logging.getLogger(self.cfg.logger)
         self._lock = threading.RLock()
+        self._local = threading.local()             # what this thread queued under the lock: see _state()
         self._tracks: "OrderedDict[str, _Track]" = OrderedDict()
-        self._blocks: Dict[str, float] = {}
+        self._history = max(self.cfg.rate_limit, self.cfg.cadence_samples)
+        self._blocks: Dict[str, float] = {}         # network -> expiry
+        self._members: Dict[str, Set[str]] = {}     # wider IPv6 prefix -> blocked networks inside it
+        self._wide = 0                              # blocks wider than a /64 now held
+        self._pruned = self.clock()
+        self._export_lock = threading.Lock()        # one writer of the block file per process
+        self._export_due: Optional[float] = None    # when the earliest entry in that file expires
+        self._timer: Optional[threading.Timer] = None
         self._trusted = _nets(self.cfg.trusted_proxies)
         self._allowed = _nets(self.cfg.allow_cidrs)
         self._exempt = _prefixes(self.cfg.exempt_paths, "exempt_paths")
@@ -161,6 +192,42 @@ class Shield:
         self._tls_deny = {str(v).lower() for v in self.cfg.tls_denylist}
         self.stats = {"requests": 0, "throttled": 0, "blocked": 0, "friendly": 0, "unidentified": 0, "refused": 0}
         self._unidentified_warned: Optional[float] = None
+
+    # ---- lock and delivery ----------------------------------------------
+    @contextmanager
+    def _state(self):
+        """Hold the lock for bookkeeping. Events and block-file writes asked for
+        inside are queued and carried out once it is released: a slow log
+        handler, callback or disk must not make every other request wait."""
+        local = self._local
+        with self._lock:
+            local.depth = getattr(local, "depth", 0) + 1
+            try:
+                yield
+            finally:
+                local.depth -= 1
+        if not local.depth:
+            self._deliver()
+
+    def _deliver(self) -> None:
+        local = self._local
+        events, local.events = getattr(local, "events", None), None
+        forget, local.export = getattr(local, "export", None), None
+        for event in events or ():
+            self.log.warning(json.dumps(event, separators=(",", ":")))
+            if self.cfg.on_event:
+                try:
+                    self.cfg.on_event(event)
+                except Exception:                   # a broken hook must not take the site down
+                    self.log.exception("on_event callback failed")
+        if forget is not None:
+            self._export_safely(forget)
+
+    def _want_export(self, forget: Iterable[str] = ()) -> None:
+        """Rewrite the block file once the lock is released, leaving out `forget`."""
+        if self.cfg.blocklist_export_path:
+            local = self._local
+            local.export = (getattr(local, "export", None) or set()) | set(forget)
 
     # ---- client address -------------------------------------------------
     def client_ip(self, remote_addr: str, forwarded_for: Optional[str] = None) -> str:
@@ -201,8 +268,11 @@ class Shield:
         m = ASSESSMENT_UA.search(ua)
         hits: List[_Hit] = []
 
-        with self._lock:
+        with self._state():
             self.stats["requests"] += 1
+            if self._export_due is not None and now >= self._export_due:
+                self._export_due = None             # an entry in the block file has expired: one rewrite, not one per request
+                self._want_export()
 
             # IFF 1: operator allowlists.
             if exempt:
@@ -239,7 +309,7 @@ class Shield:
         # lock: a large request must not make every other one wait.
         seen = self._scan(method, npath, query, h, ua)
 
-        with self._lock:
+        with self._state():
             if self._blocked(key, now):
                 if enforce:                         # blocked by another request in the meantime
                     return Decision("block", enforce, cfg.block_score, ["blocklist"], ref, ip)
@@ -291,14 +361,14 @@ class Shield:
             return
         key = _track_key(ip)
         hits: List[_Hit] = []
-        if RECON_PATHS.match(npath):
+        if RECON_PATHS.search(npath):
             hits.append(("recon:probe-404", 25.0, False))
         if MISSING_SENSITIVE.search(npath) and not SENSITIVE_PATHS.search(npath):   # not twice for /.env.bak
             hits.append(("decoy:sensitive-file-probe", 60.0, False))
         guess = not _under(path, self._enum_skip) and _extension(npath) not in self._enum_skip_ext
-        with self._lock:
+        with self._state():
             t = self._tracks.get(key)
-            if t is None or key in self._blocks:
+            if t is None or self._blocked(key, now):
                 return
             self._decay(t, now)
             # Enumeration is many different missing paths. Asking again for one
@@ -306,6 +376,12 @@ class Shield:
             # page) adds nothing, however often it happens.
             if guess and self._newly_missing(t, npath, now):
                 t.not_found.append(now)
+                # The allowance for the longer window: full, and its oldest
+                # entry still inside the window, means this one is past it.
+                if cfg.slow_enum_budget:
+                    if len(t.slow) == t.slow.maxlen and now - t.slow[0] <= cfg.slow_enum_window:
+                        hits.append(("behavior:slow-enumeration", cfg.slow_enum_points, False))
+                    t.slow.append(now)
             while t.not_found and now - t.not_found[0] > cfg.enum_window:
                 t.not_found.popleft()
             if len(t.not_found) >= cfg.enum_404_threshold:
@@ -366,8 +442,10 @@ class Shield:
 
         # Payloads in the URL; out-of-band markers in headers as well.
         target = _url_text(npath, query)
-        found = [label for rx, label in PAYLOADS + OOB if rx.search(target)]
-        head_blob = _decode(" ".join(v[:2048] for k, v in h.items() if k != "cookie"))
+        plain = _strip_sql_comments(target)         # UNION/**/SELECT reads as UNION SELECT
+        found = [label for rx, label in PAYLOADS + OOB
+                 if rx.search(target) or (plain is not target and rx.search(plain))]
+        head_blob = _decode(" ".join(h.values()))   # every header, whole, cookies included
         found += [label for rx, label in OOB if label not in found and rx.search(head_blob)]
         hits += [(label, 50.0, False) for label in found]
 
@@ -434,69 +512,167 @@ class Shield:
         t.strikes += 1
         self.stats["blocked"] += 1
         ttl = min(self.cfg.block_ttl * (2 ** (t.strikes - 1)), self.cfg.max_block_ttl)
-        self._blocks[key] = now + ttl
+        if now - self._pruned >= 60 or len(self._blocks) >= self.cfg.max_blocks:
+            self._prune_blocks(now)
+        self._set_block(key, now + ttl)
         t.hard = t.soft_points = 0.0     # served its sentence when the block expires
         t.throttled_until = 0.0
         t.not_found.clear()
-        if self.cfg.blocklist_export_path:
-            try:
-                self.export_blocklist(self.cfg.blocklist_export_path, self.cfg.blocklist_export_format)
-            except OSError as e:
-                self.log.error("blocklist export failed: %s", e)
+        self._want_export(self._escalate(key, now))
+
+    def _escalate(self, key: str, now: float) -> List[str]:
+        """Enough blocked networks inside one wider IPv6 prefix: block the prefix
+        and let that one entry stand for them. Returns the entries it replaced."""
+        replaced: List[str] = []
+        need, parent = self.cfg.v6_escalate_after, _wider(key)
+        while need and parent and len(self._members.get(parent, ())) >= need:
+            for inside in list(self._members[parent]):
+                self._drop_block(inside)
+                replaced.append(inside)
+            self._set_block(parent, now + self.cfg.block_ttl)
+            self._emit("block", parent, self.cfg.block_score, ["behavior:network-rotation"], "-", "-", "", "-",
+                       self.cfg.mode == "enforce")
+            parent = _wider(parent)
+        return replaced
+
+    def _set_block(self, key: str, until: float) -> None:
+        if key not in self._blocks:
+            parent = _wider(key)
+            if parent:
+                self._members.setdefault(parent, set()).add(key)
+            self._wide += not key.endswith("/64") and ":" in key
+        self._blocks[key] = until
+
+    def _drop_block(self, key: str) -> bool:
+        if self._blocks.pop(key, None) is None:
+            return False
+        parent = _wider(key)
+        inside = self._members.get(parent) if parent else None
+        if inside is not None:
+            inside.discard(key)
+            if not inside:
+                del self._members[parent]
+        self._wide -= not key.endswith("/64") and ":" in key
+        return True
+
+    def _prune_blocks(self, now: float) -> None:
+        """Drop expired blocks, and when the table is full make room by dropping
+        the tenth nearest to expiry: they have served most of their time."""
+        self._pruned = now
+        for key in [k for k, until in self._blocks.items() if until <= now]:
+            self._drop_block(key)
+        over = len(self._blocks) - self.cfg.max_blocks + 1
+        if over > 0:
+            nearest = sorted(self._blocks.items(), key=lambda kv: kv[1])
+            for key, _ in nearest[:max(over, self.cfg.max_blocks // 10)]:
+                self._drop_block(key)
 
     # ---- command post ------------------------------------------------------
     def blocklist(self) -> Dict[str, float]:
         """Active blocks: network -> expiry (unix time)."""
         now = self.clock()
         with self._lock:
-            self._blocks = {k: v for k, v in self._blocks.items() if v > now}
+            for key in [k for k, until in self._blocks.items() if until <= now]:
+                self._drop_block(key)
             return dict(self._blocks)
 
     def unblock(self, ip: str) -> bool:
-        with self._lock:
-            self._tracks.pop(_track_key(ip), None)
-            return self._blocks.pop(_track_key(ip), None) is not None
+        """Lift the block on `ip`, including a wider IPv6 prefix that covers it."""
+        with self._state():
+            key = _track_key(ip)
+            self._tracks.pop(key, None)
+            dropped = [k for k in self._covering(key, wide=True) if self._drop_block(k)]
+            if dropped:
+                self._want_export(dropped)
+            return bool(dropped)
 
     def export_blocklist(self, path: str, fmt: str = "nginx") -> int:
         """Write active blocks for the edge to enforce (nginx: `include` the file
-        inside http/server and reload). Written atomically."""
-        entries = sorted(self.blocklist())
-        lines = [f"deny {e};" if fmt == "nginx" else e for e in entries]
-        tmp = f"{path}.{os.getpid()}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + ("\n" if lines else ""))
-        os.replace(tmp, path)
-        return len(entries)
+        inside http/server and reload). Returns the number of entries written.
+
+        Every worker process writes the same file, so each one merges: entries
+        other workers wrote stay until they expire. Expiry times are kept next
+        to it in `<path>.state`, and writers take turns on `<path>.lock`. Both
+        files are replaced atomically."""
+        return self._export(path, fmt, ())
+
+    def _export(self, path: str, fmt: str, forget: Iterable[str]) -> int:
+        mine, now, forget = self.blocklist(), self.clock(), set(forget)
+        with self._export_lock, _file_lock(path + ".lock"):
+            merged = {k: until for k, until in _read_state(path + ".state").items()
+                      if until > now and k not in forget}
+            for key, until in mine.items():
+                if _is_network(key):
+                    merged[key] = max(until, merged.get(key, 0.0))
+            _write_atomic(path + ".state", json.dumps(merged, sort_keys=True))
+            lines = [f"deny {key};" if fmt == "nginx" else key for key in sorted(merged)]
+            _write_atomic(path, "\n".join(lines) + ("\n" if lines else ""))
+            if path == self.cfg.blocklist_export_path:
+                self._export_due = min(merged.values(), default=None)
+                self._arm_timer()
+        return len(merged)
+
+    def _export_safely(self, forget: Iterable[str] = ()) -> None:
+        try:
+            self._export(self.cfg.blocklist_export_path, self.cfg.blocklist_export_format, forget)
+        except OSError as e:
+            self.log.error("blocklist export failed: %s", e)
+            self._export_due = self.clock() + 60    # try again in a minute, not on every request
+
+    def _arm_timer(self) -> None:
+        """Rewrite the file when its earliest entry expires, even if no request
+        arrives to notice. Needs a real clock; with an injected one the check
+        at the top of check() does the same on the next request."""
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        if self._export_due is None or self.clock is not time.time:
+            return
+        self._timer = threading.Timer(max(self._export_due - time.time(), 0.0) + 0.05, self._export_safely)
+        self._timer.daemon = True
+        self._timer.start()
 
     def _emit(self, action, ip, score, labels, method, path, ua, ref, enforced) -> None:
         event = {"ts": datetime.fromtimestamp(self.clock(), timezone.utc).isoformat(timespec="seconds"),
                  "action": action, "enforced": enforced, "ip": ip, "score": round(score, 1),
                  "hits": labels, "method": method, "path": path[:512], "ua": ua[:256], "ref": ref}
-        self.log.warning(json.dumps(event, separators=(",", ":")))
-        if self.cfg.on_event:
-            try:
-                self.cfg.on_event(event)
-            except Exception:                       # a broken hook must not take the site down
-                self.log.exception("on_event callback failed")
+        local = self._local
+        if getattr(local, "events", None) is None:
+            local.events = []
+        local.events.append(event)
+        if not getattr(local, "depth", 0):          # not under the lock: nothing to wait for
+            self._deliver()
 
     # ---- tracking ------------------------------------------------------------
     def _track(self, key: str, now: float) -> _Track:
         t = self._tracks.get(key)
         if t is None:
-            t = self._tracks[key] = _Track(now)
+            t = self._tracks[key] = _Track(now, self._history, self.cfg.slow_enum_budget)
             while len(self._tracks) > self.cfg.max_tracks:
                 self._tracks.popitem(last=False)
         else:
             self._tracks.move_to_end(key)
         return t
 
+    def _covering(self, key: str, wide: bool = False) -> List[str]:
+        """`key` and, for IPv6, the wider prefixes a block on it could sit under.
+        Those cost two address computations, so they are skipped while no wide
+        block exists unless `wide` asks for them."""
+        keys = [key]
+        if ":" in key and (wide or self._wide):
+            while keys[-1]:
+                keys.append(_wider(keys[-1]))
+            keys.pop()
+        return keys
+
     def _blocked(self, key: str, now: float) -> bool:
-        until = self._blocks.get(key)
-        if until is None:
-            return False
-        if until > now:
-            return True
-        del self._blocks[key]
+        for k in self._covering(key):
+            until = self._blocks.get(k)
+            if until is None:
+                continue
+            if until > now:
+                return True
+            self._drop_block(k)
         return False
 
     def _decay(self, t: _Track, now: float) -> None:

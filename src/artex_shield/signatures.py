@@ -54,10 +54,14 @@ MISSING_SENSITIVE = re.compile(
     r"|\.(bak|old|swp|orig)$",
     re.I)
 # Recon paths: scored only when YOUR app answers 404, so real routes are safe.
+# Names that mean one thing are recognised at any depth (/api/v1/openapi.json).
+# Plain words a site may use for its own pages count only at the root. Use with
+# search(); each branch ends at a segment boundary instead of consuming the rest.
 RECON_PATHS = re.compile(
-    r"^/(swagger(-ui)?(\.json|\.yaml|/.*)?|openapi\.(json|yaml)|(v[23]/)?api-docs.*|graphql|graphiql"
-    r"|actuator(/.*)?|admin(/.*)?|console|debug(/.*)?|metrics|wp-login\.php|wp-admin(/.*)?|xmlrpc\.php"
-    r"|phpmyadmin(/.*)?|manager/html|druid(/.*)?|nacos(/.*)?|jenkins(/.*)?|solr(/.*)?|\.well-known/security\.txt)$",
+    r"^/(?:admin|debug)(?:/|$)|^/(?:console|metrics)$"
+    r"|/(?:swagger(?:-ui)?(?:\.json$|\.yaml$|/|$)|openapi\.(?:json|yaml)$|(?:v[23]/)?api-docs|graphi?ql$"
+    r"|actuator(?:/|$)|wp-login\.php$|wp-admin(?:/|$)|xmlrpc\.php$|phpmyadmin(?:/|$)|manager/html$"
+    r"|druid(?:/|$)|nacos(?:/|$)|jenkins(?:/|$)|solr(?:/|$)|\.well-known/security\.txt$)",
     re.I)
 ODD_METHODS = {"TRACE", "TRACK", "CONNECT", "DEBUG"}
 # Scanners use it, but so do Windows and Office whenever someone opens a link
@@ -65,22 +69,48 @@ ODD_METHODS = {"TRACE", "TRACK", "CONNECT", "DEBUG"}
 SOFT_METHODS = {"PROPFIND"}
 
 PAYLOADS = [(re.compile(p, re.I), label) for p, label in [
+    # Last branch: a tautology after OR/AND, numeric (or 1=1) or quoted with or without spaces ('or'1'='1).
     (r"union\s+(all\s+)?select|information_schema|\b(pg_)?sleep\s*\(\s*\d|benchmark\s*\(|waitfor\s+delay"
-     r"|'\s*(or|and)\s+['\d]|xp_cmdshell|extractvalue\s*\(|updatexml\s*\(", "payload:sqli"),
-    (r"<script|javascript:|on(error|load|mouseover|focus)\s*=|<svg[\s/]|<iframe", "payload:xss"),
+     r"|'\s*(or|and)\s+['\d]|xp_cmdshell|extractvalue\s*\(|updatexml\s*\("
+     r"|\b(?:or|and)(?:\s+\d+\s*=\s*\d+|\s*(?P<q>['\"])[^'\"]{0,20}(?P=q)\s*=\s*(?P=q))", "payload:sqli"),
+    # Last branch: any DOM event handler, but only where an attribute can be:
+    # inside a tag, or straight after a quote that closes one. Without that
+    # `?online=1` and a forum search for "use onclick= in html" would match.
+    (r"<script|javascript:|on(error|load|mouseover|focus)\s*=|<svg[\s/]|<iframe"
+     r"|(?:<[a-z][^<>]{0,256}[\s/\"']|[\"']\s*)on(?:abort|animation(?:end|iteration|start)|auxclick|before\w+|blur|cancel|canplay\w*|change|click"
+     r"|close|contextmenu|copy|cut|dblclick|drag\w*|drop|ended|error|focus(?:in|out)?|formdata|hashchange|input"
+     r"|invalid|key(?:down|press|up)|load\w*|message|mouse\w+|page(?:hide|show)|paste|pointer\w+|popstate|reset"
+     r"|resize|scroll\w*|search|select\w*|show|submit|toggle|touch\w+|transition\w+|unload|wheel)\s*=",
+     "payload:xss"),
     (r"\.\./\.\./|\.\.\\\.\.\\|/etc/(passwd|shadow)|win\.ini|/proc/self/", "payload:traversal"),
     # Shell separators also join ordinary lists (`fields=name|id|price`, `color=red;id=5`),
     # so a short word after a single separator counts only with an argument behind it.
     # Command substitution and doubled operators have no such innocent reading.
-    (r"[;|&`]\s*whoami\b"
-     r"|[;|&`]\s*(?:cat|id|uname|nc|bash|sh)\s+[-/.~$]"
-     r"|[;|&`]\s*(?:curl|wget)\s+\S"
-     r"|(?:&&|\|\||`)\s*(?:cat|id|uname|curl|wget|nc|bash|sh)\b"
-     r"|\$\((?:id|whoami|uname|curl|wget)", "payload:cmdi"),
-    (r"\{\{\s*\d+\s*\*\s*\d+\s*\}\}|\$\{\s*\d+\s*\*\s*\d+\s*\}|<%=\s*\d+\s*\*", "payload:ssti"),
+    # A line break separates commands too, and the same rule holds: a list can
+    # be one item to a line. After a separator only spaces and tabs are skipped,
+    # since skipping line breaks as well would rescan a run of them from every
+    # position.
+    (r"[;|&`\n\r][ \t]*whoami\b"
+     r"|[;|&`\n\r][ \t]*(?:cat|id|uname|nc|bash|sh|ls)\s+[-/.~$]"
+     r"|[;|&`\n\r][ \t]*(?:curl|wget)\s+\S"
+     r"|[;|&`\n\r][ \t]*(?:sleep\s+\d|ping\s+-[cnw])"
+     r"|(?:&&|\|\|)[ \t]*(?:cat|id|uname|curl|wget|nc|bash|sh|ls|sleep|ping)\b"
+     r"|`[ \t]*(?:cat|id|uname|curl|wget|nc|bash|sh)\b"
+     r"|\$\([ \t]*(?:cat|id|whoami|uname|curl|wget|nc|bash|sh|ls|sleep|ping)\b", "payload:cmdi"),
+    # Arithmetic probes with or without quotes, then the objects template
+    # engines expose, bare or being dug into. `{{email}}` from a mail merge
+    # that did not run is neither, nor is `{{ config.site_name }}`.
+    (r"\{\{\s*['\"]?\d+['\"]?\s*\*\s*['\"]?\d+['\"]?\s*\}\}|\$\{\s*\d+\s*\*\s*\d+\s*\}|<%=\s*\d+\s*\*"
+     r"|#\{\s*\d+\s*\*\s*\d+\s*\}|\$\{\s*T\("
+     r"|\{\{\s*(?:config|self|request|cycler|joiner|namespace|lipsum|url_for|get_flashed_messages)"
+     r"\s*(?:\}\}|\[|\|\s*attr|\.\s*(?:_|items\s*\(|application|environ))",
+     "payload:ssti"),
     (r"169\.254\.169\.254|metadata\.google\.internal", "payload:ssrf-metadata"),
 ]]
-# Checked in headers too: out-of-band callbacks and Log4Shell-style lookups.
+# Checked in every header too, cookies included: out-of-band callbacks and
+# Log4Shell-style lookups. Headers are not searched for the PAYLOADS above:
+# a Referer or cookie repeats on every request, so one innocent match there
+# would score a visitor again and again.
 OOB = [(re.compile(p, re.I), label) for p, label in [
     (r"\$\{\s*(jndi|\$\{|lower:|upper:|env:|sys:|::-)", "payload:jndi"),
     (r"(?<=[a-z0-9-])\.(?:oast\.(?:fun|pro|live|site|online|me)|interact\.sh|oastify\.com|burpcollaborator\.net)",

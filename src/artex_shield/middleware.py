@@ -53,7 +53,8 @@ class ShieldASGI:
         self.app, self.shield = app, shield
 
     async def __call__(self, scope, receive, send):
-        if scope.get("type") != "http":
+        kind = scope.get("type")
+        if kind not in ("http", "websocket"):       # lifespan and the like
             return await self.app(scope, receive, send)
         s = self.shield
         headers: Dict[str, str] = {}
@@ -66,6 +67,13 @@ class ShieldASGI:
         path = scope.get("path", "/")
         d = s.check(ip, scope.get("method", "GET"), path,
                     (scope.get("query_string") or b"").decode("latin-1"), headers)
+        if kind == "websocket":
+            # The handshake is a GET like any other, checked before the socket
+            # opens. Closing before accepting makes the server answer it 403.
+            if d.stop:
+                await receive()                     # websocket.connect
+                return await send({"type": "websocket.close", "code": 1008})
+            return await self.app(scope, receive, send)     # no status code to observe afterwards
         if d.stop:
             code, _, hdrs, body = _reply(d)
             await send({"type": "http.response.start", "status": code,
