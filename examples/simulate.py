@@ -7,6 +7,7 @@ clock. Run it to see the engagement sequence and to sanity-check tuning.
 """
 import logging
 import random
+import urllib.parse
 
 from artex_shield import Config, Shield, make_canaries
 
@@ -38,6 +39,39 @@ DOWNLOADS = ["/downloads/price-list.pdf", "/downloads/brochure-2026.pdf", "/down
              "/downloads/feedback-form-2026.zip", "/exports/customer-database.zip", "/downloads/release-notes.old",
              "/downloads/site-backup-tool.tar"]
 SITE = set(PAGES) | set(DOWNLOADS)
+# What people type into a search box: books with colons, years and quoted
+# titles, recipes with apostrophes and brackets, programming questions that
+# mention <script>, sleep(), UNION SELECT or ../../. tests/test_shield.py
+# checks the same phrases one by one.
+SEARCHES = [
+    "javascript: the good parts", "JavaScript: The Definitive Guide (7th edition)",
+    "javascript: understanding the weird parts (course)", "Why We Sleep (2017) Matthew Walker",
+    "'Salem's Lot", "'Dune' and '1984'", "'The Road' or 'Blood Meridian'", '"Catch-22" and "Slaughterhouse-Five"',
+    "Harry Potter and the Philosopher's Stone", "The Hitchhiker's Guide to the Galaxy", "'Tis: A Memoir",
+    "Charlotte's Web or Stuart Little", '"Pride and Prejudice" or "Emma"', "Don't Make Me Think (2nd edition)",
+    "O'Reilly 'Learning Python' or 'Fluent Python'", "Tolkien 'The Hobbit' and 3 other books",
+    "'Night Shift' or 'Skeleton Crew' stephen king", "Rock 'n' Roll: A Social History",
+    "'Dune' or true crime", "'It' and 'Carrie' (1976 film)",
+    "chicken tikka masala (serves 4)", "mac 'n' cheese", "grandma's apple pie", "salt & pepper squid",
+    "bake at 350°F (175°C) for 25-30 min", "1/2 cup sugar; 2 eggs; 1 tsp vanilla", "slow cooker chili | easy | 8 hours",
+    "shepherd's pie or cottage pie", "meal plan for 3 kids' and 2 adults", "fish 'n' chips", "s'mores without a campfire",
+    "'no knead' bread or focaccia", "eggs benedict & hollandaise (blender)", "sourdough starter (day 1)",
+    "'salt' and 'pepper' to taste", "brownies 9x13 (serves 12-16)", "2 eggs or 1 banana as substitute",
+    "sleep (8 hours)", "how much sleep (7-9 hours) do adults need", "benchmark (2024) gpu",
+    "student union select committee", "credit union select checking account",
+    "how to use <script tags in html", "<script async vs defer", "what does the <script> tag do",
+    "python time.sleep(5) not working", "how to sleep 5 seconds in bash", "sql union select example",
+    "sql union all select vs union", "mysql information_schema.tables size", "waitfor delay sql server example",
+    "window.onload = function vs DOMContentLoaded", "img onerror= fallback image", "<iframe> embed youtube responsive",
+    '<svg viewBox="0 0 24 24"> icon size', "jest cannot find module '../../utils'", "import styles from '../../theme.css'",
+    "difference between == and === in javascript", "rust Option<T> unwrap vs expect", "c++ std::vector<int> push_back",
+    "regex lookahead (?=...) example", "bash if [ -f file ]; then echo exists", "git log --oneline && git status",
+    'href="javascript:void(0)" meaning', "jinja2 {{ variable|default('none') }}", "flask {{ config.SECRET_KEY }} in template",
+    "find . -name '*.py' | xargs grep TODO", "python f'{name!r}' formatting", "sql where 1=1 meaning",
+    "kubectl get pods -o wide | grep Running", "node fetch('/api').then(res => res.json())", "css :not(.active) selector",
+    "powershell Get-ChildItem | Select-Object Name", "typescript Record<string, number>", "cron */5 * * * * every 5 minutes",
+    "geekbench cpu benchmark(single core)", "<button onclick= not working", "sleep sort algorithm (joke)",
+]
 # Query strings real sites see every day: paging, ids, categories, tracking
 # tags, pipe- and semicolon-separated lists, an encoded return URL.
 QUERIES = {
@@ -54,6 +88,7 @@ QUERIES = {
     "/": ["utm_source=mail&utm_campaign=autumn&id=77", "ref=partner&curl=0",
           "email=%7B%7Bemail%7D%7D&utm_source=newsletter"],      # a mail merge that did not run
 }
+QUERIES["/search"] += ["q=" + urllib.parse.quote_plus(text) for text in SEARCHES]
 
 
 class Clock:
@@ -193,6 +228,13 @@ def awkward(shield, clock, tally, canaries, rng):
         for i in range(135):
             tally.count(kind, send(shield, clock, ip, f"/archive/{copy}/{i}", BROWSER, gap=80.0))
             tally.count(kind, send(shield, clock, ip, "/products", BROWSER, query="page=2&id=5", gap=1.0))
+
+    for copy in range(6):    # the search box: book titles, recipes, programming questions, one after another
+        kind, ip = "search box, 78 phrases", f"198.19.25.{copy + 1}"
+        tally.client(kind)
+        for text in rng.sample(SEARCHES, len(SEARCHES)):
+            tally.count(kind, send(shield, clock, ip, "/search", SIGNED_IN if copy % 2 else BROWSER,
+                                   query="q=" + urllib.parse.quote_plus(text), gap=rng.uniform(5, 45)))
 
     # An IPv6 street: twenty-four households in one /56, each with its own /64.
     # Five more networks in the same /56 are scanners and get blocked; that is

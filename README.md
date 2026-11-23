@@ -161,9 +161,21 @@ Guessing slower than 15 paths a minute is held to an allowance: 60 newly missing
 Payload patterns read the decoded path and each decoded query name and value. The `?`, `&` and `=` of the query string itself are not part of that text, so `?page=2&id=5` is four plain words. They are matched twice, the second time with SQL comments turned into spaces, so `UNION/**/SELECT` reads as `UNION SELECT`.
 
 - **Command injection.** After a single `;`, `|`, `&` or line break, a short command name such as `id`, `cat` or `ls` counts only with an argument behind it (`;cat /etc/passwd`), because those characters also separate ordinary lists (`fields=name|id|price`). `whoami`, command substitution, `&&` and `||` count without one.
-- **SQL injection.** Besides the keywords, a tautology after `OR` or `AND` counts: `or 1=1`, `'or'1'='1`.
-- **XSS.** Any DOM event handler counts where an attribute can be, inside a tag or straight after a closing quote: `<details ontoggle=…>`, `" onpointerenter=…`. `?online=1` and a search for `use onclick= in html` do not.
+- **SQL injection.** Each keyword counts with the part of the attack that prose does not have, so a search box can take book titles, recipes and questions about SQL.
+  - `UNION SELECT` followed by a select list (`NULL`, `1,2,3`, `@@version`, a call, a column then `FROM`), or straight after a quote, bracket or number. Not "student union select committee".
+  - `SLEEP(5)` and `BENCHMARK(1000000,…)` written as MySQL needs them, with no space before the bracket and not as a method. Not "Why We Sleep (2017)", "sleep (8 hours)" or `time.sleep(5)`.
+  - `WAITFOR DELAY '0:0:5'` with its quoted time, and `FROM information_schema`. Not "waitfor delay sql server example" or "information_schema.tables size".
+  - After a quote, `OR`/`AND` with a comparison between literals (`'1'='1`, `1=1`, `'a' like 'a`), a comment, a function call, `TRUE`/`FALSE`, or a number left for the app's own quote to close (`' or '1`). Not quoted titles joined by "and" (`'Dune' and '1984'`), and not a filter with a column on the left (`status='open' and owner='sam'`).
+  - A tautology after `OR` or `AND` anywhere: `or 1=1`, `'or'1'='1`.
+- **XSS.** A tag or scheme counts with code behind it.
+  - `<script` with a `src`, a call or assignment after it, or a closing `</script>`. Not "how to use <script tags" or "what does the <script> tag do".
+  - `javascript:` followed by code (a call, backtick, `=`, `;` or `//`). Not "javascript: the good parts", and not `javascript:void(0)` alone.
+  - An event handler with code after the `=`: the common ones anywhere but after a dot (`window.onload = …` is a script, not an attribute), any handler inside a tag or straight after a closing quote (`<details ontoggle=alert(1)>`, `" onpointerenter=…`). Not `?online=1`, "use onclick= in html" or "img onerror= fallback image".
+  - `<iframe` with a `src` or `srcdoc`. A bare `<iframe>` or `<svg>` is a question about HTML.
+- **Path traversal.** Three levels up, or up into a place worth reading (`/etc`, `windows`, `WEB-INF`, a dotfile), or two levels up to a server-side or config file (`../../config.php`). Two levels to a module (`cannot find module '../../utils'`) is how code imports things.
 - **Template injection.** Arithmetic probes (`{{7*7}}`, `{{7*'7'}}`, `${7*7}`, `#{7*7}`) and the objects engines expose, bare or being dug into (`{{config}}`, `{{request.application…}}`). `{{email}}` from a mail merge that did not run is neither.
+
+A search that pastes a whole payload, such as `' or 1=1--`, `<script>alert(1)</script>` or `../../../etc/passwd`, still scores: it is the attack, whoever typed it.
 
 Headers are searched for JNDI lookups and callback domains only, in full and cookies included. They are not searched for the payload kinds above. A `Referer` or cookie repeats on every request, and a single-page app puts whatever the person typed into the address without asking the server, so one innocent match there would score a visitor again and again.
 
@@ -187,7 +199,7 @@ For the TLS sensor, have your edge pass a JA3 or JA4 value in a header and set `
 - **`Sec-Fetch-Site` is the client's word.** A request is taken as induced, and so never scored, when its `Sec-Fetch-Site` header says `cross-site` or `same-site`, when it says `same-origin` and `Sec-Fetch-Dest` names something a page embeds, or, without those headers, when the `Referer` is from another host. Real browsers set these and a page cannot forge them, which is what protects your visitors from being blocked by a page they merely looked at. A tool can send them too. It gains nothing for an attack request, since every induced request that trips a hard signal is refused, but it can guess paths and send volume without its address being scored: the 404, recon, slow-guessing and flood sensors do not see it. `score_induced=True` closes that gap and reopens the other one.
 - **A link someone is talked into opening** is not induced as far as the browser can tell if it is pasted or opened from a mail client (`Sec-Fetch-Site: none`), so a canary link sent by e-mail still blocks the person who opens it.
 - **About 60 guessed paths an hour per address are still free**, and 14 a minute until that allowance is spent. Guessing values of one query parameter (`/item?id=1`, `?id=2`) is not counted at all, because the path is the same.
-- **Payload patterns are a net, not a parser.** A bare `;id` or `|id` is not scored, because it reads the same as a list. Injection sent only in a `Referer`, cookie or other header is not scored, apart from JNDI lookups and callback domains. Encodings a pattern does not expect get through. And some ordinary text still matches: a search for `javascript: the good parts` or `sleep (8 hours)` scores as a payload.
+- **Payload patterns are a net, not a parser.** A bare `;id` or `|id` is not scored, because it reads the same as a list. Injection sent only in a `Referer`, cookie or other header is not scored, apart from JNDI lookups and callback domains. Encodings a pattern does not expect get through. To let search text through, some payload forms are not scored: a bare `<script>` tag with no code, a lone `<svg>` or `<iframe>`, a number left dangling after `OR` (`' or 1`), `UNION SELECT` after a plain word with a one-word list (`x union select a`), and two levels of `../` to a file with no server-side extension. And a search that is itself a payload (`sleep(5)`, `{{7*7}}`, `' or 1=1--`) still scores.
 - **Request bodies are not inspected**, nor are messages on an open WebSocket, and nmap port scans never reach a web app at all. Keep your firewall and, if you have one, your WAF.
 - **An exposed dump that really exists is served.** The shield cannot tell `db-backup.sql` from `employee-handbook.zip` until the app answers, so it waits for the 404.
 - **Shared addresses.** Blocking an address also blocks everyone behind the same NAT, VPN or campus network. A widened IPv6 block covers more: a /56 can be one household or, with some providers, a few hundred customers. It takes 8 separately blocked networks inside it, and lasts the first-block time. This is why blocks expire and why `monitor` is the default mode.
@@ -203,6 +215,6 @@ src/artex_shield/
   decoys.py       canary generation and trap snippets
   middleware.py   WSGI and ASGI adapters
   util.py         address and decoding helpers
-tests/            101 tests on simulated traffic
+tests/            104 tests on simulated traffic
 examples/         Flask, FastAPI, nginx, and a campaign simulation
 ```
