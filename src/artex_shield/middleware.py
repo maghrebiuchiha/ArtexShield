@@ -7,8 +7,9 @@ from .core import Decision, Shield
 
 
 def _reply(d: Decision) -> Tuple[int, str, List[Tuple[str, str]], bytes]:
-    if d.action == "block":
-        body = f"Request blocked. Reference: {d.ref}\n".encode()
+    if d.action in ("block", "refuse"):
+        word = "blocked" if d.action == "block" else "refused"
+        body = f"Request {word}. Reference: {d.ref}\n".encode()
         return 403, "403 Forbidden", [("Content-Type", "text/plain; charset=utf-8"),
                                       ("Content-Length", str(len(body))), ("Cache-Control", "no-store")], body
     body = f"Too many requests. Reference: {d.ref}\n".encode()
@@ -37,7 +38,7 @@ class ShieldWSGI:
 
         def watching(status, hdrs, exc_info=None):
             try:
-                s.observe(ip, path, int(status.split(" ", 1)[0]))
+                s.observe(ip, path, int(status.split(" ", 1)[0]), d.induced)
             except Exception:
                 s.log.exception("observe failed")
             return start_response(status, hdrs, exc_info) if exc_info else start_response(status, hdrs)
@@ -74,7 +75,7 @@ class ShieldASGI:
         async def watching(message):
             if message.get("type") == "http.response.start":
                 try:
-                    s.observe(ip, path, int(message.get("status", 200)))
+                    s.observe(ip, path, int(message.get("status", 200)), d.induced)
                 except Exception:
                     s.log.exception("observe failed")
             await send(message)

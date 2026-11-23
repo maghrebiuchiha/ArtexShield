@@ -20,10 +20,19 @@ SCRIPT = {"User-Agent": "python-requests/2.32"}
 # A synthetic-monitoring browser: headless, and it sends no Accept-Language.
 HEADLESS = {"User-Agent": CHROME.replace("Chrome/", "HeadlessChrome/"), "Accept": "text/html"}
 CRON = {"User-Agent": "curl/8.5.0", "Accept": "*/*"}
+# Windows asks about a link by WebDAV before the browser opens it.
+WEBDAV = {"User-Agent": "Microsoft-WebDAV-MiniRedir/10.0.19045", "Accept-Language": "en-US"}
+# What a browser adds when another site's page, not the person, made it send the request.
+FORCED = dict(BROWSER, **{"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "no-cors", "Sec-Fetch-Dest": "image",
+                          "Referer": "https://forum.example/thread/9", "Host": "shop.example"})
 
 PAGES = ["/", "/products", "/about", "/api/items", "/login", "/static/app.js", "/search", "/blog"]
+# Several of these have names a backup-hunting scanner would also try. The site
+# really serves them, so asking for them is not a probe.
 DOWNLOADS = ["/downloads/price-list.pdf", "/downloads/brochure-2026.pdf", "/downloads/user-guide.zip",
-             "/downloads/installer-2.4.1.zip", "/downloads/terms.docx"]
+             "/downloads/installer-2.4.1.zip", "/downloads/terms.docx", "/downloads/employee-handbook.zip",
+             "/downloads/feedback-form-2026.zip", "/exports/customer-database.zip", "/downloads/release-notes.old",
+             "/downloads/site-backup-tool.tar"]
 SITE = set(PAGES) | set(DOWNLOADS)
 # Query strings real sites see every day: paging, ids, categories, tracking
 # tags, pipe- and semicolon-separated lists, an encoded return URL.
@@ -52,6 +61,7 @@ class Tally:
 
     def __init__(self):
         self.rows = {}
+        self.forced = [0, 0]         # requests a hostile page made visitors' browsers send: sent, refused
 
     def client(self, kind):
         self.rows.setdefault(kind, [0, 0, 0])[0] += 1
@@ -65,12 +75,12 @@ class Tally:
         return sum(row[column] for row in self.rows.values())
 
 
-def send(shield, clock, ip, path, headers, query="", gap=0.0, log=None, who=""):
+def send(shield, clock, ip, path, headers, query="", gap=0.0, log=None, who="", method="GET"):
     clock.t += gap
-    d = shield.check(ip, "GET", path, query, headers)
-    status = {"block": 403, "throttle": 429}.get(d.action) if d.stop else (200 if path in SITE else 404)
+    d = shield.check(ip, method, path, query, headers)
+    status = {"throttle": 429}.get(d.action, 403) if d.stop else (200 if path in SITE else 404)
     if not d.stop:
-        shield.observe(ip, path, status)
+        shield.observe(ip, path, status, d.induced)
     if log is not None:
         log.append((who, path + ("?" + query if query else ""), status, int(d.score), ",".join(d.hits)))
     return status
@@ -129,7 +139,54 @@ def poll(shield, clock, tally, kind, ip, headers, paths, every, hours, rng=None)
         i += 1
 
 
-def visitors(shield, clock, n=300):
+def awkward(shield, clock, tally, canaries, rng):
+    """Honest clients that look bad at a glance: 404s that are not guesses,
+    WebDAV discovery, and visitors whose browser a hostile page is driving."""
+    for copy in range(3):    # waiting for a job that is not ready: the same 404 every 2 s for 10 minutes
+        kind, ip = "job poller, 404 every 2 s", f"198.19.20.{copy + 1}"
+        tally.client(kind)
+        poll(shield, clock, tally, kind, ip, BROWSER, ["/api/jobs/42/result"], 2.0, 1 / 6)
+        tally.count(kind, send(shield, clock, ip, "/products", BROWSER, query="page=2&id=5", gap=1.0))
+
+    for copy in range(3):    # a cached page asking for 30 script and style chunks a deploy removed, reloaded twice
+        kind, ip = "stale page, 30 dead assets", f"198.19.21.{copy + 1}"
+        tally.client(kind)
+        for reload in range(3):
+            tally.count(kind, send(shield, clock, ip, "/", BROWSER, gap=rng.uniform(60, 240)))
+            for i in range(30):
+                asset = f"/static/chunk-{copy}{i:02d}." + ("js", "css", "js.map")[i % 3]
+                tally.count(kind, send(shield, clock, ip, asset, BROWSER, gap=rng.uniform(0.005, 0.05)))
+
+    for copy in range(3):    # links opened from Word: Windows probes by WebDAV, then the browser fetches
+        kind, ip = "office link, WebDAV probe", f"198.19.22.{copy + 1}"
+        tally.client(kind)
+        for _ in range(6):
+            clock.t += rng.uniform(120, 900)
+            for method in ("OPTIONS", "PROPFIND", "PROPFIND", "PROPFIND", "PROPFIND"):
+                tally.count(kind, send(shield, clock, ip, "/downloads", WEBDAV, gap=0.2, method=method))
+            tally.count(kind, send(shield, clock, ip, "/downloads/terms.docx", BROWSER, gap=0.5))
+
+    # A hostile page shows visitors image tags that point here: at a canary, a
+    # dotfile, attack URLs, admin paths, a pile of dead links. Their browsers
+    # send those. Those requests are not legitimate and may be refused; the
+    # visitors' own browsing, before and after, must not be touched.
+    bait = [(canaries[0], ""), (canaries[1], ""), ("/.env", ""), ("/search", "q=<script>alert(1)</script>"),
+            ("/api/items", "id=1' UNION SELECT null--"), ("/db-backup.sql", ""),
+            ("/admin", ""), ("/wp-login.php", ""), ("/phpmyadmin/", ""), ("/actuator/env", "")]
+    bait += [(f"/x-{i}", "") for i in range(40)]
+    for copy in range(5):
+        kind, ip = "visitor on a hostile page", f"198.19.23.{copy + 1}"
+        tally.client(kind)
+        browse(shield, clock, tally, kind, ip, rng, sessions=4, pause=(5, 60))
+        for round_ in range(3):
+            for path, query in bait:
+                status = send(shield, clock, ip, path, FORCED, query=query, gap=0.01)
+                tally.forced[0] += 1
+                tally.forced[1] += status in (403, 429)
+            browse(shield, clock, tally, kind, ip, rng, sessions=4, pause=(5, 60))
+
+
+def visitors(shield, clock, canaries, n=300):
     """People, polling dashboards, API scripts, monitors and downloads, some of
     them running for hours. None should be stopped."""
     rng, tally = random.Random(11), Tally()
@@ -168,6 +225,7 @@ def visitors(shield, clock, n=300):
     for copy in range(4):    # a tab left open all working day
         tally.client("browsing, 8 h")
         browse(shield, clock, tally, "browsing, 8 h", f"198.19.9.{copy + 1}", rng, sessions=110, pause=(60, 480))
+    awkward(shield, clock, tally, canaries, rng)
     return tally
 
 
@@ -181,12 +239,14 @@ def main():
         print(f"{who:<12} {req[:44]:<44} {status:>4} {score:>5}  {hits}")
 
     print(f"\nactive blocks: {sorted(shield.blocklist())}")
-    tally = visitors(shield, clock)
+    tally = visitors(shield, clock, canaries)
     print(f"\n{'legitimate client':<26} {'clients':>7} {'requests':>9} {'stopped':>8}")
     for kind, (clients, requests, stopped) in tally.rows.items():
         print(f"{kind:<26} {clients:>7} {requests:>9} {stopped:>8}")
     stopped = tally.total(2)
-    print(f"\nlegitimate traffic: {tally.total(1)} requests from {tally.total(0)} clients, {stopped} stopped")
+    print(f"\nforced on visitors by a hostile page: {tally.forced[0]} requests, {tally.forced[1]} refused, "
+          f"{sum(ip.startswith('198.') for ip in shield.blocklist())} visitors blocked")
+    print(f"legitimate traffic: {tally.total(1)} requests from {tally.total(0)} clients, {stopped} stopped")
     return stopped
 
 
