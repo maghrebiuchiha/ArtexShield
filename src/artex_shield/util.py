@@ -5,7 +5,7 @@ import ipaddress
 import re
 import urllib.parse
 from datetime import datetime
-from typing import Iterable
+from typing import Iterable, Optional
 
 def _ts(dt: datetime) -> float:
     return dt.timestamp()
@@ -21,6 +21,30 @@ def _valid_ip(value: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _usable_ip(value: str) -> bool:
+    """An address that can stand for one client: parseable and not 0.0.0.0 / ::."""
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+        addr = addr.ipv4_mapped
+    return not addr.is_unspecified
+
+
+def _hop_ip(hop: str) -> Optional[str]:
+    """The address in one X-Forwarded-For entry, or None. Some proxies append
+    the source port: `203.0.113.7:44321`, `[2001:db8::7]:443`."""
+    h = hop.strip().strip('"')
+    if h.startswith("["):
+        end = h.find("]")
+        if end > 0:
+            h = h[1:end]
+    elif h.count(":") == 1:
+        h = h.split(":", 1)[0]
+    return h if _valid_ip(h) else None
 
 
 def _in_nets(ip: str, nets) -> bool:
@@ -61,3 +85,18 @@ def _decode(text: str) -> str:
             break
         text = nxt
     return text
+
+
+def _url_text(path: str, query: str) -> str:
+    """What the client sent in the URL, for payload matching: the decoded path,
+    then each decoded query name and value, separated by NUL. The `?`, `&` and
+    `=` that hold a query string together are left out, so `page=2&id=5` is
+    read as four words and not as text containing `&id`. A `&` or `=` the
+    client encoded is data and stays in."""
+    parts = [_decode(path)]
+    for pair in query.split("&"):
+        if pair:
+            name, _, value = pair.partition("=")
+            parts.append(_decode(name))
+            parts.append(_decode(value))
+    return "\x00".join(parts)

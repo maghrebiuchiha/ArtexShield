@@ -1,4 +1,11 @@
-"""Radar signatures: what ARTEX and its bundled toolchain look like on the wire."""
+"""Radar signatures: what ARTEX and its bundled toolchain look like on the wire.
+
+Every pattern here runs on text a client chose, on every request, so each one
+must scan in time proportional to its input. Avoid shapes a backtracking
+engine retries from every position: an unbounded run in front of a literal,
+or two unbounded runs either side of one. tests/test_shield.py times every
+pattern against hostile input.
+"""
 import re
 
 # (pattern, points, label). 100 = block on sight.
@@ -28,14 +35,16 @@ SOFT_UA = [(re.compile(p, re.I), pts, label) for p, pts, label in [
      15, "ua:http-library"),
 ]]
 ASSESSMENT_UA = re.compile(r"ARTEX-Assessment/\d+(?:\.\d+)*(?:\s*\(engagement=([A-Za-z0-9._-]{1,64})\))?", re.I)
-BROWSER_UA = re.compile(r"mozilla/5\.0.*(chrome|firefox|safari|edg)/", re.I)
+# "Mozilla/5.0" and, somewhere after it, a browser token. Anchored on the first
+# "Mozilla/5.0" so a User-Agent that repeats it is still read once.
+BROWSER_UA = re.compile(r"\A(?:(?!mozilla/5\.0).)*mozilla/5\.0.*(?:chrome|firefox|safari|edg)/", re.I)
 CRAWLER_UA = re.compile(r"bot|crawl|spider|slurp|preview|facebookexternalhit|monitor|uptime", re.I)
 
 # Paths nobody requests by accident.
 SENSITIVE_PATHS = re.compile(
     r"/\.(env|git|svn|hg|aws|ssh|DS_Store|htpasswd|htaccess|npmrc|dockerenv)(\b|/|$)"
     r"|/(id_rsa|id_dsa|wp-config\.php\.[a-z~]+|web\.config|phpinfo\.php|server-status|server-info)$"
-    r"|/[\w.-]*(backup|dump|database|db)[\w.-]*\.(sql|zip|tar|gz|bak|7z)$"
+    r"|/(?=[\w.-]*\.(?:sql|zip|tar|gz|bak|7z)$)[\w.-]*(?:backup|dump|database|db)"
     r"|\.(bak|old|swp|orig)$",
     re.I)
 # Recon paths: scored only when YOUR app answers 404, so real routes are safe.
@@ -51,13 +60,20 @@ PAYLOADS = [(re.compile(p, re.I), label) for p, label in [
      r"|'\s*(or|and)\s+['\d]|xp_cmdshell|extractvalue\s*\(|updatexml\s*\(", "payload:sqli"),
     (r"<script|javascript:|on(error|load|mouseover|focus)\s*=|<svg[\s/]|<iframe", "payload:xss"),
     (r"\.\./\.\./|\.\.\\\.\.\\|/etc/(passwd|shadow)|win\.ini|/proc/self/", "payload:traversal"),
-    (r"[;|&`]\s*(cat|id|whoami|uname|curl|wget|nc|bash|sh)\b|\$\((id|whoami|uname|curl|wget)", "payload:cmdi"),
+    # Shell separators also join ordinary lists (`fields=name|id|price`, `color=red;id=5`),
+    # so a short word after a single separator counts only with an argument behind it.
+    # Command substitution and doubled operators have no such innocent reading.
+    (r"[;|&`]\s*whoami\b"
+     r"|[;|&`]\s*(?:cat|id|uname|nc|bash|sh)\s+[-/.~$]"
+     r"|[;|&`]\s*(?:curl|wget)\s+\S"
+     r"|(?:&&|\|\||`)\s*(?:cat|id|uname|curl|wget|nc|bash|sh)\b"
+     r"|\$\((?:id|whoami|uname|curl|wget)", "payload:cmdi"),
     (r"\{\{\s*\d+\s*\*\s*\d+\s*\}\}|\$\{\s*\d+\s*\*\s*\d+\s*\}|<%=\s*\d+\s*\*", "payload:ssti"),
     (r"169\.254\.169\.254|metadata\.google\.internal", "payload:ssrf-metadata"),
 ]]
 # Checked in headers too: out-of-band callbacks and Log4Shell-style lookups.
 OOB = [(re.compile(p, re.I), label) for p, label in [
     (r"\$\{\s*(jndi|\$\{|lower:|upper:|env:|sys:|::-)", "payload:jndi"),
-    (r"[a-z0-9-]+\.(oast\.(fun|pro|live|site|online|me)|interact\.sh|oastify\.com|burpcollaborator\.net)",
+    (r"(?<=[a-z0-9-])\.(?:oast\.(?:fun|pro|live|site|online|me)|interact\.sh|oastify\.com|burpcollaborator\.net)",
      "payload:oob-callback"),
 ]]

