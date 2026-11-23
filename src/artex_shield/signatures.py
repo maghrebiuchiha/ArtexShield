@@ -40,11 +40,17 @@ ASSESSMENT_UA = re.compile(r"ARTEX-Assessment/\d+(?:\.\d+)*(?:\s*\(engagement=([
 BROWSER_UA = re.compile(r"\A(?:(?!mozilla/5\.0).)*mozilla/5\.0.*(?:chrome|firefox|safari|edg)/", re.I)
 CRAWLER_UA = re.compile(r"bot|crawl|spider|slurp|preview|facebookexternalhit|monitor|uptime", re.I)
 
-# Paths nobody requests by accident.
+# Paths nobody requests by accident: scored on sight.
 SENSITIVE_PATHS = re.compile(
     r"/\.(env|git|svn|hg|aws|ssh|DS_Store|htpasswd|htaccess|npmrc|dockerenv)(\b|/|$)"
-    r"|/(id_rsa|id_dsa|wp-config\.php\.[a-z~]+|web\.config|phpinfo\.php|server-status|server-info)$"
-    r"|/(?=[\w.-]*\.(?:sql|zip|tar|gz|bak|7z)$)[\w.-]*(?:backup|dump|database|db)"
+    r"|/(id_rsa|id_dsa|wp-config\.php\.[a-z~]+|web\.config|phpinfo\.php|server-status|server-info)$",
+    re.I)
+# Dumps, backups and editor leftovers, told by name alone. A site can really
+# serve handbook.zip or notes.old, so like the recon paths below these are
+# scored only when YOUR app answers 404. "db" must not sit inside a longer
+# word: mydb.sql and db_2026.zip, but not handbook.zip or feedback.zip.
+MISSING_SENSITIVE = re.compile(
+    r"/(?=[\w.-]*\.(?:sql|zip|tar|gz|bak|7z)$)[\w.-]*(?:backup|dump|database|(?<![a-z])db|db(?![a-z]))"
     r"|\.(bak|old|swp|orig)$",
     re.I)
 # Recon paths: scored only when YOUR app answers 404, so real routes are safe.
@@ -53,7 +59,10 @@ RECON_PATHS = re.compile(
     r"|actuator(/.*)?|admin(/.*)?|console|debug(/.*)?|metrics|wp-login\.php|wp-admin(/.*)?|xmlrpc\.php"
     r"|phpmyadmin(/.*)?|manager/html|druid(/.*)?|nacos(/.*)?|jenkins(/.*)?|solr(/.*)?|\.well-known/security\.txt)$",
     re.I)
-ODD_METHODS = {"TRACE", "TRACK", "CONNECT", "DEBUG", "PROPFIND"}
+ODD_METHODS = {"TRACE", "TRACK", "CONNECT", "DEBUG"}
+# Scanners use it, but so do Windows and Office whenever someone opens a link
+# from a document (WebDAV discovery). Soft: once per half-life.
+SOFT_METHODS = {"PROPFIND"}
 
 PAYLOADS = [(re.compile(p, re.I), label) for p, label in [
     (r"union\s+(all\s+)?select|information_schema|\b(pg_)?sleep\s*\(\s*\d|benchmark\s*\(|waitfor\s+delay"

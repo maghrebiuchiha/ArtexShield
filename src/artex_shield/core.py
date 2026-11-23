@@ -14,12 +14,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
-from .signatures import (ASSESSMENT_UA, BROWSER_UA, CRAWLER_UA, HARD_UA, ODD_METHODS, OOB,
-                         PAYLOADS, RECON_PATHS, SENSITIVE_PATHS, SOFT_UA)
-from .util import (_decode, _hop_ip, _in_nets, _nets, _norm_path, _track_key, _ts, _url_text,
-                   _usable_ip)
+from .signatures import (ASSESSMENT_UA, BROWSER_UA, CRAWLER_UA, HARD_UA, MISSING_SENSITIVE, ODD_METHODS,
+                         OOB, PAYLOADS, RECON_PATHS, SENSITIVE_PATHS, SOFT_METHODS, SOFT_UA)
+from .util import (_decode, _extension, _hop_ip, _in_nets, _induced, _nets, _norm_path, _prefixes,
+                   _track_key, _ts, _under, _url_text, _usable_ip)
 
 _Hit = Tuple[str, float, bool]       # label, points, soft?
+_MISSING_MEMORY = 128                # missing paths remembered per client, so repeats are not recounted
 
 
 @dataclass
@@ -54,10 +55,10 @@ class Config:
     ignored_throttle_points: float = 5.0
     trusted_proxies: List[str] = field(default_factory=list)   # CIDRs allowed to set X-Forwarded-For
     allow_cidrs: List[str] = field(default_factory=list)       # never scored (monitors, partners)
-    exempt_paths: List[str] = field(default_factory=list)      # path prefixes never scored
+    exempt_paths: List[str] = field(default_factory=list)      # these paths and what is under them: never scored
     engagements: List[Engagement] = field(default_factory=list)
     canary_paths: List[str] = field(default_factory=list)      # see make_canaries()
-    enum_404_threshold: int = 15     # 404s inside enum_window
+    enum_404_threshold: int = 15     # different paths answered 404 inside enum_window
     enum_window: float = 60.0
     rate_limit: int = 240            # requests inside rate_window
     rate_window: float = 60.0
@@ -76,10 +77,23 @@ class Config:
     # Kept below throttle_score so they cannot stop a request without hard
     # evidence beside them. None means 80% of throttle_score.
     soft_cap: Optional[float] = None
+    # 404s that never count as path enumeration: under these paths (routes that
+    # answer 404 for "no such item"), or with these extensions (a page asking
+    # for assets that are gone is not guessing). Recon and dump names still score.
+    enum_ignore_prefixes: List[str] = field(default_factory=list)
+    enum_ignore_extensions: Iterable[str] = ("js", "mjs", "css", "map", "png", "jpg", "jpeg", "gif", "svg", "webp",
+                                             "avif", "ico", "woff", "woff2", "ttf", "otf", "eot", "mp3", "mp4", "webm")
+    # False: a request that a web page made the visitor's browser send (see
+    # util._induced) is never held against the visitor; if it trips a hard
+    # signal that one request is refused. True: score it like any other, which
+    # lets anyone who can show your visitors an image tag get them blocked.
+    score_induced: bool = False
 
     def __post_init__(self):
         if self.mode not in ("monitor", "enforce"):
             raise ValueError("mode must be 'monitor' or 'enforce'")
+        _prefixes(self.exempt_paths, "exempt_paths")
+        _prefixes(self.enum_ignore_prefixes, "enum_ignore_prefixes")
         if not 0 < self.throttle_score <= self.block_score:
             raise ValueError("need 0 < throttle_score <= block_score")
         if self.soft_cap is None:
@@ -93,7 +107,9 @@ class Config:
 
 @dataclass
 class Decision:
-    action: str                      # "pass" | "throttle" | "block"
+    # "pass" | "throttle" (429, the client may retry later) | "block" (403, the address is blocked)
+    # | "refuse" (403 for this one request; nothing is held against the address)
+    action: str
     enforced: bool                   # False in monitor mode
     score: float
     hits: List[str]
@@ -101,6 +117,7 @@ class Decision:
     ip: str
     retry_after: int = 0
     friendly: bool = False
+    induced: bool = False            # a web page, not the person, made the browser send it; pass on to observe()
 
     @property
     def stop(self) -> bool:
@@ -108,14 +125,16 @@ class Decision:
 
 
 class _Track:
-    __slots__ = ("hard", "soft_points", "updated", "times", "not_found", "soft", "strikes", "throttled_until")
+    __slots__ = ("hard", "soft_points", "updated", "times", "not_found", "missing", "soft", "strikes",
+                 "throttled_until")
 
     def __init__(self, now: float):
         self.hard = 0.0              # points from signals that repeat on every hit
         self.soft_points = 0.0       # points from once-per-half-life signals, capped at Config.soft_cap
         self.updated = now
         self.times: deque = deque(maxlen=512)
-        self.not_found: deque = deque(maxlen=512)
+        self.not_found: deque = deque(maxlen=512)       # when each newly missing path was first asked for
+        self.missing: "OrderedDict[int, float]" = OrderedDict()     # missing paths already counted -> last asked
         self.soft: Dict[str, float] = {}
         self.strikes = 0
         self.throttled_until = 0.0
@@ -135,9 +154,12 @@ class Shield:
         self._blocks: Dict[str, float] = {}
         self._trusted = _nets(self.cfg.trusted_proxies)
         self._allowed = _nets(self.cfg.allow_cidrs)
+        self._exempt = _prefixes(self.cfg.exempt_paths, "exempt_paths")
+        self._enum_skip = _prefixes(self.cfg.enum_ignore_prefixes, "enum_ignore_prefixes")
+        self._enum_skip_ext = {str(e).lower().lstrip(".") for e in self.cfg.enum_ignore_extensions}
         self._canaries = {_norm_path(p) for p in self.cfg.canary_paths}
         self._tls_deny = {str(v).lower() for v in self.cfg.tls_denylist}
-        self.stats = {"requests": 0, "throttled": 0, "blocked": 0, "friendly": 0, "unidentified": 0}
+        self.stats = {"requests": 0, "throttled": 0, "blocked": 0, "friendly": 0, "unidentified": 0, "refused": 0}
         self._unidentified_warned: Optional[float] = None
 
     # ---- client address -------------------------------------------------
@@ -174,7 +196,8 @@ class Shield:
         ref = secrets.token_hex(4)
         enforce = cfg.mode == "enforce"
         npath = _norm_path(path)
-        exempt = any(npath.startswith(p) for p in cfg.exempt_paths) or _in_nets(ip, self._allowed)
+        exempt = _under(path, self._exempt) or _in_nets(ip, self._allowed)
+        induced = not cfg.score_induced and _induced(h)
         m = ASSESSMENT_UA.search(ua)
         hits: List[_Hit] = []
 
@@ -207,8 +230,9 @@ class Shield:
                     return Decision("pass", enforce, 0.0, [f"iff:engagement={eref}"], ref, ip, friendly=True)
                 hits.append(("artex:unverified-assessment-label", 100.0, False))
 
-            # Already blocked: no need to look further.
-            if self._blocked(key, now):
+            # Already blocked: no need to look further. (Monitor mode did not
+            # stop the client, so there it keeps looking: see below.)
+            if enforce and self._blocked(key, now):
                 return Decision("block", enforce, cfg.block_score, ["blocklist"], ref, ip)
 
         # Reading the request needs no shared state, so it is done without the
@@ -216,8 +240,29 @@ class Shield:
         seen = self._scan(method, npath, query, h, ua)
 
         with self._lock:
-            if self._blocked(key, now):             # blocked by another request in the meantime
-                return Decision("block", enforce, cfg.block_score, ["blocklist"], ref, ip)
+            if self._blocked(key, now):
+                if enforce:                         # blocked by another request in the meantime
+                    return Decision("block", enforce, cfg.block_score, ["blocklist"], ref, ip)
+                # Monitor mode: enforce would be refusing this address, so its
+                # score stays frozen, but what it goes on to do is the evidence
+                # the operator needs. Report requests that carry a hard signal,
+                # and the rest once per half-life.
+                labels = ["blocklist"] + [l for l, _, _ in hits + seen]
+                loud = any(not soft for _, _, soft in hits + seen)
+                if loud or self._soft_due(self._track(key, now), "blocked", now):
+                    self._emit("blocked", ip, cfg.block_score, labels, method, path, ua, ref, enforce)
+                return Decision("block", enforce, cfg.block_score, labels, ref, ip)
+
+            # A page made the browser send this, so it says nothing about the
+            # visitor: no score, no track. If it carries a hard signal it is
+            # refused, which also means a tool gains nothing by posing as one.
+            if induced:
+                labels = [l for l, _, soft in hits + seen if not soft]
+                if not labels:
+                    return Decision("pass", enforce, 0.0, [], ref, ip, induced=True)
+                self.stats["refused"] += 1
+                self._emit("refuse", ip, 0.0, labels, method, path, ua, ref, enforce)
+                return Decision("refuse", enforce, 0.0, labels, ref, ip, induced=True)
 
             t = self._track(key, now)
             self._decay(t, now)
@@ -225,32 +270,42 @@ class Shield:
             t.times.append(now)
 
             # A throttled client that keeps coming inside Retry-After is not backing off.
-            if t.throttled_until > now:
+            # Only if it was told: in monitor mode nobody sent it a Retry-After.
+            if enforce and t.throttled_until > now:
                 hits.append(("behavior:ignored-retry-after", cfg.ignored_throttle_points, False))
 
             self._add(t, hits)
             return self._engage(t, key, ip, now, [l for l, _, _ in hits], method, path, ua, ref, enforce)
 
     # ---- after the app answered -------------------------------------------
-    def observe(self, ip: str, path: str, status: int) -> None:
-        """Feed the app's status code back in. 404s drive the enumeration and
-        recon sensors, so real routes on your site never count against anyone."""
-        if status != 404:
+    def observe(self, ip: str, path: str, status: int, induced: bool = False) -> None:
+        """Feed the app's status code back in. 404s drive the enumeration,
+        recon and missing-dump sensors, so what your site really serves never
+        counts against anyone. Pass `induced` from the Decision check() gave:
+        a 404 for a request some page forced is not the visitor's guess."""
+        if status != 404 or induced:
             return
         cfg, now = self.cfg, self.clock()
         npath = _norm_path(path)
-        if any(npath.startswith(p) for p in cfg.exempt_paths) or _in_nets(ip, self._allowed):
+        if _under(path, self._exempt) or _in_nets(ip, self._allowed):
             return
         key = _track_key(ip)
+        hits: List[_Hit] = []
+        if RECON_PATHS.match(npath):
+            hits.append(("recon:probe-404", 25.0, False))
+        if MISSING_SENSITIVE.search(npath) and not SENSITIVE_PATHS.search(npath):   # not twice for /.env.bak
+            hits.append(("decoy:sensitive-file-probe", 60.0, False))
+        guess = not _under(path, self._enum_skip) and _extension(npath) not in self._enum_skip_ext
         with self._lock:
             t = self._tracks.get(key)
             if t is None or key in self._blocks:
                 return
             self._decay(t, now)
-            hits: List[_Hit] = []
-            if RECON_PATHS.match(npath):
-                hits.append(("recon:probe-404", 25.0, False))
-            t.not_found.append(now)
+            # Enumeration is many different missing paths. Asking again for one
+            # already counted (polling, a reload, the same dead link on every
+            # page) adds nothing, however often it happens.
+            if guess and self._newly_missing(t, npath, now):
+                t.not_found.append(now)
             while t.not_found and now - t.not_found[0] > cfg.enum_window:
                 t.not_found.popleft()
             if len(t.not_found) >= cfg.enum_404_threshold:
@@ -266,6 +321,17 @@ class Shield:
                 self._emit("block", ip, score, labels, "-", path, "", "-", cfg.mode == "enforce")
             else:
                 self._emit("score", ip, t.score, labels, "-", path, "", "-", cfg.mode == "enforce")
+
+    def _newly_missing(self, t: _Track, npath: str, now: float) -> bool:
+        """True the first time this client is told `npath` does not exist, and
+        again only after a half-life without asking for it."""
+        k = hash(npath)
+        last = t.missing.get(k)
+        t.missing[k] = now
+        t.missing.move_to_end(k)
+        while len(t.missing) > _MISSING_MEMORY:
+            t.missing.popitem(last=False)
+        return last is None or now - last > self.cfg.half_life
 
     # ---- sensors ----------------------------------------------------------
     def _scan(self, method: str, npath: str, query: str, h: Dict[str, str], ua: str) -> List[_Hit]:
@@ -294,8 +360,9 @@ class Shield:
             if BROWSER_UA.search(ua) and not CRAWLER_UA.search(ua) and not h.get("accept-language"):
                 hits.append(("shape:browser-ua-without-browser-headers", 20.0, True))
 
-        if method.upper() in ODD_METHODS:
-            hits.append((f"method:{method.upper()}", 30.0, False))
+        verb = method.upper()
+        if verb in ODD_METHODS or verb in SOFT_METHODS:
+            hits.append((f"method:{verb}", 30.0, verb in SOFT_METHODS))
 
         # Payloads in the URL; out-of-band markers in headers as well.
         target = _url_text(npath, query)

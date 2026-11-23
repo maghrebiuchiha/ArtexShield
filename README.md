@@ -12,7 +12,7 @@ ARTEX is a self-hosted, LLM-driven pentest platform: a planner breaks a goal int
 | IFF | Tell friend from foe | Allowlists, plus authorised assessments verified by reference, source range and time window |
 | Decoys | Draw fire away from real assets | Canary paths planted in `robots.txt`, hidden links and JS bundles |
 | Tracking | Follow each contact | One decaying threat score per client (IPv4 address, IPv6 /64) |
-| Fire control | Respond in proportion | Pass, then throttle (429), then block (403) with doubling block times |
+| Fire control | Respond in proportion | Pass, then throttle (429), then block (403) with doubling block times; refuse a single request (403) without touching the address |
 | Command post | Share the picture | JSON event log, callback hook, blocklist export for nginx |
 
 Soft signals cannot stop a request on their own, however many fire or however long a client runs. A block needs either one unambiguous signal (a canary hit, a scanner signature) or several weaker ones adding up.
@@ -66,6 +66,29 @@ A request is passed unscored when no address identifies its sender: the peer is 
 
 An app server bound to a unix socket reports no peer address. Add `"0.0.0.0/32"` to `trusted_proxies` to take `X-Forwarded-For` from that socket.
 
+### Exempt paths
+
+`exempt_paths` entries cover a path and everything under it, by whole segments: `"/static"` covers `/static` and `/static/app.js`, and not `/static-admin` or `/static/../api`. An entry must start with `/` and name something below the root; `""` and `"/"` are rejected because they would switch the shield off.
+
+### Requests a page made the browser send
+
+Canary paths are public by design: they sit in `robots.txt` and in your JavaScript. So anyone can put `<img src="https://your-site/that-canary">` on a page of their own, or in a forum post on yours, and every visitor's browser will request it. If that counted against the visitor, any stranger could have your visitors blocked. The same goes for attack-looking URLs, admin paths and piles of dead links.
+
+Browsers say when a page, not the person, started a request (the `Sec-Fetch-*` headers; the `Referer` on browsers too old to send them). The shield treats a request as induced when it was started from another site, or is something a page of your own site embeds, such as an image or a frame. An induced request:
+
+- is never held against the visitor: no score, no 404 counted, no block;
+- is refused on its own, with a 403, if it trips a hard signal (a canary, a dotfile, a payload, a scanner User-Agent). It never reaches your app. The decision's action is `refuse`.
+
+An address typed or bookmarked, a click inside your site, your site's own scripts, and any client that sends none of these headers are scored as before.
+
+The cost: these headers are the client's word. A tool that marks its requests as induced keeps its address clean. It cannot get an attack request through that way, because every request that trips a hard signal is refused, but it can look for paths and send volume without being scored. Set `score_induced=True` to score these requests like any other; your visitors can then be blocked by a page they merely looked at.
+
+If you call `check()` and `observe()` yourself, pass the decision's flag on: `shield.observe(ip, path, status, decision.induced)`.
+
+### Monitor mode
+
+Monitor mode reports what enforce mode would do, and stops nothing. Two details keep the report honest. A client over the throttle score is reported as `throttle` on each request, but is not scored for ignoring a wait nobody told it about. An address enforce mode would have blocked keeps its score frozen, as it would be, and its later requests are reported as `blocked` events: every one that carries a hard signal, and the rest once per half-life. A person who browses on normally while "blocked" is what a false positive looks like in the log.
+
 ## Plant the decoys
 
 ```python
@@ -100,13 +123,15 @@ A User-Agent is self-declared, so the label alone is never trusted. ARTEX's own 
 | --- | --- | --- |
 | Canary path | 100 | every hit |
 | ARTEX or scanner User-Agent, unverified assessment label | 100 | every hit |
-| Sensitive file probe (`/.env`, `/.git/`, dumps, backups) | 60 | every hit |
+| Dotfile or key probe (`/.env`, `/.git/`, `/id_rsa`) | 60 | every hit |
+| Dump, backup or editor leftover by name (`db.sql`, `site-backup.zip`, `index.php.bak`) that returned 404 | 60 | every hit |
 | Attack payload in URL; JNDI or callback domain in URL or headers | 50 each | every hit |
 | Headless browser User-Agent | 40 | once per half-life |
 | Denylisted TLS fingerprint (from your edge) | 40 | once per half-life |
-| 15 or more 404s in 60 s | 40 | per 15 |
+| 15 different missing paths (404) in 60 s | 40 | per 15 |
 | More than 240 requests in 60 s | 30 | per window |
-| TRACE, TRACK, CONNECT, DEBUG, PROPFIND | 30 | every hit |
+| TRACE, TRACK, CONNECT, DEBUG | 30 | every hit |
+| PROPFIND | 30 | once per half-life |
 | Recon path that returned 404 | 25 | every hit |
 | Evenly spaced requests; browser User-Agent without browser headers; empty User-Agent | 20 each | once per half-life |
 | HTTP library User-Agent | 15 | once per half-life |
@@ -115,6 +140,10 @@ A User-Agent is self-declared, so the label alone is never trusted. ARTEX's own 
 Throttle at 50, block at 100. Scores halve every 10 minutes. First block lasts 1 hour and doubles per repeat, up to 24 hours. Everything is a `Config` field.
 
 The signals that repeat once per half-life are the soft ones. Together they hold at most `soft_cap` points, 40 by default and always below the throttle score, so a headless monitor or a script polling on the second is never stopped for that alone. They still count beside hard evidence: a headless browser that also probes for `/swagger.json` is throttled.
+
+A 404 counts toward enumeration once per path: polling one missing resource, reloading a page of dead links, or meeting the same broken image on every page adds nothing after the first time. 404s for page assets (`enum_ignore_extensions`: scripts, styles, source maps, images, fonts, media) do not count, since a stale page asking for files a deploy removed is not guessing. If a route of yours answers 404 to mean "no such item", list it in `enum_ignore_prefixes`. Recon paths and dump names that return 404 still score wherever they are.
+
+A file name alone is not evidence: sites really do serve `employee-handbook.zip` and `release-notes.old`. Names that look like dumps or backups are scored only when your app answers 404, so a request for one that exists is served and costs nothing.
 
 Payload patterns read the decoded path and each decoded query name and value. The `?`, `&` and `=` of the query string itself are not part of that text, so `?page=2&id=5` is four plain words. After a single `;`, `|` or `&`, a short command name such as `id` or `cat` counts only with an argument behind it (`;cat /etc/passwd`), because those characters also separate ordinary lists (`fields=name|id|price`). Command substitution, `&&` and `||` count without one.
 
@@ -131,6 +160,9 @@ For the TLS sensor, have your edge pass a JA3 or JA4 value in a header and set `
 - **Shared addresses.** Blocking an address also blocks everyone behind the same NAT, VPN or campus network. This is why blocks expire and why `monitor` is the default mode.
 - **State is per process.** With several workers each keeps its own scores, so thresholds are effectively multiplied. Use the nginx export to share blocks, or run one worker until a shared store is added.
 - **Request bodies are not inspected**, and nmap port scans never reach a web app at all. Keep your firewall and, if you have one, your WAF.
+- **Induced requests are taken at the browser's word.** See "Requests a page made the browser send": a tool can claim that context to avoid being scored for path guessing and volume. It was a choice between that and letting any web page get your visitors blocked.
+- **A link someone is talked into opening** is not induced as far as the browser can tell if it is pasted or opened from a mail client, so a canary link sent by e-mail still blocks the person who opens it.
+- **An exposed dump that really exists is served.** The shield used to stop the first request for anything named like a backup. It cannot tell `db-backup.sql` from `employee-handbook.zip` until the app answers, so it now waits for the 404.
 - **Search engines.** Crawlers that honour `robots.txt` will not touch canaries. Verified-bot checks by reverse DNS are not included; add crawler ranges to `allow_cidrs` if you see them scored.
 
 ## Layout
@@ -142,6 +174,6 @@ src/artex_shield/
   decoys.py       canary generation and trap snippets
   middleware.py   WSGI and ASGI adapters
   util.py         address and decoding helpers
-tests/            44 tests on simulated traffic
+tests/            70 tests on simulated traffic
 examples/         Flask, FastAPI, nginx, and a campaign simulation
 ```

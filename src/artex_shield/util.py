@@ -5,7 +5,7 @@ import ipaddress
 import re
 import urllib.parse
 from datetime import datetime
-from typing import Iterable, Optional
+from typing import Dict, Iterable, List, Optional
 
 def _ts(dt: datetime) -> float:
     return dt.timestamp()
@@ -74,6 +74,67 @@ def _norm_path(path: str) -> str:
     p = urllib.parse.unquote(path or "/")
     p = re.sub(r"/{2,}", "/", p)
     return p if p.startswith("/") else "/" + p
+
+
+def _prefixes(entries: Iterable[str], field: str) -> List[str]:
+    """Validate a list of path prefixes and drop trailing slashes. An entry
+    must name something below the root: "" or "/" would cover every request."""
+    if isinstance(entries, str):
+        raise ValueError(f"{field} must be a list of paths, not one string")
+    out = []
+    for entry in entries:
+        if not isinstance(entry, str) or not entry.startswith("/") or not entry.strip("/"):
+            raise ValueError(f"{field}: {entry!r} must start with '/' and name a path below it")
+        out.append(re.sub(r"/{2,}", "/", entry).rstrip("/"))
+    return out
+
+
+def _under(path: str, prefixes: List[str]) -> bool:
+    """True when `path` is one of `prefixes` or lies below one: whole segments
+    only, so "/static" covers "/static/app.js" and not "/static-admin". `path`
+    is taken as the app will route it, without decoding it further, and a path
+    that climbs with ".." at any depth of encoding is under nothing."""
+    if not prefixes:
+        return False
+    p = re.sub(r"/{2,}", "/", path or "/")
+    if ".." in _decode(p).replace("\\", "/").split("/"):
+        return False
+    return any(p == prefix or p.startswith(prefix + "/") for prefix in prefixes)
+
+
+def _extension(path: str) -> str:
+    """Lower-case extension of the last path segment, without the dot."""
+    name = path.rsplit("/", 1)[-1]
+    return name.rsplit(".", 1)[-1].lower() if "." in name else ""
+
+
+def _induced(h: Dict[str, str]) -> bool:
+    """Did a web page, not the person, make the browser send this request?
+
+    Browsers say so themselves in the Sec-Fetch-* headers. Induced: anything
+    started from another site (`cross-site`, `same-site`), and anything a
+    page of this site embeds (an image, a frame, a stylesheet). Not induced:
+    an address typed or bookmarked (`none`), a navigation inside the site, and
+    the site's own scripts (`same-origin` with dest `document` or `empty`).
+    Browsers too old to send these, and plain-HTTP sites, fall back to the
+    Referer: one from another host means another site started the request.
+    A client that sends neither is taken to be acting for itself."""
+    site = h.get("sec-fetch-site", "").strip().lower()
+    if site in ("cross-site", "same-site"):
+        return True
+    if site == "same-origin":
+        return h.get("sec-fetch-dest", "").strip().lower() not in ("", "document", "empty")
+    if site:
+        return False
+    referer, host = h.get("referer", ""), h.get("host", "").strip().lower()
+    if not referer or not host:
+        return False
+    try:
+        origin = urllib.parse.urlsplit(referer.strip()).netloc
+    except ValueError:
+        return False
+    origin = origin.rsplit("@", 1)[-1].lower()
+    return bool(origin) and origin != host
 
 
 def _decode(text: str) -> str:
