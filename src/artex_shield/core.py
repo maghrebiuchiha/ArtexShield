@@ -16,7 +16,10 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from .signatures import (ASSESSMENT_UA, BROWSER_UA, CRAWLER_UA, HARD_UA, ODD_METHODS, OOB,
                          PAYLOADS, RECON_PATHS, SENSITIVE_PATHS, SOFT_UA)
-from .util import _decode, _in_nets, _nets, _norm_path, _track_key, _ts, _valid_ip
+from .util import (_decode, _hop_ip, _in_nets, _nets, _norm_path, _track_key, _ts, _url_text,
+                   _usable_ip)
+
+_Hit = Tuple[str, float, bool]       # label, points, soft?
 
 
 @dataclass
@@ -69,12 +72,20 @@ class Config:
     blocklist_export_format: str = "nginx"     # "nginx" or "plain"
     logger: str = "artex_shield"
     on_event: Optional[Callable[[dict], None]] = None
+    # Most that soft signals (scored once per half-life) can hold between them.
+    # Kept below throttle_score so they cannot stop a request without hard
+    # evidence beside them. None means 80% of throttle_score.
+    soft_cap: Optional[float] = None
 
     def __post_init__(self):
         if self.mode not in ("monitor", "enforce"):
             raise ValueError("mode must be 'monitor' or 'enforce'")
         if not 0 < self.throttle_score <= self.block_score:
             raise ValueError("need 0 < throttle_score <= block_score")
+        if self.soft_cap is None:
+            self.soft_cap = 0.8 * self.throttle_score
+        if not 0 <= self.soft_cap < self.throttle_score:
+            raise ValueError("need 0 <= soft_cap < throttle_score")
         for e in self.engagements:
             if e.start.tzinfo is None or e.end.tzinfo is None:
                 raise ValueError("engagement start/end must be timezone-aware")
@@ -97,16 +108,21 @@ class Decision:
 
 
 class _Track:
-    __slots__ = ("score", "updated", "times", "not_found", "soft", "strikes", "throttled_until")
+    __slots__ = ("hard", "soft_points", "updated", "times", "not_found", "soft", "strikes", "throttled_until")
 
     def __init__(self, now: float):
-        self.score = 0.0
+        self.hard = 0.0              # points from signals that repeat on every hit
+        self.soft_points = 0.0       # points from once-per-half-life signals, capped at Config.soft_cap
         self.updated = now
         self.times: deque = deque(maxlen=512)
         self.not_found: deque = deque(maxlen=512)
         self.soft: Dict[str, float] = {}
         self.strikes = 0
         self.throttled_until = 0.0
+
+    @property
+    def score(self) -> float:
+        return self.hard + self.soft_points
 
 
 class Shield:
@@ -121,20 +137,32 @@ class Shield:
         self._allowed = _nets(self.cfg.allow_cidrs)
         self._canaries = {_norm_path(p) for p in self.cfg.canary_paths}
         self._tls_deny = {str(v).lower() for v in self.cfg.tls_denylist}
-        self.stats = {"requests": 0, "throttled": 0, "blocked": 0, "friendly": 0}
+        self.stats = {"requests": 0, "throttled": 0, "blocked": 0, "friendly": 0, "unidentified": 0}
+        self._unidentified_warned: Optional[float] = None
 
     # ---- client address -------------------------------------------------
     def client_ip(self, remote_addr: str, forwarded_for: Optional[str] = None) -> str:
         """X-Forwarded-For is believed only when the direct peer is one of your
-        own proxies; otherwise anyone could get a stranger blocked by forging it."""
+        own proxies; otherwise anyone could get a stranger blocked by forging it.
+
+        When the header names no client, the peer is returned: a proxy's own
+        address, or 0.0.0.0 when there is none (a unix socket). check() does
+        not score those, because every visitor would arrive under them. To take
+        X-Forwarded-For from a unix-socket peer, trust "0.0.0.0/32"."""
         remote = (remote_addr or "").strip() or "0.0.0.0"
         if forwarded_for and _in_nets(remote, self._trusted):
             for hop in reversed([h.strip() for h in forwarded_for.split(",") if h.strip()]):
-                if not _valid_ip(hop):
+                addr = _hop_ip(hop)
+                if addr is None:
                     break
-                if not _in_nets(hop, self._trusted):
-                    return hop
+                if not _in_nets(addr, self._trusted):
+                    return addr
         return remote
+
+    def _identified(self, ip: str) -> bool:
+        """False when `ip` cannot stand for one client: missing, unparseable,
+        or one of the operator's own proxies."""
+        return _usable_ip(ip) and not _in_nets(ip, self._trusted)
 
     # ---- before the app runs --------------------------------------------
     def check(self, ip: str, method: str, path: str, query: str = "",
@@ -146,17 +174,29 @@ class Shield:
         ref = secrets.token_hex(4)
         enforce = cfg.mode == "enforce"
         npath = _norm_path(path)
+        exempt = any(npath.startswith(p) for p in cfg.exempt_paths) or _in_nets(ip, self._allowed)
+        m = ASSESSMENT_UA.search(ua)
+        hits: List[_Hit] = []
 
         with self._lock:
             self.stats["requests"] += 1
 
             # IFF 1: operator allowlists.
-            if any(npath.startswith(p) for p in cfg.exempt_paths) or _in_nets(ip, self._allowed):
+            if exempt:
                 return Decision("pass", enforce, 0.0, [], ref, ip)
 
+            # No address that stands for this client alone: scoring it would
+            # score everyone behind the same proxy or socket. Let it through
+            # and tell the operator, once per half-life.
+            if not self._identified(ip):
+                self.stats["unidentified"] += 1
+                labels = ["config:unidentified-client"]
+                if self._unidentified_warned is None or now - self._unidentified_warned >= cfg.half_life:
+                    self._unidentified_warned = now
+                    self._emit("unidentified", ip, 0.0, labels, method, path, ua, ref, enforce)
+                return Decision("pass", enforce, 0.0, labels, ref, ip)
+
             # IFF 2: self-declared ARTEX assessment. Verified -> friend. Unverified -> foe.
-            hits: List[Tuple[str, float]] = []
-            m = ASSESSMENT_UA.search(ua)
             if m:
                 eref = m.group(1) or ""
                 if any(e.covers(eref, ip, now) for e in cfg.engagements):
@@ -165,26 +205,31 @@ class Shield:
                     if self._soft_due(t, "friendly", now):
                         self._emit("friendly", ip, 0.0, [f"iff:engagement={eref}"], method, path, ua, ref, enforce)
                     return Decision("pass", enforce, 0.0, [f"iff:engagement={eref}"], ref, ip, friendly=True)
-                hits.append(("artex:unverified-assessment-label", 100.0))
+                hits.append(("artex:unverified-assessment-label", 100.0, False))
 
             # Already blocked: no need to look further.
-            until = self._blocks.get(key)
-            if until is not None:
-                if until > now:
-                    return Decision("block", enforce, cfg.block_score, ["blocklist"], ref, ip)
-                del self._blocks[key]
+            if self._blocked(key, now):
+                return Decision("block", enforce, cfg.block_score, ["blocklist"], ref, ip)
+
+        # Reading the request needs no shared state, so it is done without the
+        # lock: a large request must not make every other one wait.
+        seen = self._scan(method, npath, query, h, ua)
+
+        with self._lock:
+            if self._blocked(key, now):             # blocked by another request in the meantime
+                return Decision("block", enforce, cfg.block_score, ["blocklist"], ref, ip)
 
             t = self._track(key, now)
             self._decay(t, now)
-            hits += self._radar(t, now, method, npath, query, h, ua)
+            hits += self._radar(t, now, seen)
             t.times.append(now)
 
             # A throttled client that keeps coming inside Retry-After is not backing off.
             if t.throttled_until > now:
-                hits.append(("behavior:ignored-retry-after", cfg.ignored_throttle_points))
+                hits.append(("behavior:ignored-retry-after", cfg.ignored_throttle_points, False))
 
-            t.score += sum(p for _, p in hits)
-            return self._engage(t, key, ip, now, [l for l, _ in hits], method, path, ua, ref, enforce)
+            self._add(t, hits)
+            return self._engage(t, key, ip, now, [l for l, _, _ in hits], method, path, ua, ref, enforce)
 
     # ---- after the app answered -------------------------------------------
     def observe(self, ip: str, path: str, status: int) -> None:
@@ -202,19 +247,19 @@ class Shield:
             if t is None or key in self._blocks:
                 return
             self._decay(t, now)
-            hits: List[Tuple[str, float]] = []
+            hits: List[_Hit] = []
             if RECON_PATHS.match(npath):
-                hits.append(("recon:probe-404", 25.0))
+                hits.append(("recon:probe-404", 25.0, False))
             t.not_found.append(now)
             while t.not_found and now - t.not_found[0] > cfg.enum_window:
                 t.not_found.popleft()
             if len(t.not_found) >= cfg.enum_404_threshold:
-                hits.append(("behavior:path-enumeration", 40.0))
+                hits.append(("behavior:path-enumeration", 40.0, False))
                 t.not_found.clear()
             if not hits:
                 return
-            t.score += sum(p for _, p in hits)
-            labels = [l for l, _ in hits]
+            self._add(t, hits)
+            labels = [l for l, _, _ in hits]
             score = t.score
             if score >= cfg.block_score:
                 self._block(t, key, now)
@@ -223,56 +268,59 @@ class Shield:
                 self._emit("score", ip, t.score, labels, "-", path, "", "-", cfg.mode == "enforce")
 
     # ---- sensors ----------------------------------------------------------
-    def _radar(self, t: _Track, now: float, method: str, npath: str, query: str,
-               h: Dict[str, str], ua: str) -> List[Tuple[str, float]]:
+    def _scan(self, method: str, npath: str, query: str, h: Dict[str, str], ua: str) -> List[_Hit]:
+        """Signals that depend on this request alone. Called without the lock."""
         cfg = self.cfg
-        hits: List[Tuple[str, float]] = []
+        hits: List[_Hit] = []
 
         # Decoys: a canary path has no legitimate visitor at all.
         if npath in self._canaries:
-            hits.append(("decoy:canary-path", 100.0))
+            hits.append(("decoy:canary-path", 100.0, False))
         elif SENSITIVE_PATHS.search(npath):
-            hits.append(("decoy:sensitive-file-probe", 60.0))
+            hits.append(("decoy:sensitive-file-probe", 60.0, False))
 
         # Signatures.
         hard = next(((l, p) for rx, p, l in HARD_UA if rx.search(ua)), None)
         if hard:
-            hits.append((hard[0], float(hard[1])))
+            hits.append((hard[0], float(hard[1]), False))
         else:
             for rx, pts, label in SOFT_UA:
-                if rx.search(ua) and self._soft_due(t, label, now):
-                    hits.append((label, float(pts)))
-            if not ua.strip() and self._soft_due(t, "ua:empty", now):
-                hits.append(("ua:empty", 20.0))
+                if rx.search(ua):
+                    hits.append((label, float(pts), True))
+            if not ua.strip():
+                hits.append(("ua:empty", 20.0, True))
             # A "browser" that sends no Accept-Language is a client library
             # wearing a browser User-Agent (rotating-UA scanners do this).
-            if (BROWSER_UA.search(ua) and not CRAWLER_UA.search(ua) and not h.get("accept-language")
-                    and self._soft_due(t, "shape:browser-ua-without-browser-headers", now)):
-                hits.append(("shape:browser-ua-without-browser-headers", 20.0))
+            if BROWSER_UA.search(ua) and not CRAWLER_UA.search(ua) and not h.get("accept-language"):
+                hits.append(("shape:browser-ua-without-browser-headers", 20.0, True))
 
         if method.upper() in ODD_METHODS:
-            hits.append((f"method:{method.upper()}", 30.0))
+            hits.append((f"method:{method.upper()}", 30.0, False))
 
         # Payloads in the URL; out-of-band markers in headers as well.
-        target = _decode(npath + "?" + query)
-        for rx, label in PAYLOADS + OOB:
-            if rx.search(target):
-                hits.append((label, 50.0))
+        target = _url_text(npath, query)
+        found = [label for rx, label in PAYLOADS + OOB if rx.search(target)]
         head_blob = _decode(" ".join(v[:2048] for k, v in h.items() if k != "cookie"))
-        for rx, label in OOB:
-            if rx.search(head_blob) and (label, 50.0) not in hits:
-                hits.append((label, 50.0))
+        found += [label for rx, label in OOB if label not in found and rx.search(head_blob)]
+        hits += [(label, 50.0, False) for label in found]
 
         # TLS fingerprint handed down by the edge (optional).
         if cfg.tls_header and self._tls_deny:
             fp = h.get(cfg.tls_header.lower(), "").lower()
-            if fp and fp in self._tls_deny and self._soft_due(t, "tls:denylisted-fingerprint", now):
-                hits.append(("tls:denylisted-fingerprint", 40.0))
+            if fp and fp in self._tls_deny:
+                hits.append(("tls:denylisted-fingerprint", 40.0, True))
+        return hits
+
+    def _radar(self, t: _Track, now: float, seen: List[_Hit]) -> List[_Hit]:
+        """What counts against this client now: the request's own signals, with
+        soft ones limited to once per half-life, plus volume and cadence."""
+        cfg = self.cfg
+        hits = [hit for hit in seen if not hit[2] or self._soft_due(t, hit[0], now)]
 
         # Volume.
         recent = [x for x in t.times if now - x <= cfg.rate_window]
         if len(recent) + 1 > cfg.rate_limit:
-            hits.append(("behavior:request-flood", 30.0))
+            hits.append(("behavior:request-flood", 30.0, False))
             t.times.clear()
         # Cadence: ARTEX's noise profiles and paced scanners (-rate N) space
         # requests evenly. People and browsers arrive in bursts and pauses.
@@ -283,8 +331,16 @@ class Shield:
             if cfg.cadence_min_mean <= mean <= cfg.cadence_max_mean:
                 cv = statistics.pstdev(gaps) / mean
                 if cv <= cfg.cadence_max_cv and self._soft_due(t, "behavior:metronomic-cadence", now):
-                    hits.append(("behavior:metronomic-cadence", 20.0))
+                    hits.append(("behavior:metronomic-cadence", 20.0, True))
         return hits
+
+    def _add(self, t: _Track, hits: List[_Hit]) -> None:
+        """Soft points fill a capped bucket; everything else adds without limit."""
+        for _, points, soft in hits:
+            if soft:
+                t.soft_points = min(self.cfg.soft_cap, t.soft_points + points)
+            else:
+                t.hard += points
 
     # ---- fire control ----------------------------------------------------
     def _engage(self, t, key, ip, now, labels, method, path, ua, ref, enforce) -> Decision:
@@ -312,7 +368,7 @@ class Shield:
         self.stats["blocked"] += 1
         ttl = min(self.cfg.block_ttl * (2 ** (t.strikes - 1)), self.cfg.max_block_ttl)
         self._blocks[key] = now + ttl
-        t.score = 0.0            # served its sentence when the block expires
+        t.hard = t.soft_points = 0.0     # served its sentence when the block expires
         t.throttled_until = 0.0
         t.not_found.clear()
         if self.cfg.blocklist_export_path:
@@ -367,12 +423,23 @@ class Shield:
             self._tracks.move_to_end(key)
         return t
 
+    def _blocked(self, key: str, now: float) -> bool:
+        until = self._blocks.get(key)
+        if until is None:
+            return False
+        if until > now:
+            return True
+        del self._blocks[key]
+        return False
+
     def _decay(self, t: _Track, now: float) -> None:
         dt = now - t.updated
         if dt > 0:
-            t.score *= 0.5 ** (dt / self.cfg.half_life)
+            factor = 0.5 ** (dt / self.cfg.half_life)
+            t.hard *= factor
+            t.soft_points *= factor
             if t.score < 0.5:
-                t.score = 0.0
+                t.hard = t.soft_points = 0.0
         t.updated = now
 
     def _soft_due(self, t: _Track, label: str, now: float) -> bool:

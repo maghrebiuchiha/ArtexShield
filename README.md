@@ -15,7 +15,7 @@ ARTEX is a self-hosted, LLM-driven pentest platform: a planner breaks a goal int
 | Fire control | Respond in proportion | Pass, then throttle (429), then block (403) with doubling block times |
 | Command post | Share the picture | JSON event log, callback hook, blocklist export for nginx |
 
-No single soft signal can stop a request. A block needs either one unambiguous signal (a canary hit, a scanner signature) or several weaker ones adding up.
+Soft signals cannot stop a request on their own, however many fire or however long a client runs. A block needs either one unambiguous signal (a canary hit, a scanner signature) or several weaker ones adding up.
 
 ## What ARTEX does, and how each habit is used
 
@@ -57,6 +57,14 @@ app.wsgi_app = ShieldWSGI(app.wsgi_app, shield)            # Flask
 ```
 
 Events go to the `artex_shield` logger as one JSON object per line. Every stopped request carries a short reference, also shown to the client, so a wrongly blocked user can quote it to you.
+
+### Behind a proxy
+
+The shield scores one client per address, so it has to see the visitor's address and not your proxy's. List your proxies in `trusted_proxies`; `X-Forwarded-For` is then read from them and from nobody else. Entries with a port (`203.0.113.7:44321`, `[2001:db8::7]:443`) are understood.
+
+A request is passed unscored when no address identifies its sender: the peer is one of your trusted proxies and the header names no client, or there is no peer address at all. Scoring it would put every visitor on one track, and one scanner would block them all. Each such request counts in `stats["unidentified"]`, and an `unidentified` event is logged once per half-life. If you see it, the shield is not protecting those requests, so fix the proxy configuration.
+
+An app server bound to a unix socket reports no peer address. Add `"0.0.0.0/32"` to `trusted_proxies` to take `X-Forwarded-For` from that socket.
 
 ## Plant the decoys
 
@@ -106,6 +114,10 @@ A User-Agent is self-declared, so the label alone is never trusted. ARTEX's own 
 
 Throttle at 50, block at 100. Scores halve every 10 minutes. First block lasts 1 hour and doubles per repeat, up to 24 hours. Everything is a `Config` field.
 
+The signals that repeat once per half-life are the soft ones. Together they hold at most `soft_cap` points, 40 by default and always below the throttle score, so a headless monitor or a script polling on the second is never stopped for that alone. They still count beside hard evidence: a headless browser that also probes for `/swagger.json` is throttled.
+
+Payload patterns read the decoded path and each decoded query name and value. The `?`, `&` and `=` of the query string itself are not part of that text, so `?page=2&id=5` is four plain words. After a single `;`, `|` or `&`, a short command name such as `id` or `cat` counts only with an argument behind it (`;cat /etc/passwd`), because those characters also separate ordinary lists (`fields=name|id|price`). Command substitution, `&&` and `||` count without one.
+
 ## Pushing blocks to the edge
 
 Set `blocklist_export_path="/etc/nginx/artex-deny.conf"` and include that file in your nginx `server` block; see `examples/nginx.conf`. The file is rewritten atomically on each new block. Reload nginx on a timer or with a file watcher.
@@ -130,6 +142,6 @@ src/artex_shield/
   decoys.py       canary generation and trap snippets
   middleware.py   WSGI and ASGI adapters
   util.py         address and decoding helpers
-tests/            31 tests on simulated traffic
+tests/            44 tests on simulated traffic
 examples/         Flask, FastAPI, nginx, and a campaign simulation
 ```
