@@ -236,15 +236,7 @@ def awkward(shield, clock, tally, canaries, rng):
             tally.count(kind, send(shield, clock, ip, "/search", SIGNED_IN if copy % 2 else BROWSER,
                                    query="q=" + urllib.parse.quote_plus(text), gap=rng.uniform(5, 45)))
 
-    # An IPv6 street: twenty-four households in one /56, each with its own /64.
-    # Five more networks in the same /56 are scanners and get blocked; that is
-    # too few for the /56 to be taken as one operator, so the street is left alone.
-    for bad in range(5):
-        send(shield, clock, f"2001:db8:40:{0xe0 + bad:x}::1", "/", {"User-Agent": "sqlmap/1.9"}, gap=1.0)
-    for house in range(24):
-        kind, ip = "IPv6 neighbours of scanners", f"2001:db8:40:{house:x}::{house + 1:x}"
-        tally.client(kind)
-        browse(shield, clock, tally, kind, ip, rng, sessions=3, pause=(5, 60), headers=SIGNED_IN)
+    ipv6_street(shield, clock, tally, rng)
 
     # A hostile page shows visitors image tags that point here: at a canary, a
     # dotfile, attack URLs, admin paths, a pile of dead links. Their browsers
@@ -264,6 +256,19 @@ def awkward(shield, clock, tally, canaries, rng):
                 tally.forced[0] += 1
                 tally.forced[1] += status in (403, 429)
             browse(shield, clock, tally, kind, ip, rng, sessions=4, pause=(5, 60))
+
+
+def ipv6_street(shield, clock, tally, rng, kind="IPv6 neighbours of scanners"):
+    """Twenty-four households in one /56, each with its own /64, and ten more
+    networks in the same /56 that are scanners and get blocked. Ten is past the
+    point where block widening (v6_escalate_after=8) would take the whole /56
+    for one operator. Widening is off by default, so the street is left alone."""
+    for bad in range(10):
+        send(shield, clock, f"2001:db8:40:{0xe0 + bad:x}::1", "/", {"User-Agent": "sqlmap/1.9"}, gap=1.0)
+    for house in range(24):
+        tally.client(kind)
+        browse(shield, clock, tally, kind, f"2001:db8:40:{house:x}::{house + 1:x}", rng, sessions=3, pause=(5, 60),
+               headers=SIGNED_IN)
 
 
 def visitors(shield, clock, canaries, n=300):
@@ -330,6 +335,13 @@ def main():
     stopped = tally.total(2)
     print(f"\nforced on visitors by a hostile page: {tally.forced[0]} requests, {tally.forced[1]} refused, "
           f"{sum(net.startswith('198.') for net in shield.blocklist())} visitors blocked")
+    # The same street on a shield with block widening switched on: not part of
+    # the count above, a picture of what the option costs.
+    wide_clock, wide_tally = Clock(), Tally()
+    ipv6_street(Shield(Config(mode="enforce", v6_escalate_after=8), clock=wide_clock), wide_clock, wide_tally,
+                random.Random(11))
+    _, sent, lost = wide_tally.rows["IPv6 neighbours of scanners"]
+    print(f"the same IPv6 street with block widening on (v6_escalate_after=8): {lost} of {sent} requests stopped")
     print(f"legitimate traffic: {tally.total(1)} requests from {tally.total(0)} clients, {stopped} stopped")
     return stopped
 

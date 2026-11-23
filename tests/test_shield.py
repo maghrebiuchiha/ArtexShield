@@ -950,7 +950,7 @@ class BlockTable(unittest.TestCase):
         self.assertEqual(len(s._blocks), 1)
 
     def test_rotating_ipv6_networks_gets_the_wider_prefix_blocked(self):
-        s, c = shield()
+        s, c = shield(v6_escalate_after=8)
         for i in range(7):
             s.check(f"2001:db8:5:{i:x}::1", "GET", "/", headers=SCANNER)
         self.assertEqual(s.check("2001:db8:5:99::7", "GET", "/", headers=BROWSER).action, "pass")   # seven: not yet
@@ -965,7 +965,7 @@ class BlockTable(unittest.TestCase):
         self.assertEqual(s.blocklist(), {})
 
     def test_rotation_across_wider_networks_escalates_again(self):
-        s, _ = shield()
+        s, _ = shield(v6_escalate_after=8)
         for net in range(8):                      # eight /56s, eight /64s in each
             for i in range(8):
                 s.check(f"2001:db8:6:{net:x}{i:02x}::1", "GET", "/", headers=SCANNER)
@@ -975,15 +975,21 @@ class BlockTable(unittest.TestCase):
         self.assertTrue(s.unblock("2001:db8:6:f00d::1"))                 # lifting it for one address lifts the prefix
         self.assertEqual(s.check("2001:db8:6:f00d::1", "GET", "/", headers=BROWSER).action, "pass")
 
-    def test_escalation_can_be_switched_off(self):
-        s, _ = shield(v6_escalate_after=0)
-        for i in range(40):
-            s.check(f"2001:db8:5:{i:x}::1", "GET", "/", headers=SCANNER)
-        self.assertEqual(len(s.blocklist()), 40)
-        self.assertEqual(s.check("2001:db8:5:99::7", "GET", "/", headers=BROWSER).action, "pass")
+    def test_widening_is_off_by_default(self):
+        # A /56 or /48 can hold hundreds of a provider's customers, so blocking
+        # one is something an operator must ask for.
+        self.assertEqual(Config().v6_escalate_after, 0)
+        for s, _ in (shield(), shield(v6_escalate_after=0)):
+            for i in range(40):
+                s.check(f"2001:db8:5:{i:x}::1", "GET", "/", headers=SCANNER)
+            self.assertEqual(len(s.blocklist()), 40)
+            self.assertTrue(all(net.endswith("/64") for net in s.blocklist()))
+            self.assertEqual(s.check("2001:db8:5:99::7", "GET", "/", headers=BROWSER).action, "pass")
+        with self.assertRaises(ValueError):
+            Config(v6_escalate_after=1)
 
     def test_neighbours_of_a_few_blocked_networks_are_untouched(self):
-        s, c = shield()
+        s, c = shield(v6_escalate_after=8)
         for i in range(3):
             s.check(f"2001:db8:8:{i:x}::1", "GET", "/", headers=SCANNER)
         for i in range(16, 200):                  # the rest of the street

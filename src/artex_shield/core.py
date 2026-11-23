@@ -91,10 +91,13 @@ class Config:
     # lets anyone who can show your visitors an image tag get them blocked.
     score_induced: bool = False
     max_blocks: int = 100000         # most blocks held; past it the ones nearest expiry go first
-    # IPv6: one host can own a /56 or a /48 and move to a fresh /64 for every
-    # request. When this many /64s inside one /56 are blocked at once the /56 is
-    # blocked, and the same again from /56 to /48. 0 switches it off.
-    v6_escalate_after: int = 8
+    # IPv6 block widening, off by default. One host can own a /56 or a /48 and
+    # move to a fresh /64 for every request. Set this to N (8 is a reasonable
+    # start) and when N /64s inside one /56 are blocked at once the /56 is
+    # blocked, and the same again from /56 to /48. Off, because a /56 or /48
+    # can also be a provider's pool shared by hundreds of customers, who would
+    # all be blocked together. 0 is off; 1 is refused.
+    v6_escalate_after: int = 0
     # Guessing below enum_404_threshold a minute used to cost nothing for ever.
     # A client gets this many newly missing paths per slow_enum_window; each one
     # past that scores slow_enum_points. 0 switches it off.

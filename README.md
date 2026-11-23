@@ -11,7 +11,7 @@ ARTEX is a self-hosted, LLM-driven pentest platform: a planner breaks a goal int
 | Radar | See everything, score what looks wrong | Sensors: signatures, header shape, payloads, 404 enumeration fast and slow, request cadence, optional TLS fingerprint |
 | IFF | Tell friend from foe | Allowlists, plus authorised assessments verified by reference, source range and time window |
 | Decoys | Draw fire away from real assets | Canary paths planted in `robots.txt`, hidden links and JS bundles |
-| Tracking | Follow each contact | One decaying threat score per client (IPv4 address, IPv6 /64); a block widens to the /56 or /48 when one operator keeps changing /64 |
+| Tracking | Follow each contact | One decaying threat score per client (IPv4 address, IPv6 /64); optionally, a block widens to the /56 or /48 when one operator keeps changing /64 |
 | Fire control | Respond in proportion | Pass, then throttle (429), then block (403) with doubling block times; refuse a single request (403) without touching the address |
 | Command post | Share the picture | JSON event log, callback hook, one nginx deny file shared by all workers |
 
@@ -146,7 +146,7 @@ Two things act without points:
 | Situation | What happens |
 | --- | --- |
 | A request a web page made the browser send (see "Requests a page made the browser send") | Never scored. Refused with a 403 if the request itself carries a hard signal: a canary, a scanner User-Agent, a dotfile, a payload or an odd method. |
-| 8 blocked IPv6 /64s inside one /56, or 8 blocked /56s inside one /48 | The whole prefix is blocked for the first-block time, and one entry replaces the eight. |
+| Only with `v6_escalate_after` set (off by default): that many blocked IPv6 /64s inside one /56, or /56s inside one /48 | The whole prefix is blocked for the first-block time, and one entry replaces them. See "IPv6 block widening" before turning it on. |
 
 Throttle at 50, block at 100. Scores halve every 10 minutes. First block lasts 1 hour and doubles per repeat, up to 24 hours. Everything is a `Config` field.
 
@@ -179,6 +179,18 @@ A search that pastes a whole payload, such as `' or 1=1--`, `<script>alert(1)</s
 
 Headers are searched for JNDI lookups and callback domains only, in full and cookies included. They are not searched for the payload kinds above. A `Referer` or cookie repeats on every request, and a single-page app puts whatever the person typed into the address without asking the server, so one innocent match there would score a visitor again and again.
 
+## IPv6 block widening
+
+Off by default. An IPv6 client is tracked and blocked by its /64, the network one household or server is usually given. One operator can hold a whole /56 or /48 and move to a fresh /64 for every request, starting from zero each time. `v6_escalate_after` answers that: set it to N and, when N /64s inside one /56 are blocked at the same time, the whole /56 is blocked; N blocked /56s inside one /48 get the /48 blocked the same way.
+
+```python
+Config(v6_escalate_after=8)   # 0, the default, is off; 1 is refused
+```
+
+The risk is who else is in that prefix. A /56 is often one household's or one customer's allocation, but some providers, mobile networks and hosting platforms hand out /64s to many customers from a shared /56 or /48. Widening there blocks every customer in the pool together, for the first-block time (an hour by default), because of what a few neighbours did. `examples/simulate.py` shows it: 24 households sharing a /56 with 10 blocked scanners are untouched with widening off, and lose every request with `v6_escalate_after=8`.
+
+Turn it on only if you know how your visitors' providers allocate addresses, or you are under a rotating-/64 attack and accept blocking neighbours. Watch the log for `behavior:network-rotation` events, which mark each widened block, and run in `monitor` mode first.
+
 ## Pushing blocks to the edge
 
 Set `blocklist_export_path="/etc/nginx/artex-deny.conf"` and include that file in your nginx `server` block; see `examples/nginx.conf`. Reload nginx on a timer or with a file watcher.
@@ -194,7 +206,7 @@ For the TLS sensor, have your edge pass a JA3 or JA4 value in a header and set `
 
 ## Limits
 
-- **There is no list of ARTEX addresses.** It is self-hosted, so it arrives from wherever its operator runs it. Addresses are blocked for behaviour, and an operator with fresh IPv4 addresses starts each one from zero. On IPv6 a run of fresh /64s inside one /56 or /48 gets the prefix blocked after 8 (`v6_escalate_after`), but an operator with addresses in unrelated prefixes still starts from zero in each.
+- **There is no list of ARTEX addresses.** It is self-hosted, so it arrives from wherever its operator runs it. Addresses are blocked for behaviour, and an operator with fresh addresses starts each one from zero. On IPv6 that includes every fresh /64 inside one /56 or /48, unless you turn on block widening (`v6_escalate_after`, off by default; see "IPv6 block widening"). Even with it on, an operator with addresses in unrelated prefixes starts from zero in each.
 - **Signatures are the weak layer.** Every User-Agent here can be changed with one flag. The decoys and behaviour sensors are what hold against a careful operator, and a patient one running slowly, with full browser headers, avoiding guesswork, can still get through. This reduces what automated tooling finds cheaply. It does not fix vulnerabilities.
 - **`Sec-Fetch-Site` is the client's word.** A request is taken as induced, and so never scored, when its `Sec-Fetch-Site` header says `cross-site` or `same-site`, when it says `same-origin` and `Sec-Fetch-Dest` names something a page embeds, or, without those headers, when the `Referer` is from another host. Real browsers set these and a page cannot forge them, which is what protects your visitors from being blocked by a page they merely looked at. A tool can send them too. It gains nothing for an attack request, since every induced request that trips a hard signal is refused, but it can guess paths and send volume without its address being scored: the 404, recon, slow-guessing and flood sensors do not see it. `score_induced=True` closes that gap and reopens the other one.
 - **A link someone is talked into opening** is not induced as far as the browser can tell if it is pasted or opened from a mail client (`Sec-Fetch-Site: none`), so a canary link sent by e-mail still blocks the person who opens it.
@@ -202,7 +214,7 @@ For the TLS sensor, have your edge pass a JA3 or JA4 value in a header and set `
 - **Payload patterns are a net, not a parser.** A bare `;id` or `|id` is not scored, because it reads the same as a list. Injection sent only in a `Referer`, cookie or other header is not scored, apart from JNDI lookups and callback domains. Encodings a pattern does not expect get through. To let search text through, some payload forms are not scored: a bare `<script>` tag with no code, a lone `<svg>` or `<iframe>`, a number left dangling after `OR` (`' or 1`), `UNION SELECT` after a plain word with a one-word list (`x union select a`), and two levels of `../` to a file with no server-side extension. And a search that is itself a payload (`sleep(5)`, `{{7*7}}`, `' or 1=1--`) still scores.
 - **Request bodies are not inspected**, nor are messages on an open WebSocket, and nmap port scans never reach a web app at all. Keep your firewall and, if you have one, your WAF.
 - **An exposed dump that really exists is served.** The shield cannot tell `db-backup.sql` from `employee-handbook.zip` until the app answers, so it waits for the 404.
-- **Shared addresses.** Blocking an address also blocks everyone behind the same NAT, VPN or campus network. A widened IPv6 block covers more: a /56 can be one household or, with some providers, a few hundred customers. It takes 8 separately blocked networks inside it, and lasts the first-block time. This is why blocks expire and why `monitor` is the default mode.
+- **Shared addresses.** Blocking an address also blocks everyone behind the same NAT, VPN or campus network. IPv6 block widening, if you turn it on, covers more: a /56 can be one household or, with some providers, hundreds of customers. This is why blocks expire and why `monitor` is the default mode.
 - **Scores are per process.** With several workers each keeps its own scores, so thresholds are effectively multiplied, and a block made by one worker is enforced by the others only at the edge, through the shared deny file. Run one worker, or enforce the file in nginx, until a shared store is added.
 - **Search engines.** Crawlers that honour `robots.txt` will not touch canaries. Verified-bot checks by reverse DNS are not included; add crawler ranges to `allow_cidrs` if you see them scored. A crawler working through many dead links will also run into the hourly allowance.
 
