@@ -9,11 +9,14 @@ Python middleware that detects and blocks ARTEX-style automated pentest traffic
 - `src/artex_shield/decoys.py` - canary paths and trap snippets
 - `src/artex_shield/middleware.py` - WSGI and ASGI adapters
 - `tests/test_shield.py` - simulated traffic, fake clock, no network
+- `spec/vectors.json`, `spec/SPEC.md` - the cases and rules every port must match; `tests/test_vectors.py` runs them
 - `examples/simulate.py` - campaign vs. legitimate-traffic soak; exits 1 if any legit request is stopped
 
 ## Commands
 - Tests: `python -W error -m unittest discover -s tests`
 - Simulation: `python examples/simulate.py`
+- Vectors: `python spec/export_vectors.py` after a deliberate behaviour change (review the diff: it binds every port);
+  CI runs `--check`
 
 ## Rules
 - No runtime dependencies. Optional integrations (e.g. Redis) go behind an extra.

@@ -1,0 +1,350 @@
+"""Write spec/vectors.json from the Python test suite.
+
+Runs the detection tests in tests/test_shield.py with Shield instrumented, and
+records every decision they make: each test's shield becomes one case (its
+config, then every request, status fed back, unblock and blocklist check, in
+order, with the decision that came out). Long runs of near-identical requests
+are folded into repeat blocks, and the result is checked by replaying it
+through the Python shield (tests/test_vectors.py) before it is written.
+
+The expectations are therefore what the reference implementation does under
+the tests that already assert the intended behaviour. Regenerate only after a
+deliberate change of behaviour, and review the diff of vectors.json: it is the
+contract every port is held to.
+
+    python spec/export_vectors.py           # rewrite spec/vectors.json
+    python spec/export_vectors.py --check   # exit 1 if it would change
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import os
+import re
+import sys
+import time
+import unittest
+from typing import Any, Dict, List, Optional
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path[:0] = [os.path.join(ROOT, "src"), os.path.join(ROOT, "tests")]
+
+from artex_shield import Config, Shield  # noqa: E402
+from artex_shield import core  # noqa: E402
+
+T0 = 1_800_000_000.0
+OUT = os.path.join(ROOT, "spec", "vectors.json")
+
+# Tests of Python plumbing, not of decisions: adapters, the block file, the
+# lock, the block table's memory bound, and timing.
+SKIP_CLASSES = {"Adapters", "Export", "Delivery", "Cost", "WebSockets"}
+SKIP_TESTS = {"test_blocklist_export", "test_track_table_is_bounded", "test_block_table_is_capped",
+              "test_expired_blocks_are_dropped_without_being_asked_for", "test_asgi_passes_the_context_through",
+              "test_canaries_match_what_artex_harvests", "test_helpers"}
+# Config fields that are wiring, not behaviour.
+NOT_SPEC = {"logger", "on_event", "blocklist_export_path", "blocklist_export_format", "max_tracks", "max_blocks"}
+
+state: Dict[str, Any] = {"test": None, "cases": [], "client_ip": [], "config_errors": []}
+_orig = {name: getattr(Shield, name) for name in ("__init__", "check", "observe", "client_ip", "blocklist", "unblock")}
+_orig_post_init = Config.__post_init__
+
+
+def _number(v: float) -> Any:
+    return int(v) if float(v).is_integer() else round(v, 9)
+
+
+def _config(cfg: Config) -> Dict[str, Any]:
+    default, out = Config(), {}
+    for f in dataclasses.fields(Config):
+        if f.name in NOT_SPEC:
+            continue
+        value, base = getattr(cfg, f.name), getattr(default, f.name)
+        if f.name == "soft_cap":
+            base = 0.8 * cfg.throttle_score
+        if f.name == "engagements":
+            value = [{"reference": e.reference, "cidrs": list(e.cidrs), "start": _time(e.start.timestamp()),
+                      "end": _time(e.end.timestamp())} for e in value]
+            base = []
+        if isinstance(value, (tuple, set, frozenset)):
+            value = sorted(value) if isinstance(value, (set, frozenset)) else list(value)
+            base = list(base) if isinstance(base, (tuple, list)) else base
+        if value != base:
+            out[f.name] = value
+    return out
+
+
+def _decision(d) -> Dict[str, Any]:
+    out = {"action": d.action, "hits": sorted(d.hits), "score": _number(d.score)}
+    if d.action == "throttle":
+        out["retry_after"] = d.retry_after
+    return out
+
+
+def _recording(self) -> Optional[Dict[str, Any]]:
+    return getattr(self, "_vector", None)
+
+
+def _init(self, config=None, clock=time.time):
+    _orig["__init__"](self, config, clock)
+    if state["test"] and clock is not time.time:
+        self._vector = {"id": None, "test": state["test"], "config": _config(self.cfg), "steps": []}
+        state["cases"].append(self._vector)
+
+
+def _time(t: float) -> Any:
+    """Seconds after T0, exactly: T0 + this gives back t bit for bit."""
+    at = t - T0
+    return int(at) if at.is_integer() else at
+
+
+def _at(self) -> Any:
+    return _time(self.clock())
+
+
+def _check(self, ip, method, path, query="", headers=None):
+    rec, at = _recording(self), self.clock()
+    d = _orig["check"](self, ip, method, path, query, headers)
+    if rec is not None:
+        request = {"ip": ip, "method": method, "path": path}
+        if query:
+            request["query"] = query
+        if headers:
+            request["headers"] = dict(headers)
+        rec["steps"].append({"at": _time(at), "request": request, "expect": _decision(d)})
+    return d
+
+
+def _observe(self, ip, path, status, induced=False):
+    rec = _recording(self)
+    if rec is not None:
+        step = {"at": _at(self), "observe": {"ip": ip, "path": path, "status": status}}
+        if induced:
+            step["observe"]["induced"] = True
+        rec["steps"].append(step)
+    return _orig["observe"](self, ip, path, status, induced)
+
+
+def _client_ip(self, remote_addr, forwarded_for=None):
+    out = _orig["client_ip"](self, remote_addr, forwarded_for)
+    if state["test"]:
+        item = {"trusted_proxies": list(self.cfg.trusted_proxies), "remote": remote_addr or "",
+                "forwarded_for": forwarded_for, "expect": out}
+        if item not in state["client_ip"]:
+            state["client_ip"].append(item)
+    return out
+
+
+def _blocklist(self):
+    out = _orig["blocklist"](self)
+    rec = _recording(self)
+    if rec is not None:
+        rec["steps"].append({"at": _at(self), "expect_blocklist": sorted(out)})
+    return out
+
+
+def _unblock(self, ip):
+    out = _orig["unblock"](self, ip)
+    rec = _recording(self)
+    if rec is not None:
+        rec["steps"].append({"at": _at(self), "unblock": ip, "expect": out})
+    return out
+
+
+def _post_init(self):
+    try:
+        _orig_post_init(self)
+    except ValueError as e:
+        if state["test"]:
+            fields = {f.name: getattr(self, f.name) for f in dataclasses.fields(Config)}
+            default = {f.name: getattr(Config(), f.name) for f in dataclasses.fields(Config)}
+            given = {k: (list(v) if isinstance(v, tuple) else v) for k, v in fields.items()
+                     if k not in NOT_SPEC and v != default[k] and not (k == "soft_cap" and v is None)}
+            entry = {"config": given, "error": str(e)}
+            if entry not in state["config_errors"]:
+                state["config_errors"].append(entry)
+        raise
+
+
+# ---- folding loops into repeat blocks ----------------------------------------------
+_TOKEN = re.compile(r"\d+")
+
+
+def _shape(step: Dict[str, Any]) -> str:
+    """The step with its time removed and every number replaced, for grouping."""
+    body = {k: v for k, v in step.items() if k not in ("at", "expect")}
+    return _TOKEN.sub("#", json.dumps(body, sort_keys=True))
+
+
+def _template(steps: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """If the request/observe parts of `steps` differ only by one number that
+    counts up by one per step, the template with {i} in its place and the
+    first value; else None."""
+    texts = [json.dumps({k: v for k, v in s.items() if k not in ("at", "expect")}, sort_keys=True) for s in steps]
+    if all(t == texts[0] for t in texts):
+        return {"template": json.loads(texts[0]), "first": None}
+    parts = [_TOKEN.split(t) for t in texts]
+    nums = [_TOKEN.findall(t) for t in texts]
+    if any(p != parts[0] for p in parts) or any(len(n) != len(nums[0]) for n in nums):
+        return None
+    varying = [j for j in range(len(nums[0])) if any(n[j] != nums[0][j] for n in nums)]
+    if len(varying) != 1:
+        return None
+    j = varying[0]
+    first = int(nums[0][j])
+    if any(int(n[j]) != first + k for k, n in enumerate(nums)) or nums[0][j] != str(first):
+        return None
+    pieces = []
+    for k, piece in enumerate(parts[0]):
+        pieces.append(piece)
+        if k < len(nums[0]):
+            pieces.append("{i}" if k == j else nums[0][k])
+    text = "".join(pieces)
+    if text.count("{i}") != 1 or any("{i}" in t for t in texts):
+        return None
+    try:
+        template = json.loads(text)               # the counter must sit inside a string value
+    except ValueError:
+        return None
+    return {"template": template, "first": first}
+
+
+def _fold(steps: List[Dict[str, Any]], min_run: int = 12) -> List[Dict[str, Any]]:
+    """Fold runs of 1- or 2-step groups (a request, or a request and the
+    status fed back for it) into repeat blocks. A run qualifies when its
+    groups differ only by one number counting up by one, and each group's
+    absolute time is the previous one's plus the same increment, so a runner
+    that accumulates time the same way reproduces every instant exactly."""
+    count = len(steps)
+    shapes = [_shape(s) for s in steps]
+    run = {1: [1] * count, 2: [1] * count}             # groups of identical shape starting here
+    for k in range(count - 2, -1, -1):
+        if shapes[k] == shapes[k + 1]:
+            run[1][k] = run[1][k + 1] + 1
+    for k in range(count - 4, -1, -1):
+        if shapes[k] == shapes[k + 2] and shapes[k + 1] == shapes[k + 3]:
+            run[2][k] = run[2][k + 2] + 1
+    out, i = [], 0
+    while i < count:
+        done = False
+        for width in (1, 2):
+            n = run[width][i]
+            if n < min_run or (width == 2 and steps[i + 1]["at"] != steps[i]["at"]):
+                continue
+            first_t = T0 + steps[i]["at"]
+            every = (T0 + steps[i + width]["at"]) - first_t
+            m, t = 1, first_t
+            while (m < n and every > 0 and t + every == T0 + steps[i + m * width]["at"]
+                   and (width == 1 or steps[i + m * width + 1]["at"] == steps[i + m * width]["at"])):
+                t += every
+                m += 1
+            if m < min_run:
+                continue
+            groups = [steps[i + g * width:i + (g + 1) * width] for g in range(m)]
+            templates = [_template([g[k] for g in groups]) for k in range(width)]
+            firsts = {tp["first"] for tp in templates if tp is not None and tp["first"] is not None}
+            if any(tp is None for tp in templates) or len(firsts) > 1:
+                out += steps[i:i + m * width]          # same shape, but not one counter: leave it unfolded
+                i += m * width
+                done = True
+                break
+            block = {"repeat": m, "at": steps[i]["at"], "every": every, "i_from": firsts.pop() if firsts else 0,
+                     "steps": [tp["template"] for tp in templates], "expect": []}
+            for g in groups:
+                full = [st.get("expect") for st in g]
+                outcome = [None if e is None else {"action": e["action"], "hits": e["hits"]} for e in full]
+                if block["expect"] and block["expect"][-1]["each"] == outcome:
+                    block["expect"][-1]["times"] += 1
+                    block["expect"][-1]["last"] = full
+                else:
+                    block["expect"].append({"times": 1, "each": outcome, "last": full})
+            out.append(block)
+            i += m * width
+            done = True
+            break
+        if not done:
+            out.append(steps[i])
+            i += 1
+    return out
+
+
+class _Recorder(unittest.TextTestResult):
+    def startTest(self, test):
+        state["test"] = test.id().split(".", 1)[1]
+        super().startTest(test)
+
+    def stopTest(self, test):
+        super().stopTest(test)
+        state["test"] = None
+
+
+def _selected(suite) -> List[unittest.TestCase]:
+    out = []
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            out += _selected(item)
+        elif type(item).__name__ not in SKIP_CLASSES and item._testMethodName not in SKIP_TESTS:
+            out.append(item)
+    return out
+
+
+def record() -> Dict[str, Any]:
+    Shield.__init__, Shield.check, Shield.observe = _init, _check, _observe
+    Shield.client_ip, Shield.blocklist, Shield.unblock = _client_ip, _blocklist, _unblock
+    Config.__post_init__ = _post_init
+    try:
+        import test_shield
+        tests = _selected(unittest.defaultTestLoader.loadTestsFromModule(test_shield))
+        with open(os.devnull, "w") as devnull:
+            result = unittest.TextTestRunner(resultclass=_Recorder, verbosity=0, stream=devnull).run(
+                unittest.TestSuite(tests))
+        if not result.wasSuccessful():
+            raise SystemExit(f"the test suite fails; fix it before exporting: {result.failures + result.errors}")
+    finally:
+        for name, fn in _orig.items():
+            setattr(Shield, name, fn)
+        Config.__post_init__ = _orig_post_init
+
+    cases, counts = [], {}
+    for case in state["cases"]:
+        if not case["steps"]:
+            continue
+        name = case["test"].replace(".", "/")
+        counts[name] = counts.get(name, 0) + 1
+        case["id"] = f"{name}#{counts[name]}"
+        case["steps"] = _fold(case["steps"])
+        cases.append({k: case[k] for k in ("id", "config", "steps") if case[k] or k != "config"})
+    return {
+        "spec": "artex-shield detection vectors",
+        "version": 1,
+        "t0": T0,
+        "about": "Generated by spec/export_vectors.py from the Python test suite; see spec/SPEC.md for the format.",
+        "client_ip": state["client_ip"],
+        "config_errors": state["config_errors"],
+        "cases": cases,
+    }
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--check", action="store_true", help="exit 1 if vectors.json would change")
+    args = ap.parse_args()
+    data = record()
+    text = json.dumps(data, indent=1, ensure_ascii=False, sort_keys=False) + "\n"
+    old = ""
+    if os.path.exists(OUT):
+        with open(OUT, encoding="utf-8") as f:
+            old = f.read()
+    if args.check:
+        print("spec/vectors.json is up to date" if old == text else "spec/vectors.json would change")
+        return 0 if old == text else 1
+    with open(OUT, "w", encoding="utf-8") as f:
+        f.write(text)
+    steps = sum(len(c["steps"]) for c in data["cases"])
+    print(f"wrote {OUT}: {len(data['cases'])} cases, {steps} top-level steps, "
+          f"{len(data['client_ip'])} client_ip cases, {len(data['config_errors'])} config errors")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

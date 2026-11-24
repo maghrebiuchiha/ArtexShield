@@ -227,6 +227,7 @@ src/artex_shield/
   decoys.py       canary generation and trap snippets
   middleware.py   WSGI and ASGI adapters
   util.py         address and decoding helpers
-tests/            104 tests on simulated traffic
+tests/            109 tests, including every case in spec/vectors.json
 examples/         Flask, FastAPI, nginx, and a campaign simulation
+spec/             vectors.json and SPEC.md: the cases and rules every port is checked against
 ```
