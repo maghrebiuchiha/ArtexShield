@@ -5,11 +5,12 @@ clock. Run it to see the engagement sequence and to sanity-check tuning.
 
     python examples/simulate.py
 """
+import json
 import logging
 import random
 import urllib.parse
 
-from artex_shield import Config, Shield, make_canaries
+from artex_shield import Config, Shield, honeytoken_html, honeytoken_js, make_canaries, make_honeytokens
 
 logging.getLogger("artex_shield").addHandler(logging.NullHandler())
 logging.getLogger("artex_shield").propagate = False
@@ -49,6 +50,9 @@ DOWNLOADS = ["/downloads/price-list.pdf", "/downloads/brochure-2026.pdf", "/down
              "/downloads/feedback-form-2026.zip", "/exports/customer-database.zip", "/downloads/release-notes.old",
              "/downloads/site-backup-tool.tar"]
 SITE = set(PAGES) | set(DOWNLOADS)
+# Fake credentials planted in the site: honeytoken_js(TOKENS) in /static/app.js,
+# honeytoken_html(TOKENS) in the base template.
+TOKENS = make_honeytokens("demo-secret")
 # What people type into a search box: books with colons, years and quoted
 # titles, recipes with apostrophes and brackets, programming questions that
 # mention <script>, sleep(), UNION SELECT or ../../. tests/test_shield.py
@@ -127,9 +131,9 @@ class Tally:
         return sum(row[column] for row in self.rows.values())
 
 
-def send(shield, clock, ip, path, headers, query="", gap=0.0, log=None, who="", method="GET"):
+def send(shield, clock, ip, path, headers, query="", gap=0.0, log=None, who="", method="GET", body=None):
     clock.t += gap
-    d = shield.check(ip, method, path, query, headers)
+    d = shield.check(ip, method, path, query, headers, body)
     status = {"throttle": 429}.get(d.action, 403) if d.stop else (200 if path in SITE else 404)
     if not d.stop:
         kind = "text/html" if path in HTML else "application/json" if path.startswith("/api") else "text/plain"
@@ -319,6 +323,7 @@ def awkward(shield, clock, tally, canaries, rng):
 
     ipv6_street(shield, clock, tally, rng)
     script_clients(shield, clock, tally, rng)
+    forms_and_uploads(shield, clock, tally, rng)
 
     # A hostile page shows visitors image tags that point here: at a canary, a
     # dotfile, attack URLs, admin paths, a pile of dead links. Their browsers
@@ -328,6 +333,7 @@ def awkward(shield, clock, tally, canaries, rng):
             ("/api/items", "id=1' UNION SELECT null--"), ("/db-backup.sql", ""),
             ("/admin", ""), ("/wp-login.php", ""), ("/phpmyadmin/", ""), ("/actuator/env", "")]
     bait += [(f"/x-{i}", "") for i in range(40)]
+    bait += [("/api/items", "api_key=" + TOKENS.api_keys[0])]        # a planted key, in an <img> URL
     for copy in range(5):
         kind, ip = "visitor on a hostile page", f"198.19.23.{copy + 1}"
         tally.client(kind)
@@ -338,6 +344,41 @@ def awkward(shield, clock, tally, canaries, rng):
                 tally.forced[0] += 1
                 tally.forced[1] += status in (403, 429)
             browse(shield, clock, tally, kind, ip, rng, sessions=4, pause=(5, 60))
+
+
+def forms_and_uploads(shield, clock, tally, rng):
+    """Requests with bodies, which the honeytoken check now reads: logins with
+    real credentials, JSON posts, uploads past the 64 KB it reads."""
+    for copy in range(6):
+        kind, ip = "forms and uploads", f"198.19.26.{copy + 1}"
+        tally.client(kind)
+        for i in range(25):
+            login = urllib.parse.urlencode({"username": f"customer{copy}", "password": f"Correct-Horse-{i}!"})
+            tally.count(kind, send(shield, clock, ip, "/login", BROWSER, gap=rng.uniform(5, 60), method="POST",
+                                   body=login.encode()))
+            note = json.dumps({"id": i, "note": "deliver to the back door; api_live is our plan name", "qty": 2})
+            tally.count(kind, send(shield, clock, ip, "/api/items", BROWSER, gap=rng.uniform(2, 20), method="POST",
+                                   body=note.encode()))
+            upload = b"--b\r\nContent-Disposition: form-data; name=file\r\n\r\n" + bytes(rng.randrange(256)
+                                                                                         for _ in range(200_000))
+            tally.count(kind, send(shield, clock, ip, "/api/items", BROWSER, gap=rng.uniform(2, 20), method="POST",
+                                   body=upload[:65536]))
+
+
+def credential_replay(shield, clock):
+    """Campaign, last phase: the harvest read app.js and the page source and
+    found credentials someone forgot. Two more addresses try them."""
+    results = []
+    for ip, how, kwargs in (
+            ("203.0.113.15", "the bundle's API key as a Bearer token",
+             {"path": "/api/items", "headers": dict(BROWSER, Authorization="Bearer " + TOKENS.api_keys[0])}),
+            ("203.0.113.16", "the HTML comment's login through the form",
+             {"path": "/login", "headers": BROWSER, "method": "POST",
+              "body": urllib.parse.urlencode({"username": TOKENS.users[1], "password": TOKENS.passwords[1]}).encode()})):
+        log = []
+        status = send(shield, clock, ip, gap=1.0, log=log, who="replay", **kwargs)
+        results.append((how, status, log[0][4]))
+    return results
 
 
 def ipv6_street(shield, clock, tally, rng, kind="IPv6 neighbours of scanners"):
@@ -400,7 +441,7 @@ def visitors(shield, clock, canaries, n=300):
 def main():
     clock = Clock()
     canaries = make_canaries("demo-secret")
-    shield = Shield(Config(mode="enforce", canary_paths=canaries, client_check=True,
+    shield = Shield(Config(mode="enforce", canary_paths=canaries, honeytokens=TOKENS, client_check=True,
                            client_check_secret="demo-secret"), clock=clock)
 
     print(f"{'actor':<12} {'request':<44} {'resp':>4} {'score':>5}  signals")
@@ -414,6 +455,8 @@ def main():
     signals, stopped = api_replay(shield, clock)
     print(f"API replay from a fifth address, no page script run: signals {', '.join(signals)}; soft alone, so it "
           f"is let through until a /swagger.json probe adds hard evidence; stopped from request {stopped}")
+    for how, status, hits in credential_replay(shield, clock):
+        print(f"credential replay, {how}: {status} on the first request ({hits})")
     tally = visitors(shield, clock, canaries)
     print(f"\n{'legitimate client':<26} {'clients':>7} {'requests':>9} {'stopped':>8}")
     for kind, (clients, requests, stopped) in tally.rows.items():

@@ -139,6 +139,33 @@ js_trap(canaries[0])         # paste into a JS file that ships in your bundle
 
 Always list canaries in `robots.txt` so well-behaved crawlers stay out of them. Change the secret and the canaries change with it.
 
+### Credential honeytokens
+
+Fake API keys and passwords, derived from the same secret, planted where someone reading your source would find them. There is no account behind them, so the only way a request carries one is that someone harvested it and is trying it. Presenting one, anywhere, is a block on the first request.
+
+```python
+from artex_shield import Config, honeytoken_html, honeytoken_js, make_honeytokens
+
+tokens = make_honeytokens("a-long-random-secret-you-keep")
+Config(canary_paths=canaries, honeytokens=tokens)
+honeytoken_js(tokens)     # paste into a JS file that ships in your bundle: a dead staging config object
+honeytoken_html(tokens)   # paste into your base template: a "remove before release" comment with a login
+```
+
+The two helpers plant different pairs, so the log says which one was harvested. The keys look like `api_live_` plus 32 letters and digits. That deliberately matches no real provider's format, so planting them sets off no secret scanner and sends no false leak report to a provider. The passwords are 16 characters with a symbol. The usernames (`svc-deploy`, `admin-legacy`) are decoration: they could be someone's real account name, so they trigger nothing on their own.
+
+Where the shield looks:
+
+- every request header, with `Authorization: Basic` unpacked; the `Referer` is skipped, since it is only the browser repeating an address;
+- cookies, the query string and the path;
+- the first 64 KB of the body (`honeytoken_body_limit`).
+
+Each place is searched as sent and URL-decoded, so a password typed into a login form is caught however it is encoded. The adapters read the body only when honeytokens are set, and hand it to your app unchanged. A WSGI body of unknown length is not read unless the server marks its end, since reading it could block.
+
+Like canaries, honeytokens are public by design, so a hostile page could make a visitor's browser send one: `<img src="/api/items?api_key=...">`. That request is refused, and the visitor's address is not blocked (see "Requests a page made the browser send"). A request carrying one in a header or cookie cannot be forced that way, because another site's page cannot set them.
+
+If you deploy by uploading your bundle through your own site, the upload carries the planted tokens: exempt that path (`exempt_paths`) or the deploy address (`allow_cidrs`).
+
 ## Authorised assessments
 
 ```python
@@ -160,6 +187,7 @@ A User-Agent is self-declared, so the label alone is never trusted. ARTEX's own 
 | Signal | Points | Repeats |
 | --- | --- | --- |
 | Canary path | 100 | every hit |
+| Honeytoken (a planted fake API key or password) in a header, cookie, query, path or the first 64 KB of the body | the block score | every hit |
 | ARTEX or scanner User-Agent, unverified assessment label | 100 | every hit |
 | Dotfile or key probe (`/.env`, `/.git/`, `/id_rsa`) | 60 | every hit |
 | Dump, backup or editor leftover by name (`db.sql`, `site-backup.zip`, `index.php.bak`) that returned 404 | 60 | every hit |
@@ -250,7 +278,7 @@ For the TLS sensor, have your edge pass a JA3 or JA4 value in a header and set `
 - **About 60 guessed paths an hour per address are still free**, and 14 a minute until that allowance is spent. Guessing values of one query parameter (`/item?id=1`, `?id=2`) is not counted at all, because the path is the same.
 - **Payload patterns are a net, not a parser.** A bare `;id` or `|id` is not scored, because it reads the same as a list. Injection sent only in a `Referer`, cookie or other header is not scored, apart from JNDI lookups and callback domains. Encodings a pattern does not expect get through. To let search text through, some payload forms are not scored: a bare `<script>` tag with no code, a lone `<svg>` or `<iframe>`, a number left dangling after `OR` (`' or 1`), `UNION SELECT` after a plain word with a one-word list (`x union select a`), and two levels of `../` to a file with no server-side extension. And a search that is itself a payload (`sleep(5)`, `{{7*7}}`, `' or 1=1--`) still scores.
 - **The client check is a speed bump, not a lock.** Anyone who reads this README can call `/_artex/check?f=0` and get a clean cookie, and a stealth plugin can hide `navigator.webdriver` (ARTEX ships none today; the weekly ARTEX check watches for one). It catches clients that do not know it is there, and only ever as soft evidence.
-- **Request bodies are not inspected**, nor are messages on an open WebSocket, and nmap port scans never reach a web app at all. Keep your firewall and, if you have one, your WAF.
+- **Request bodies are inspected only for honeytokens**, and only their first 64 KB; attack payloads in a body are not scored. Nor are messages on an open WebSocket inspected, and nmap port scans never reach a web app at all. Keep your firewall and, if you have one, your WAF.
 - **An exposed dump that really exists is served.** The shield cannot tell `db-backup.sql` from `employee-handbook.zip` until the app answers, so it waits for the 404.
 - **Shared addresses.** Blocking an address also blocks everyone behind the same NAT, VPN or campus network. IPv6 block widening, if you turn it on, covers more: a /56 can be one household or, with some providers, hundreds of customers. This is why blocks expire and why `monitor` is the default mode.
 - **Scores are per process.** With several workers each keeps its own scores, so thresholds are effectively multiplied, and a block made by one worker is enforced by the others only at the edge, through the shared deny file. Run one worker, or enforce the file in nginx, until a shared store is added.
@@ -262,7 +290,7 @@ For the TLS sensor, have your edge pass a JA3 or JA4 value in a header and set `
 src/artex_shield/
   core.py         Config, Shield: tracking, sensors, fire control
   signatures.py   patterns for ARTEX and its toolchain
-  decoys.py       canary generation and trap snippets
+  decoys.py       canaries, credential honeytokens, and snippets to plant them
   middleware.py   WSGI and ASGI adapters
   util.py         address and decoding helpers
   client_check.py the optional client-side check: script, signed cookie
