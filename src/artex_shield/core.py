@@ -1,10 +1,13 @@
 """Configuration, tracking, sensors and fire control."""
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import math
 import os
+import re
 import secrets
 import statistics
 import threading
@@ -15,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
+from . import client_check as _cc
 from .signatures import (ASSESSMENT_UA, BROWSER_UA, CRAWLER_UA, HARD_UA, MISSING_SENSITIVE, ODD_METHODS,
                          OOB, PAYLOADS, RECON_PATHS, SENSITIVE_PATHS, SOFT_METHODS, SOFT_UA)
 from .util import (_decode, _extension, _file_lock, _hop_ip, _in_nets, _induced, _is_network, _nets, _norm_path,
@@ -104,6 +108,30 @@ class Config:
     slow_enum_budget: int = 60
     slow_enum_window: float = 3600.0
     slow_enum_points: float = 10.0
+    # Optional client-side check, off by default; see client_check.py. Put
+    # client_check_tag(config) on every HTML page first. API requests (under
+    # client_check_api_prefixes) that a page's script made then score, softly,
+    # when the client loaded pages but never completed the check
+    # ("client:no-check"), or when it reported browser automation
+    # ("client:automation-reported"). Navigations and image loads are never
+    # scored, so visitors without JavaScript are not affected.
+    client_check: bool = False
+    # Signs the cookie. Give every worker the same secret; None makes a random
+    # one per process, which a client's cookie only matches on the worker that set it.
+    client_check_secret: Optional[str] = None
+    client_check_path: str = "/_artex/check"          # the script is served at this path + ".js"
+    client_check_cookie: str = "artex_check"
+    client_check_api_prefixes: List[str] = field(default_factory=lambda: ["/api"])
+    client_check_grace: float = 30.0   # after a client's first page, how long its API calls may run unchecked
+    client_check_ttl: float = 86400.0  # how long a check cookie is good for
+    client_check_points: float = 20.0
+    # Credential honeytokens (see make_honeytokens): fake API keys and
+    # passwords you planted. A request presenting one, in any header (Basic
+    # auth included), a cookie, the query, the path or the body, is blocked
+    # on the spot. Bodies are read up to honeytoken_body_limit bytes, and
+    # only when honeytokens are set.
+    honeytokens: Iterable[str] = ()
+    honeytoken_body_limit: int = 65536
 
     def __post_init__(self):
         if self.mode not in ("monitor", "enforce"):
@@ -119,6 +147,24 @@ class Config:
                 raise ValueError(f"{name} must be positive")
         _prefixes(self.exempt_paths, "exempt_paths")
         _prefixes(self.enum_ignore_prefixes, "enum_ignore_prefixes")
+        if isinstance(self.honeytokens, str):
+            raise ValueError("honeytokens must be a list of values (or make_honeytokens(...)), not one string")
+        self.honeytokens = tuple(dict.fromkeys(str(t) for t in self.honeytokens))
+        for token in self.honeytokens:
+            if len(token) < 12 or any(c.isspace() for c in token):
+                raise ValueError(f"honeytoken {token[:4]}... must be at least 12 characters with no whitespace: "
+                                 "anything shorter could turn up in ordinary requests")
+        if self.honeytoken_body_limit < 0:
+            raise ValueError("honeytoken_body_limit must not be negative")
+        _prefixes(self.client_check_api_prefixes, "client_check_api_prefixes")
+        _prefixes([self.client_check_path], "client_check_path")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", self.client_check_cookie):
+            raise ValueError("client_check_cookie must be 1 to 64 letters, digits, - or _")
+        for name in ("client_check_ttl", "client_check_points"):
+            if not getattr(self, name) > 0:
+                raise ValueError(f"{name} must be positive")
+        if self.client_check_grace < 0:
+            raise ValueError("client_check_grace must not be negative")
         if not 0 < self.throttle_score <= self.block_score:
             raise ValueError("need 0 < throttle_score <= block_score")
         if self.soft_cap is None:
@@ -151,7 +197,7 @@ class Decision:
 
 class _Track:
     __slots__ = ("hard", "soft_points", "updated", "times", "not_found", "slow", "missing", "soft", "strikes",
-                 "throttled_until")
+                 "throttled_until", "page_at", "checked_at", "automation_at")
 
     def __init__(self, now: float, history: int = 512, slow_budget: int = 0):
         self.hard = 0.0              # points from signals that repeat on every hit
@@ -164,6 +210,9 @@ class _Track:
         self.soft: Dict[str, float] = {}
         self.strikes = 0
         self.throttled_until = 0.0
+        self.page_at: Optional[float] = None         # first HTML page served to this client (client check)
+        self.checked_at: Optional[float] = None      # last time it completed the client check
+        self.automation_at: Optional[float] = None   # last time that check reported automation
 
     @property
     def score(self) -> float:
@@ -193,6 +242,10 @@ class Shield:
         self._enum_skip_ext = {str(e).lower().lstrip(".") for e in self.cfg.enum_ignore_extensions}
         self._canaries = {_norm_path(p) for p in self.cfg.canary_paths}
         self._tls_deny = {str(v).lower() for v in self.cfg.tls_denylist}
+        secret = self.cfg.client_check_secret
+        self._check_key = secret.encode() if secret else secrets.token_bytes(32)
+        self._check_path = _prefixes([self.cfg.client_check_path], "client_check_path")[0]
+        self._check_api = _prefixes(self.cfg.client_check_api_prefixes, "client_check_api_prefixes")
         self.stats = {"requests": 0, "throttled": 0, "blocked": 0, "friendly": 0, "unidentified": 0, "refused": 0}
         self._unidentified_warned: Optional[float] = None
 
@@ -258,7 +311,10 @@ class Shield:
 
     # ---- before the app runs --------------------------------------------
     def check(self, ip: str, method: str, path: str, query: str = "",
-              headers: Optional[Dict[str, str]] = None) -> Decision:
+              headers: Optional[Dict[str, str]] = None, body: Optional[bytes] = None) -> Decision:
+        """Decide on one request before the app sees it. `body` is only looked
+        at for honeytokens: pass its first Config.honeytoken_body_limit bytes
+        (the adapters do)."""
         cfg, now = self.cfg, self.clock()
         h = {k.lower(): v for k, v in (headers or {}).items()}
         ua = h.get("user-agent", "")
@@ -311,6 +367,11 @@ class Shield:
         # Reading the request needs no shared state, so it is done without the
         # lock: a large request must not make every other one wait.
         seen = self._scan(method, npath, query, h, ua)
+        if cfg.honeytokens:
+            where = self._honeytoken(npath, query, h, body)
+            if where:                                # worth a block on its own, whatever block_score is
+                seen.append((f"decoy:honeytoken-{where}", max(100.0, cfg.block_score), False))
+        checked = self._client_request(path, h, now)
 
         with self._state():
             if self._blocked(key, now):
@@ -340,6 +401,7 @@ class Shield:
             t = self._track(key, now)
             self._decay(t, now)
             hits += self._radar(t, now, seen)
+            hits += self._client_hits(t, now, checked)
             t.times.append(now)
 
             # A throttled client that keeps coming inside Retry-After is not backing off.
@@ -351,11 +413,16 @@ class Shield:
             return self._engage(t, key, ip, now, [l for l, _, _ in hits], method, path, ua, ref, enforce)
 
     # ---- after the app answered -------------------------------------------
-    def observe(self, ip: str, path: str, status: int, induced: bool = False) -> None:
+    def observe(self, ip: str, path: str, status: int, induced: bool = False, content_type: str = "") -> None:
         """Feed the app's status code back in. 404s drive the enumeration,
         recon and missing-dump sensors, so what your site really serves never
         counts against anyone. Pass `induced` from the Decision check() gave:
-        a 404 for a request some page forced is not the visitor's guess."""
+        a 404 for a request some page forced is not the visitor's guess. Pass
+        the response's Content-Type for the client check: it needs to know
+        which clients have been served HTML pages."""
+        if (self.cfg.client_check and not induced and 200 <= status < 300
+                and content_type.split(";", 1)[0].strip().lower() in ("text/html", "application/xhtml+xml")):
+            self._client_page(ip)
         if status != 404 or induced:
             return
         cfg, now = self.cfg, self.clock()
@@ -411,6 +478,112 @@ class Shield:
         while len(t.missing) > _MISSING_MEMORY:
             t.missing.popitem(last=False)
         return last is None or now - last > self.cfg.half_life
+
+    # ---- honeytokens ----------------------------------------------------------
+    def _honeytoken(self, npath: str, query: str, h: Dict[str, str], body: Optional[bytes]) -> Optional[str]:
+        """Where a planted credential turns up in this request, or None. Each
+        place is searched as sent and URL-decoded; Basic auth is unpacked.
+        The Referer is skipped: it is the browser repeating an address."""
+        tokens = self.cfg.honeytokens
+
+        def has(text: str) -> bool:
+            if not text:
+                return False
+            if any(t in text for t in tokens):
+                return True
+            decoded = _decode(text)
+            return decoded != text and any(t in decoded for t in tokens)
+
+        for name, value in h.items():
+            if name == "referer":
+                continue
+            value = value[:16384]
+            if has(value):
+                return "cookie" if name == "cookie" else "header"
+            if name in ("authorization", "proxy-authorization"):
+                m = re.match(r"\s*basic\s+([A-Za-z0-9+/_=-]{4,8192})", value, re.I)
+                if m:
+                    try:
+                        raw = base64.b64decode(m.group(1) + "===", altchars=b"-_" if "-" in m.group(1) or "_" in m.group(1) else None)
+                    except (ValueError, binascii.Error):
+                        raw = b""
+                    if has(raw.decode("latin-1")):
+                        return "header"
+        if has(query[:65536]):
+            return "query"
+        if has(npath):
+            return "path"
+        if body and self.cfg.honeytoken_body_limit and has(body[:self.cfg.honeytoken_body_limit].decode("latin-1")):
+            return "body"
+        return None
+
+    # ---- client check (optional) --------------------------------------------
+    def client_check_reply(self, ip: str, query: str, headers: Optional[Dict[str, str]] = None,
+                           secure: bool = False) -> Tuple[int, List[Tuple[str, str]], bytes]:
+        """Answer the check script's call: record what it reported and set the
+        signed cookie. Returns (status, headers, body); the adapters call this
+        for requests to Config.client_check_path."""
+        now = self.clock()
+        params = dict(p.partition("=")[::2] for p in query.split("&") if p)
+        flags = int(params["f"]) & _cc.FLAGS if params.get("f", "").isdigit() and len(params["f"]) < 6 else 0
+        if self._identified(ip):
+            with self._state():
+                t = self._track(_track_key(ip), now)
+                t.checked_at = now
+                if flags:
+                    t.automation_at = now
+        value = _cc.sign(self._check_key, int(now), flags)
+        attrs = f"Path=/; Max-Age={int(self.cfg.client_check_ttl)}; HttpOnly; SameSite=Lax"
+        hdrs = [("Set-Cookie", f"{self.cfg.client_check_cookie}={value}; {attrs}" + ("; Secure" if secure else "")),
+                ("Cache-Control", "no-store"), ("Content-Length", "0")]
+        return 204, hdrs, b""
+
+    def client_check_asset(self) -> Tuple[int, List[Tuple[str, str]], bytes]:
+        """The check script itself, served at Config.client_check_path + ".js"."""
+        body = _cc.script(self._check_path).encode()
+        return 200, [("Content-Type", "text/javascript; charset=utf-8"), ("Content-Length", str(len(body))),
+                     ("Cache-Control", "public, max-age=3600"), ("X-Content-Type-Options", "nosniff")], body
+
+    def client_check_route(self, path: str) -> Optional[str]:
+        """"check" or "script" when `path` is one of the client check's own
+        endpoints and the check is on; None otherwise."""
+        if not self.cfg.client_check:
+            return None
+        npath = _norm_path(path)
+        return "check" if npath == self._check_path else "script" if npath == self._check_path + ".js" else None
+
+    def _client_page(self, ip: str) -> None:
+        if not self._identified(ip):
+            return
+        now = self.clock()
+        with self._state():
+            t = self._tracks.get(_track_key(ip))
+            if t is not None and t.page_at is None:
+                t.page_at = now
+
+    def _client_request(self, path: str, h: Dict[str, str], now: float) -> Optional[Tuple[bool, int]]:
+        """For an API request a page's script made, with the check on:
+        (cookie valid?, flags it reports). None when the check does not apply."""
+        if not self.cfg.client_check or not _under(path, self._check_api) or not _cc.script_made(h):
+            return None
+        value = _cc.cookie(h.get("cookie", ""), self.cfg.client_check_cookie)
+        flags = _cc.verify(self._check_key, value, now, self.cfg.client_check_ttl)
+        return (flags is not None, flags or 0)
+
+    def _client_hits(self, t: _Track, now: float, checked: Optional[Tuple[bool, int]]) -> List[_Hit]:
+        """Soft signals from the client check, at most once per half-life each."""
+        if checked is None:
+            return []
+        cfg, (valid, flags), hits = self.cfg, checked, []
+        reported = flags or (t.automation_at is not None and now - t.automation_at < cfg.client_check_ttl)
+        if reported and self._soft_due(t, "client:automation-reported", now):
+            hits.append(("client:automation-reported", cfg.client_check_points, True))
+        # Never completed the check: loaded pages (and has had time to run
+        # their script) but no check from this client has ever come back.
+        if (not valid and t.checked_at is None and t.page_at is not None and now - t.page_at >= cfg.client_check_grace
+                and self._soft_due(t, "client:no-check", now)):
+            hits.append(("client:no-check", cfg.client_check_points, True))
+        return hits
 
     # ---- sensors ----------------------------------------------------------
     def _scan(self, method: str, npath: str, query: str, h: Dict[str, str], ua: str) -> List[_Hit]:

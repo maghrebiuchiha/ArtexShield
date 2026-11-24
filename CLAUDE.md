@@ -6,8 +6,9 @@ Python middleware that detects and blocks ARTEX-style automated pentest traffic
 ## Layout
 - `src/artex_shield/core.py` - Config, Shield: per-client scoring, sensors, throttle/block logic
 - `src/artex_shield/signatures.py` - User-Agent, path and payload patterns
-- `src/artex_shield/decoys.py` - canary paths and trap snippets
+- `src/artex_shield/decoys.py` - canary paths, credential honeytokens, and snippets to plant them
 - `src/artex_shield/middleware.py` - WSGI and ASGI adapters
+- `src/artex_shield/client_check.py` - optional client-side check: automation-reporting script, signed cookie
 - `src/artex_shield/proxy.py` - `artex-shield-proxy`, the asyncio reverse proxy for non-Python sites; `Dockerfile`,
   `examples/wordpress/` (compose file and CI smoke test), `examples/proxy.toml`
 - `tests/test_shield.py` - simulated traffic, fake clock, no network
