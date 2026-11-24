@@ -8,6 +8,7 @@ Python middleware that detects and blocks ARTEX-style automated pentest traffic
 - `src/artex_shield/signatures.py` - User-Agent, path and payload patterns
 - `src/artex_shield/decoys.py` - canary paths and trap snippets
 - `src/artex_shield/middleware.py` - WSGI and ASGI adapters
+- `src/artex_shield/client_check.py` - optional client-side check: automation-reporting script, signed cookie
 - `tests/test_shield.py` - simulated traffic, fake clock, no network
 - `examples/simulate.py` - campaign vs. legitimate-traffic soak; exits 1 if any legit request is stopped
 
