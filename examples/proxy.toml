@@ -18,8 +18,12 @@ listen = "0.0.0.0:8080"             # also "[::]:8080", or a bare port
 
 [shield]
 mode = "monitor"                    # "enforce" once the logs show no visitor you would have stopped
-# A long random string you keep; it decides the canary paths (see README).
+# Long random strings you keep: they decide the canary paths and the fake
+# credentials. `artex-shield-proxy --print-decoys` prints what to plant.
 # canary_secret = "..."
+# honeytoken_secret = "..."
+# client_check = true               # the optional client-side check; put its tag on every page
+# client_check_secret = "..."
 # trusted_proxies = ["10.0.0.0/8"]  # your TLS terminator or load balancer, if any
 # allow_cidrs = []
 # exempt_paths = ["/healthz"]

@@ -27,9 +27,11 @@ services:
     environment:
       ARTEX_SHIELD_BACKEND: http://wordpress:80
       ARTEX_SHIELD_MODE: ${ARTEX_SHIELD_MODE:-monitor}
-      # A long random string you keep: it decides the canary paths. Then put
-      # the trap links on your pages; see "Plant the decoys" in README.md.
+      # Long random strings you keep: they decide the canary paths and the
+      # fake credentials. Then plant them on your pages: run
+      #   docker compose -f examples/wordpress/docker-compose.yml run --rm --no-deps shield --print-decoys
       ARTEX_SHIELD_CANARY_SECRET: ${ARTEX_SHIELD_CANARY_SECRET:-}
+      ARTEX_SHIELD_HONEYTOKEN_SECRET: ${ARTEX_SHIELD_HONEYTOKEN_SECRET:-}
       ARTEX_SHIELD_TRUSTED_PROXIES: ${ARTEX_SHIELD_TRUSTED_PROXIES:-}
 
   wordpress:

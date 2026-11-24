@@ -2,10 +2,13 @@
 
     ARTEX_SHIELD_MODE=enforce docker compose -f examples/wordpress/docker-compose.yml up -d --build --wait
     python examples/wordpress/smoke.py http://localhost:8080
+    python examples/wordpress/smoke.py http://localhost:8080 --replay PASSWORD
 
 Installs WordPress through the proxy (a form POST, redirects, cookies), reads
 pages as a visitor, then sends one scanner request and checks that it and
-everything after it from the same address is blocked. Exits 1 on failure.
+everything after it from the same address is blocked. With --replay, instead
+logs in with a planted honeytoken password (from --print-decoys) and checks
+that the login is blocked before WordPress sees it. Exits 1 on failure.
 Standard library only.
 """
 import http.cookiejar
@@ -16,6 +19,7 @@ import urllib.parse
 import urllib.request
 
 BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8080").rstrip("/")
+REPLAY = sys.argv[3] if len(sys.argv) > 3 and sys.argv[2] == "--replay" else None
 BROWSER = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8", "Accept-Language": "en-GB,en;q=0.7"}
 jar = http.cookiejar.CookieJar()
@@ -37,6 +41,16 @@ def expect(what, ok):
     if not ok:
         sys.exit(1)
 
+
+if REPLAY is not None:
+    expect("a honeytoken password was given", bool(REPLAY))
+    status, body = fetch("/wp-login.php", data={"log": "admin-legacy", "pwd": REPLAY, "wp-submit": "Log In"})
+    expect(f"a login with the planted password is blocked ({status})",
+           status == 403 and body.startswith("Request blocked. Reference: "))
+    status, _ = fetch("/")
+    expect(f"its address stays blocked ({status})", status == 403)
+    print("all good")
+    sys.exit(0)
 
 deadline = time.time() + 180
 while True:

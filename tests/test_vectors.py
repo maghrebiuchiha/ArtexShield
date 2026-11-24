@@ -1,12 +1,13 @@
 """The Python shield against spec/vectors.json, the cases every port must pass.
 See spec/SPEC.md for the format; this file is also a reference runner."""
+import base64
 import json
 import logging
 import os
 import unittest
 from datetime import datetime, timezone
 
-from artex_shield import Config, Engagement, Shield
+from artex_shield import Config, Engagement, Shield, client_check, make_canaries, make_honeytokens
 
 SPEC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "spec", "vectors.json")
 logging.getLogger("artex_shield").disabled = True
@@ -24,6 +25,13 @@ def make_config(spec, t0):
         kw["engagements"] = [Engagement(e["reference"], e["cidrs"], datetime.fromtimestamp(t0 + e["start"], timezone.utc),
                                         datetime.fromtimestamp(t0 + e["end"], timezone.utc)) for e in kw["engagements"]]
     return Config(**kw)
+
+
+def body(request):
+    """A request's body as bytes, or None."""
+    if "body_base64" in request:
+        return base64.b64decode(request["body_base64"])
+    return request["body"].encode("utf-8") if "body" in request else None
 
 
 def fill(template, i):
@@ -70,12 +78,19 @@ class Runner:
         s = self.shield
         if "request" in step:
             r = step["request"]
-            d = s.check(r["ip"], r.get("method", "GET"), r["path"], r.get("query", ""), r.get("headers", {}))
+            d = s.check(r["ip"], r.get("method", "GET"), r["path"], r.get("query", ""), r.get("headers", {}), body(r))
             if expect is not None:
                 self.compare(where, d, expect, full)
         elif "observe" in step:
             o = step["observe"]
-            s.observe(o["ip"], o["path"], o["status"], o.get("induced", False))
+            s.observe(o["ip"], o["path"], o["status"], o.get("induced", False), o.get("content_type", ""))
+        elif "client_check" in step:
+            c = step["client_check"]
+            status, headers, _ = s.client_check_reply(c["ip"], c["query"], c.get("headers", {}), c.get("secure", False))
+            got = {"status": status, "headers": [list(h) for h in headers]}
+            if got != step["expect"]:
+                self.fail(where, f"client check answered {got}, expected {step['expect']}")
+
         elif "unblock" in step:
             got = s.unblock(step["unblock"])
             if got != step["expect"]:
@@ -90,18 +105,20 @@ class Runner:
     def run(self):
         for n, step in enumerate(self.case["steps"]):
             if "repeat" in step:
-                t = self.t0 + step["at"]
+                t, started = self.t0 + step["at"], False
                 outcomes = [(run["times"], run["each"], run["last"]) for run in step["expect"]]
                 iteration = 0
                 for times, each, last in outcomes:
                     for k in range(times):
-                        self.clock.t = t
                         final = k == times - 1
                         for j, template in enumerate(step["steps"]):
+                            if started:
+                                t += step["dt"][j]          # accumulated, never at + k * dt
+                            started = True
+                            self.clock.t = t
                             want = (last if final else each)[j]
                             self.step(f"{n} (repeat {iteration}, part {j})", fill(template, step["i_from"] + iteration),
                                       want, full=final)
-                        t += step["every"]
                         iteration += 1
                 if iteration != step["repeat"]:
                     self.fail(n, f"repeat block expects {iteration} iterations, declares {step['repeat']}")
@@ -117,7 +134,7 @@ class Vectors(unittest.TestCase):
         cls.data = load()
 
     def test_the_file_is_the_version_this_runner_reads(self):
-        self.assertEqual((self.data["version"], self.data["t0"]), (1, 1_800_000_000.0))
+        self.assertEqual((self.data["version"], self.data["t0"]), (2, 1_800_000_000.0))
         self.assertGreater(len(self.data["cases"]), 400)
 
     def test_cases(self):
@@ -133,6 +150,24 @@ class Vectors(unittest.TestCase):
             with self.subTest(item=item):
                 s = Shield(Config(trusted_proxies=item["trusted_proxies"]))
                 self.assertEqual(s.client_ip(item["remote"], item["forwarded_for"]), item["expect"])
+
+    def test_client_check_routes(self):
+        for item in self.data["client_check_routes"]:
+            with self.subTest(item=item):
+                s = Shield(make_config(item["config"], self.data["t0"]))
+                self.assertEqual(s.client_check_route(item["path"]), item["expect"])
+
+    def test_derivations(self):
+        for item in self.data["canaries"]:
+            self.assertEqual(make_canaries(item["secret"], item["count"]), item["paths"])
+        for item in self.data["honeytokens"]:
+            t = make_honeytokens(item["secret"], item["count"])
+            self.assertEqual((list(t.api_keys), list(t.users), list(t.passwords)),
+                             (item["api_keys"], item["users"], item["passwords"]))
+
+    def test_client_check_script(self):
+        self.assertEqual(self.data["client_check_script"].replace("PATH", json.dumps("/_artex/check")),
+                         client_check.script("/_artex/check"))
 
     def test_config_errors(self):
         for item in self.data["config_errors"]:

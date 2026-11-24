@@ -15,7 +15,9 @@ sizes) are refused rather than guessed at, so the proxy cannot be used to
 smuggle a second request past it. Bodies stream in both directions without
 being held in memory. Keep-alive is kept with clients and backend
 connections are reused. WebSocket handshakes are checked like any request,
-then tunnelled.
+then tunnelled. With honeytokens set, the first part of each request body is
+read before the request is decided on, and the optional client check's script
+and endpoint are answered by the proxy itself.
 """
 from __future__ import annotations
 
@@ -35,8 +37,10 @@ from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Deque, Dict, List, Mapping, Optional, Tuple
 
+from .client_check import tag as client_check_tag
 from .core import Config, Engagement, Shield
-from .decoys import make_canaries
+from .decoys import (Honeytokens, honeytoken_html, honeytoken_js, html_trap, js_trap, make_canaries, make_honeytokens,
+                     robots_txt_block)
 from .middleware import _reply
 from .util import _in_nets
 
@@ -128,15 +132,25 @@ def _when(value: Any) -> datetime:
     return when
 
 
-def _shield_config(values: Mapping[str, Any]) -> Config:
+_DERIVED = {"canary_secret": str, "canary_count": int, "honeytoken_secret": str, "honeytoken_count": int}
+
+
+def _shield_config(values: Mapping[str, Any]) -> Tuple[Config, Optional[Honeytokens]]:
+    """The shield's Config, and the honeytokens made from honeytoken_secret
+    (kept whole, so --print-decoys can plant them)."""
     kw = dict(values)
-    unknown = set(kw) - _SHIELD_KEYS - {"engagements", "canary_secret", "canary_count"}
+    unknown = set(kw) - _SHIELD_KEYS - {"engagements"} - set(_DERIVED)
     if unknown:
         raise ValueError(f"unknown [shield] settings: {sorted(unknown)}")
     secret = kw.pop("canary_secret", None)
     count = int(kw.pop("canary_count", 3))
     if secret and "canary_paths" not in kw:
         kw["canary_paths"] = make_canaries(str(secret), count)
+    secret = kw.pop("honeytoken_secret", None)
+    count = int(kw.pop("honeytoken_count", 2))
+    tokens = make_honeytokens(str(secret), count) if secret else None
+    if tokens is not None:
+        kw["honeytokens"] = list(kw.get("honeytokens", [])) + list(tokens)
     if "engagements" in kw:
         engagements = []
         for e in kw["engagements"]:
@@ -144,7 +158,7 @@ def _shield_config(values: Mapping[str, Any]) -> Config:
                 raise ValueError("each engagement needs exactly reference, cidrs, start and end")
             engagements.append(Engagement(str(e["reference"]), list(e["cidrs"]), _when(e["start"]), _when(e["end"])))
         kw["engagements"] = engagements
-    return Config(**kw)
+    return Config(**kw), tokens
 
 
 def _kind(annotation: str) -> type:
@@ -175,10 +189,8 @@ def _from_env(env: Mapping[str, str]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
                 shield[name] = json.loads(raw)
             except ValueError as e:
                 raise ValueError(f"{key} must be a JSON list: {e}") from None
-        elif name == "canary_secret":
-            shield[name] = raw
-        elif name == "canary_count":
-            shield[name] = _parse_env(raw, int, key)
+        elif name in _DERIVED:
+            shield[name] = _parse_env(raw, _DERIVED[name], key)
         elif name in _SHIELD_KEYS:
             shield[name] = _parse_env(raw, _KINDS[name], key)
         else:
@@ -230,7 +242,10 @@ def load_settings(path: Optional[str] = None, env: Optional[Mapping[str, str]] =
     unknown = set(proxy) - _PROXY_KEYS
     if unknown:
         raise ValueError(f"unknown [proxy] settings: {sorted(unknown)}")
-    return Settings(shield=_shield_config(shield), **proxy)
+    config, tokens = _shield_config(shield)
+    settings = Settings(shield=config, **proxy)
+    settings.honeytoken_set = tokens
+    return settings
 
 
 # ---- reading HTTP ----------------------------------------------------------------
@@ -363,6 +378,25 @@ async def _from_client(body: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
             yield data
     except asyncio.TimeoutError:
         raise ClientError(408, "request body timed out") from None
+
+
+async def _prefetch(body: AsyncIterator[bytes], limit: int) -> Tuple[List[bytes], bool]:
+    """Read from `body` until `limit` bytes or its end: (what was read, ended?)."""
+    chunks, size = [], 0
+    async for data in body:
+        chunks.append(data)
+        size += len(data)
+        if size >= limit:
+            return chunks, False
+    return chunks, True
+
+
+async def _chain(first: List[bytes], rest: Optional[AsyncIterator[bytes]]) -> AsyncIterator[bytes]:
+    for data in first:
+        yield data
+    if rest is not None:
+        async for data in rest:
+            yield data
 
 
 async def _send(writer: asyncio.StreamWriter, body: Optional[AsyncIterator[bytes]], chunked: bool) -> None:
@@ -571,7 +605,20 @@ class Proxy:
 
         ip = shield.client_ip(peer, h.get("x-forwarded-for"))
         started = time.perf_counter()
-        d = shield.check(ip, method, path, query, h)
+        upload = _from_client(_chunked(reader, s.read_timeout, True) if chunked else _fixed(reader, length, s.read_timeout)) \
+            if has_body else None
+        continued = "100-continue" in head.tokens("expect") and has_body and not http10
+        prefix, limit = None, shield.cfg.honeytoken_body_limit
+        if upload is not None and shield.cfg.honeytokens and limit:
+            # Honeytokens: the shield reads the start of the body before it decides.
+            if continued:
+                writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+                await writer.drain()
+                continued = False
+            chunks, ended = await _prefetch(upload, limit)
+            prefix = b"".join(chunks)[:limit]
+            upload = _chain(chunks, None if ended else upload)
+        d = shield.check(ip, method, path, query, h, prefix)
 
         if d.stop:
             _, status, hdrs, body = _reply(d)
@@ -584,12 +631,16 @@ class Proxy:
             await writer.drain()
             self._access(peer, ip, method, target, status.split()[0], d, started)
             return keep
+        route = shield.client_check_route(path)
+        if route:
+            return await self._client_check(route, writer, method, query, h, ip, trusted, keep and not has_body,
+                                            peer, target, d, started)
         if method == "CONNECT":
             await self._error(writer, 405, "this is a reverse proxy")
             return False
 
         upgrade = "upgrade" in conn and any(t == "websocket" for t in head.tokens("upgrade")) and method == "GET"
-        if "100-continue" in head.tokens("expect") and has_body and not http10:
+        if continued:
             writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")      # the backend is not asked: the shield said yes
             await writer.drain()
 
@@ -597,15 +648,13 @@ class Proxy:
         if upgrade:
             return await self._tunnel(forward, reader, writer, peer, ip, path, d, method, target, started)
 
-        body = _from_client(_chunked(reader, s.read_timeout, True) if chunked else _fixed(reader, length, s.read_timeout)) \
-            if has_body else None
         retry = method in IDEMPOTENT and not has_body
         for attempt in (1, 2):
             bw, reused = None, False
             try:
                 br, bw, reused = await self.backend.acquire()
                 bw.write(forward)
-                await _send(bw, body, chunked)
+                await _send(bw, upload, chunked)
                 response = await self.backend.read_head(br)
                 break
             except ConnectionError as e:
@@ -641,6 +690,25 @@ class Proxy:
             return False
         return await self._respond(response, br, bw, writer, method, version, keep, peer, ip, target, path, d,
                                    started)
+
+    async def _client_check(self, route, writer, method, query, h, ip, trusted, keep, peer, target, d,
+                            started) -> bool:
+        """The client check's script and endpoint, answered here, not by the site."""
+        shield = self.shield
+        if route == "script":
+            code, hdrs, payload = shield.client_check_asset()
+        else:
+            proto = h.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+            code, hdrs, payload = shield.client_check_reply(ip, query, h, secure=trusted and proto == "https")
+        if not keep:
+            self.linger.add(writer)                        # a body came with it, unread
+        out = "".join(f"{k}: {v}\r\n" for k, v in hdrs)
+        writer.write(f"HTTP/1.1 {code} {'OK' if code == 200 else 'No Content'}\r\n{out}"
+                     f"Connection: {'keep-alive' if keep else 'close'}\r\n\r\n".encode()
+                     + (b"" if method == "HEAD" else payload))
+        await writer.drain()
+        self._access(peer, ip, method, target, str(code), d, started)
+        return keep
 
     def _forward_head(self, head: Head, method: str, target: str, peer: str, trusted: bool, h: Dict[str, str],
                       length: Optional[int], chunked: bool, upgrade: bool) -> bytes:
@@ -686,7 +754,7 @@ class Proxy:
         s = self.settings
         status = int(response.first[1])
         try:
-            self.shield.observe(ip, path, status, d.induced)
+            self.shield.observe(ip, path, status, d.induced, (response.get("content-type") or [""])[0])
         except Exception:
             log.exception("observe failed")
         no_body = method == "HEAD" or status in (204, 304)
@@ -800,6 +868,27 @@ class Proxy:
 
 
 # ---- command line ---------------------------------------------------------------------
+def decoys(settings: Settings) -> str:
+    """What to plant on the site for the decoys these settings watch for. A
+    site behind the proxy may not be Python, so it cannot call the helpers."""
+    cfg, tokens, out = settings.shield, getattr(settings, "honeytoken_set", None), []
+    canaries = list(cfg.canary_paths)
+    if canaries:
+        out += ["# robots.txt: add these lines", robots_txt_block(canaries),
+                "# HTML: a link no visitor sees, for your page template", html_trap(canaries[0]), "",
+                "# JavaScript: a dead constant, for your bundle", js_trap(canaries[-1]), ""]
+    if tokens is not None:
+        out += ["# JavaScript: fake credentials, for your bundle", honeytoken_js(tokens, 0), "",
+                "# HTML: a comment with fake credentials, for your page template", honeytoken_html(tokens, 1), ""]
+    if cfg.client_check:
+        out += ["# HTML: the client check, on every page", client_check_tag(cfg.client_check_path.rstrip("/")), ""]
+    if not out:
+        return ("# Nothing to plant. Set canary_secret, honeytoken_secret or client_check "
+                "(ARTEX_SHIELD_CANARY_SECRET, ARTEX_SHIELD_HONEYTOKEN_SECRET, ARTEX_SHIELD_CLIENT_CHECK).")
+    return "\n".join(out).rstrip()
+
+
+
 async def serve(settings: Settings) -> None:
     proxy = Proxy(settings)
     await proxy.start()
@@ -826,6 +915,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--listen", help="host:port to listen on (default 0.0.0.0:8080)")
     ap.add_argument("--mode", choices=("monitor", "enforce"))
     ap.add_argument("--check-config", action="store_true", help="print the settings in effect and exit")
+    ap.add_argument("--print-decoys", action="store_true",
+                    help="print what to plant on your site (canaries, honeytokens, client check) and exit")
     args = ap.parse_args(argv)
     logging.basicConfig(level=os.environ.get("ARTEX_SHIELD_LOG_LEVEL", "INFO").upper(), format="%(message)s",
                         stream=sys.stderr)
@@ -841,6 +932,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                            if f.name not in ("on_event", "engagements")}
         shown["shield"]["engagements"] = [e.reference for e in settings.shield.engagements]
         print(json.dumps(shown, indent=2, default=str))
+        return 0
+    if args.print_decoys:
+        print(decoys(settings))
         return 0
     try:
         asyncio.run(serve(settings))

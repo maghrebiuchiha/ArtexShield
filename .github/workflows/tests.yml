@@ -22,6 +22,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       COMPOSE: docker compose -f examples/wordpress/docker-compose.yml
+      ARTEX_SHIELD_HONEYTOKEN_SECRET: ci-only-honeytoken-secret
     steps:
       - uses: actions/checkout@v4
       - name: Build the image
@@ -36,10 +37,16 @@ jobs:
         run: $COMPOSE up -d --wait
       - name: Install WordPress and browse it through the proxy, then send a scanner
         run: python3 examples/wordpress/smoke.py http://localhost:8080
-      - name: The scanner was blocked and never reached WordPress
+      - name: A planted password, replayed from another address, is blocked before WordPress
         run: |
-          $COMPOSE logs shield | grep '"action":"block"'
-          if $COMPOSE logs wordpress | grep -i sqlmap; then exit 1; fi
+          password=$($COMPOSE run --rm --no-deps -T shield --print-decoys | sed -n 's/.* login [^ ]* \/ \([^ ]*\) ;.*/\1/p')
+          $COMPOSE run --rm --no-deps -T -v "$PWD/examples/wordpress:/smoke:ro" --entrypoint python shield \
+            /smoke/smoke.py http://artex-shield-wordpress-shield-1:8080 --replay "$password"
+      - name: Neither the scanner nor the replayed login reached WordPress
+        run: |
+          $COMPOSE logs shield | grep '"action":"block"' | grep tool:sqlmap
+          $COMPOSE logs shield | grep '"action":"block"' | grep decoy:honeytoken-body
+          if $COMPOSE logs wordpress | grep -i -e sqlmap -e "POST /wp-login.php"; then exit 1; fi
       - name: Logs
         if: always()
         run: $COMPOSE logs

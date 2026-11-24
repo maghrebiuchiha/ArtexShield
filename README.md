@@ -144,7 +144,7 @@ Then send your traffic to port 8080 instead of the site, and stop the site being
 docker compose -f examples/wordpress/docker-compose.yml up -d --build
 ```
 
-This starts WordPress, MariaDB and the proxy, with only the proxy published, on port 8080. Open `http://localhost:8080` and run the WordPress installer through it. The official WordPress image already believes `X-Forwarded-For` from private addresses, so WordPress and its access log see each visitor's address. Watch the shield's decisions with `docker compose -f examples/wordpress/docker-compose.yml logs -f shield`. It starts in monitor mode; set `ARTEX_SHIELD_MODE=enforce` when a week of logs shows no visitor you would have stopped. CI installs WordPress through the proxy and checks that a scanner is blocked before it reaches WordPress.
+This starts WordPress, MariaDB and the proxy, with only the proxy published, on port 8080. Open `http://localhost:8080` and run the WordPress installer through it. The official WordPress image already believes `X-Forwarded-For` from private addresses, so WordPress and its access log see each visitor's address. Watch the shield's decisions with `docker compose -f examples/wordpress/docker-compose.yml logs -f shield`. It starts in monitor mode; set `ARTEX_SHIELD_MODE=enforce` when a week of logs shows no visitor you would have stopped. CI installs WordPress through the proxy, then checks that a scanner, and a login with a planted honeytoken password, are both blocked before they reach WordPress.
 
 The image alone: `docker build -t artex-shield-proxy .`, then `docker run -p 8080:8080 -e ARTEX_SHIELD_BACKEND=http://your-site:80 artex-shield-proxy`.
 
@@ -167,12 +167,15 @@ Every setting has an environment variable named `ARTEX_SHIELD_` plus the setting
 | `max_header_bytes` | 65536 | Larger request heads are answered 431 |
 | `access_log` | false | One line per request on stderr |
 
-Under `[shield]` goes any `Config` field from "Scoring" and the sections above (`mode`, `trusted_proxies`, `exempt_paths`, `allow_cidrs`, the thresholds, and the rest), plus `canary_secret` (and `canary_count`, default 3) to generate canary paths with `make_canaries`. Authorised assessments are `[[shield.engagements]]` tables with `reference`, `cidrs`, `start` and `end`. Events go to stderr as JSON lines, as from the middleware.
+Under `[shield]` goes any `Config` field from "Scoring" and the sections above (`mode`, `trusted_proxies`, `exempt_paths`, `allow_cidrs`, the thresholds, `client_check` and its settings, and the rest). Two more make decoys from a secret you keep: `canary_secret` (and `canary_count`, default 3) for canary paths, and `honeytoken_secret` (and `honeytoken_count`, default 2) for credential honeytokens. Authorised assessments are `[[shield.engagements]]` tables with `reference`, `cidrs`, `start` and `end`. Events go to stderr as JSON lines, as from the middleware.
+
+A site behind the proxy may not be written in Python, so it cannot call the helpers that make the snippets to plant. `artex-shield-proxy --print-decoys` prints them for the settings in effect: the `robots.txt` lines, a hidden link and a JS constant for the canaries, the fake credentials for a JS bundle and an HTML comment, and the client check's `<script>` tag. Paste them into your theme or templates. On WordPress, a child theme's `footer.php` or a header-and-footer plugin will do.
 
 ### What it does with HTTP
 
 - **Client addresses.** From an untrusted peer, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host` and `Forwarded` are thrown away and replaced: the site receives the peer's address and `http`. From a peer in `trusted_proxies` they are kept, and the peer is appended to `X-Forwarded-For`.
-- **Bodies stream both ways**, sized or chunked, and are never held whole in memory. The one exception is an answer of 64 KiB or less with a `Content-Length`, which is sent out together with its head. `Expect: 100-continue` is answered by the proxy once the shield has allowed the request. Interim answers such as `103 Early Hints` are passed on.
+- **Bodies stream both ways**, sized or chunked, and are never held whole in memory. There are two exceptions. An answer of 64 KiB or less with a `Content-Length` is sent out together with its head. With honeytokens set, the first `honeytoken_body_limit` bytes (64 KiB) of a request body are read before the shield decides; the rest then streams. `Expect: 100-continue` is answered by the proxy once the shield has allowed the request, or, with honeytokens set and a body coming, before reading it. Interim answers such as `103 Early Hints` are passed on.
+- **The client check**, when on, is answered by the proxy: it serves the script at `/_artex/check.js` and the check at `/_artex/check`, and neither reaches the site. The cookie is marked `Secure` when a trusted proxy in front says the visitor used HTTPS. Each answer's `Content-Type` is passed to the shield, which is how it knows which clients were served HTML pages. Put the tag on your pages (see `--print-decoys`) and set `client_check_secret`, so cookies survive a restart.
 - **Keep-alive.** Visitors' connections are kept open between requests, and pipelined requests are answered in order, each checked by the shield. Connections to the site are pooled. A `GET`, `HEAD` or other idempotent request without a body, sent on a pooled connection the site had just closed, is retried once on a new one. A `POST` never is.
 - **WebSockets.** The handshake is checked like any other request. After the site answers `101`, bytes pass both ways untouched; messages on the socket are not inspected.
 - **Hop-by-hop headers** (`Connection` and the headers it names, `Keep-Alive`, `TE`, `Trailer`, `Upgrade` outside a WebSocket handshake, `Proxy-Connection`, `Proxy-Authorization`, `Proxy-Authenticate`) stay on their own connection.
@@ -182,14 +185,14 @@ Under `[shield]` goes any `Config` field from "Scoring" and the sections above (
 
 ### What it costs
 
-Measured with `python examples/bench_proxy.py` on a 4-vCPU cloud container with Python 3.13: 20,000 requests per row, the range over five runs. Each request carries a fresh visitor address, so it is scored in full. The origin answers 1 KiB.
+Measured with `python examples/bench_proxy.py` on a 4-vCPU cloud container with Python 3.13: 20,000 requests per row, the range over nine runs. Each request carries a fresh visitor address, so it is scored in full. The origin answers 1 KiB.
 
 | | Straight to the site, p50 | Through the proxy, p50 | Added, p50 | Through the proxy, p99 |
 | --- | --- | --- | --- | --- |
-| One request at a time | 0.09 ms | 0.45–0.54 ms | **0.36–0.44 ms** | 1.1–1.6 ms |
-| 32 connections at once | 0.7–1.1 ms | 6.9–10 ms | 6–9 ms, queueing | 12–14 ms |
+| One request at a time | 0.09–0.10 ms | 0.45–0.56 ms | **0.36–0.45 ms** | 1.1–1.6 ms |
+| 32 connections at once | 0.7–1.1 ms | 6.6–10 ms | 6–9 ms, queueing | 10–17 ms |
 
-One proxy process handled 3,400–4,200 requests a second on that machine. Below that rate it adds about 0.4 ms to a request; above it, requests queue, as the 32-connection row shows. About 120 µs of each request is the shield's own decision, and the rest is HTTP handling in Python.
+One proxy process handled 3,400–4,600 requests a second on that machine. Below that rate it adds about 0.4 ms to a request; above it, requests queue, as the 32-connection row shows. About 120 µs of each request is the shield's own decision, and the rest is HTTP handling in Python.
 
 ### Limits of the proxy
 
@@ -364,7 +367,7 @@ src/artex_shield/
   proxy.py        artex-shield-proxy, the reverse proxy
   util.py         address and decoding helpers
   client_check.py the optional client-side check: script, signed cookie
-tests/            166 tests, including every case in spec/vectors.json, run directly and through the proxy
+tests/            225 tests, including every case in spec/vectors.json, run directly and through the proxy
 examples/         Flask, FastAPI, nginx, WordPress in Docker, a proxy config and benchmark, and a campaign simulation
 spec/             vectors.json and SPEC.md: the cases and rules every port is checked against
 Dockerfile        the proxy's image

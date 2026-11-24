@@ -20,11 +20,13 @@ import time
 import unittest
 import urllib.parse
 
+from unittest import mock
+
 import artex_shield
-from artex_shield import Config, Shield
+from artex_shield import Config, Shield, make_honeytokens
 from artex_shield.proxy import Proxy, Settings, _host_port, load_settings, main
 
-from test_vectors import Runner, load
+from test_vectors import Runner, body as vector_body, load
 
 logging.getLogger("artex_shield").disabled = True      # the shield's event log; proxy errors still show
 BROWSER = (b"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -73,6 +75,7 @@ class Origin:
         self.seen = []
         self.connections = 0
         self.status = 200
+        self.content_type = "application/json"
         self.handler = None
         self.writers = set()
 
@@ -104,8 +107,8 @@ class Origin:
                 req.body = await read_body(req.headers, reader)
                 body = json.dumps({"method": req.method, "target": req.target, "headers": req.headers,
                                    "body": hashlib.sha256(req.body).hexdigest(), "length": len(req.body)}).encode()
-                writer.write(b"HTTP/1.1 %d Whatever\r\nContent-Type: application/json\r\nX-Origin: yes\r\n"
-                             b"Content-Length: %d\r\n\r\n%s" % (self.status, len(body), body))
+                writer.write(b"HTTP/1.1 %d Whatever\r\nContent-Type: %s\r\nX-Origin: yes\r\n"
+                             b"Content-Length: %d\r\n\r\n%s" % (self.status, self.content_type.encode(), len(body), body))
                 await writer.drain()
         except (ConnectionError, asyncio.IncompleteReadError):
             pass
@@ -186,20 +189,24 @@ class ProxyTest(unittest.IsolatedAsyncioTestCase):
         self.shield = Shield(Config(**self.config))
         self.proxy = Proxy(Settings(backend=self.origin.url, listen="127.0.0.1:0", **self.settings), self.shield)
         await self.proxy.start()
-        self.decisions, self.observed = [], []
+        self.decisions, self.observed, self.content_types = [], [], []
         check, observe = self.shield.check, self.shield.observe
 
         self.asked_headers = []
 
-        def checking(ip, method, path, query="", headers=None):
-            d = check(ip, method, path, query, headers)
+        self.asked_bodies = []
+
+        def checking(ip, method, path, query="", headers=None, body=None):
+            d = check(ip, method, path, query, headers, body)
             self.decisions.append((ip, method, path, query, d))
             self.asked_headers.append(dict(headers or {}))
+            self.asked_bodies.append(body)
             return d
 
-        def observing(ip, path, status, induced=False):
+        def observing(ip, path, status, induced=False, content_type=""):
             self.observed.append((ip, path, status, induced))
-            return observe(ip, path, status, induced)
+            self.content_types.append(content_type)
+            return observe(ip, path, status, induced, content_type)
 
         self.shield.check, self.shield.observe = checking, observing
 
@@ -589,6 +596,99 @@ class Streaming(ProxyTest):
         self.assertEqual((hint.status, hint.one("Link"), final.status, final.body), (103, "</app.css>; rel=preload", 200, b"ok"))
 
 
+# ---- honeytokens and the client check -----------------------------------------------------------------
+TOKENS = make_honeytokens("proxy-test-secret")
+
+
+class Honeytokens(ProxyTest):
+    config = {"mode": "enforce", "honeytokens": TOKENS}
+
+    async def test_a_planted_key_in_a_body_is_blocked_before_the_site(self):
+        payload = json.dumps({"apiKey": TOKENS.api_keys[0], "q": "x"}).encode()
+        r = await self.fetch(b"POST /api/report HTTP/1.1\r\nHost: x\r\n" + BROWSER +
+                             b"Content-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload), payload))
+        self.assertEqual((r.status, r.one("Connection")), (403, "close"))
+        self.assertIn("decoy:honeytoken-body", self.decisions[0][4].hits)
+        self.assertEqual(self.origin.seen, [])
+
+    async def test_a_planted_password_in_a_chunked_form_is_blocked(self):
+        form = urllib.parse.urlencode({"log": TOKENS.users[1], "pwd": TOKENS.passwords[1]}).encode()
+        r = await self.fetch(b"POST /wp-login.php HTTP/1.1\r\nHost: x\r\n" + BROWSER +
+                             b"Transfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n0\r\n\r\n" % (len(form), form))
+        self.assertEqual(r.status, 403)
+        self.assertEqual(self.origin.seen, [])
+
+    async def test_a_planted_key_in_a_header_is_blocked(self):
+        r = await self.fetch(get("/api/items", extra=b"Authorization: Bearer %s\r\n" % TOKENS.api_keys[1].encode()))
+        self.assertEqual(r.status, 403)
+        self.assertIn("decoy:honeytoken-header", self.decisions[0][4].hits)
+
+    async def test_100_continue_comes_first_so_the_body_can_be_read(self):
+        payload = b"key=" + TOKENS.api_keys[0].encode()
+        async with self.client() as c:
+            await c.send(b"POST /x HTTP/1.1\r\nHost: x\r\n" + BROWSER +
+                         b"Expect: 100-continue\r\nContent-Length: %d\r\n\r\n" % len(payload))
+            self.assertEqual((await read_response(c.reader)).status, 100)
+            self.assertEqual((await c.ask(payload)).status, 403)
+
+    async def test_ordinary_bodies_reach_the_site_whole(self):
+        blob = os.urandom(200 * 1024)                     # well past what is read ahead
+        r = await self.fetch(b"POST /upload HTTP/1.1\r\nHost: x\r\n" + BROWSER +
+                             b"Content-Length: %d\r\n\r\n" % len(blob) + blob)
+        self.assertEqual((r.status, r.json()["body"]), (200, hashlib.sha256(blob).hexdigest()))
+        self.assertEqual(self.asked_bodies[0], blob[:65536])
+        chunks = b"".join(b"%x\r\n%s\r\n" % (len(p), p) for p in (blob[:1000], blob[1000:90000], blob[90000:]))
+        r = await self.fetch(b"PUT /upload HTTP/1.1\r\nHost: x\r\n" + BROWSER + b"Transfer-Encoding: chunked\r\n\r\n" +
+                             chunks + b"0\r\n\r\n")
+        self.assertEqual((r.status, r.json()["body"]), (200, hashlib.sha256(blob).hexdigest()))
+
+    async def test_a_key_past_the_limit_is_not_read_as_the_shield_would_not(self):
+        payload = b"x" * 70000 + TOKENS.api_keys[0].encode()
+        r = await self.fetch(b"POST /upload HTTP/1.1\r\nHost: x\r\n" + BROWSER +
+                             b"Content-Length: %d\r\n\r\n" % len(payload) + payload)
+        self.assertEqual((r.status, r.json()["length"]), (200, len(payload)))
+
+    async def test_without_honeytokens_bodies_are_not_read_ahead(self):
+        self.shield.cfg.honeytokens = ()
+        await self.fetch(b"POST /x HTTP/1.1\r\nHost: x\r\n" + BROWSER + b"Content-Length: 5\r\n\r\nhello")
+        self.assertEqual(self.asked_bodies, [None])
+
+
+class ClientCheck(ProxyTest):
+    config = {"mode": "enforce", "client_check": True, "client_check_secret": "s", "client_check_grace": 0,
+              "trusted_proxies": ["127.0.0.0/8"]}
+    PAGE = b"Sec-Fetch-Site: none\r\nSec-Fetch-Mode: navigate\r\nSec-Fetch-Dest: document\r\n"
+    FETCH = b"Sec-Fetch-Site: same-origin\r\nSec-Fetch-Mode: cors\r\nSec-Fetch-Dest: empty\r\n"
+
+    async def test_the_proxy_serves_the_script_and_answers_the_check_itself(self):
+        r = await self.fetch(get("/_artex/check.js"))
+        self.assertEqual((r.status, r.one("Content-Type")), (200, "text/javascript; charset=utf-8"))
+        self.assertIn(b'"/_artex/check"', r.body)
+        r = await self.fetch(get("/_artex/check?v=1&f=0", extra=self.FETCH))
+        self.assertEqual(r.status, 204)
+        self.assertRegex(r.one("Set-Cookie"), r"^artex_check=1\.\d+\.0\.[\w-]{22}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax$")
+        r = await self.fetch(get("/_artex/check?v=1&f=0", extra=self.FETCH + b"X-Forwarded-Proto: https\r\n"))
+        self.assertTrue(r.one("Set-Cookie").endswith("; Secure"))
+        self.assertEqual(self.origin.seen, [])
+
+    async def test_an_api_client_that_loads_pages_but_never_checks_is_noted(self):
+        self.origin.content_type = "text/html; charset=utf-8"
+        await self.fetch(get("/", extra=self.PAGE + b"X-Forwarded-For: 198.51.100.1\r\n"))
+        self.assertEqual(self.content_types, ["text/html; charset=utf-8"])
+        self.origin.content_type = "application/json"
+        await self.fetch(get("/api/items", extra=self.FETCH + b"X-Forwarded-For: 198.51.100.1\r\n"))
+        self.assertIn("client:no-check", self.decisions[-1][4].hits)
+
+    async def test_a_browser_that_ran_the_check_is_not(self):
+        self.origin.content_type = "text/html; charset=utf-8"
+        async with self.client() as c:
+            who = b"X-Forwarded-For: 198.51.100.2\r\n"
+            await c.ask(get("/", extra=self.PAGE + who))
+            cookie = (await c.ask(get("/_artex/check?v=1&f=0", extra=self.FETCH + who))).one("Set-Cookie").split(";")[0]
+            await c.ask(get("/api/items", extra=self.FETCH + who + b"Cookie: %s\r\n" % cookie.encode()))
+        self.assertEqual([h for h in self.decisions[-1][4].hits if h.startswith("client:")], [])
+
+
 # ---- WebSockets ---------------------------------------------------------------------------------------
 def ws_frame(text: str, mask: bool) -> bytes:
     data = text.encode()
@@ -767,6 +867,30 @@ class Configuration(unittest.TestCase):
         self.assertEqual(len(c.canary_paths), 2)
         self.assertEqual(c.engagements[0].reference, "ENG-1")
 
+    def test_honeytokens_from_a_secret(self):
+        s = load_settings(env={"ARTEX_SHIELD_BACKEND": "http://a:1", "ARTEX_SHIELD_HONEYTOKEN_SECRET": "hs",
+                               "ARTEX_SHIELD_HONEYTOKEN_COUNT": "3"})
+        self.assertEqual(s.shield.honeytokens, tuple(make_honeytokens("hs", 3)))
+
+    def test_print_decoys(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        env = {"ARTEX_SHIELD_BACKEND": "http://a:1", "ARTEX_SHIELD_CANARY_SECRET": "cs",
+               "ARTEX_SHIELD_HONEYTOKEN_SECRET": "hs", "ARTEX_SHIELD_CLIENT_CHECK": "on"}
+        out = StringIO()
+        root = logging.getLogger()
+        handlers, level = root.handlers[:], root.level
+        try:
+            with mock.patch.dict(os.environ, env), redirect_stdout(out):
+                self.assertEqual(main(["--print-decoys"]), 0)
+        finally:
+            root.handlers[:], root.level = handlers, level
+        text = out.getvalue()
+        tokens = make_honeytokens("hs")
+        for snippet in ("Disallow: /api/v1/internal/audit-", tokens.api_keys[0], tokens.passwords[1],
+                        '<script src="/_artex/check.js" async></script>'):
+            self.assertIn(snippet, text)
+
     def test_the_command_line_wins(self):
         s = load_settings(env={"ARTEX_SHIELD_BACKEND": "http://a:1", "ARTEX_SHIELD_MODE": "enforce"},
                           overrides={"backend": "http://b:2", "mode": "monitor", "listen": None})
@@ -875,7 +999,7 @@ class Harness:
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
         self.thread.start()
-        self.status, self.writers = 200, set()
+        self.status, self.content_type, self.writers = 200, "", set()
         self.call(self._start())
         self.sock = self.rfile = None
         self.proxied = self.direct = 0
@@ -893,8 +1017,11 @@ class Harness:
         self.writers.add(writer)
         try:
             while True:
-                await reader.readuntil(b"\r\n\r\n")
-                writer.write(b"HTTP/1.1 %d X\r\nContent-Length: 0\r\n\r\n" % self.status)
+                head = await reader.readuntil(b"\r\n\r\n")
+                length = re.search(rb"(?i)\r\ncontent-length: *(\d+)", head)
+                await reader.readexactly(int(length.group(1)) if length else 0)
+                ctype = b"Content-Type: %s\r\n" % self.content_type.encode("latin-1") if self.content_type else b""
+                writer.write(b"HTTP/1.1 %d X\r\n%sContent-Length: 0\r\n\r\n" % (self.status, ctype))
                 await writer.drain()
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
@@ -942,9 +1069,9 @@ class Harness:
                 return False
         return True
 
-    def request(self, r, status):
+    def request(self, r, status, content_type=""):
         """Send one vector request; return (HTTP status, headers)."""
-        self.status = status
+        self.status, self.content_type = status, content_type
         method = r.get("method", "GET")
         target = urllib.parse.quote(r["path"], safe="/")     # encoded more than a browser would, on purpose
         self.query = re.sub(r"[^\x21-\x7e]", lambda m: urllib.parse.quote(m.group()), r.get("query", ""))
@@ -952,7 +1079,10 @@ class Harness:
             target += "?" + self.query
         head = [f"{method} {target} HTTP/1.1", f"X-Forwarded-For: {r['ip']}"]
         head += [f"{k}: {v}" for k, v in r.get("headers", {}).items()]
-        raw = ("\r\n".join(head) + "\r\n\r\n").encode("latin-1")
+        payload = vector_body(r)
+        if payload is not None:
+            head.append(f"Content-Length: {len(payload)}")
+        raw = ("\r\n".join(head) + "\r\n\r\n").encode("latin-1") + (payload or b"")
         if self.sock is None:
             self.sock = socket.create_connection(("127.0.0.1", self.proxy.port))
             self.rfile = self.sock.makefile("rb")
@@ -991,12 +1121,13 @@ class ProxyRunner(Runner):
         self.h, self.pending, self.reported, self.last = harness, None, [], None
         check = self.shield.check
 
-        def checking(ip, method, path, query="", headers=None):
-            self.asked = (ip, method, path, query, {k.lower(): v for k, v in (headers or {}).items()})
-            self.last = check(ip, method, path, query, headers)
+        def checking(ip, method, path, query="", headers=None, body=None):
+            self.asked = (ip, method, path, query, {k.lower(): v for k, v in (headers or {}).items()}, body)
+            self.last = check(ip, method, path, query, headers, body)
             return self.last
         self.shield.check = checking
-        self.shield.observe = lambda ip, path, status, induced=False: self.reported.append((ip, path, status, induced))
+        self.shield.observe = lambda ip, path, status, induced=False, content_type="": self.reported.append(
+            (ip, path, status, induced, content_type))
         self.observe = type(self.shield).observe.__get__(self.shield)
         harness.proxy.shield = self.shield
 
@@ -1014,7 +1145,7 @@ class ProxyRunner(Runner):
             self.pending = (where, step, expect, full, self.clock.t)
         elif "observe" in step:
             o = step["observe"]
-            self.observe(o["ip"], o["path"], o["status"], o.get("induced", False))
+            self.observe(o["ip"], o["path"], o["status"], o.get("induced", False), o.get("content_type", ""))
             self.h.direct += 1
         else:
             if "request" in step:
@@ -1023,29 +1154,37 @@ class ProxyRunner(Runner):
 
     def send(self, where, r, expect, full, observe=None):
         status = observe["status"] if observe else 200
+        ctype = observe.get("content_type", "") if observe else ""
         self.last, self.reported = None, []
-        code, headers = self.h.request(r, status)
+        code, headers = self.h.request(r, status, ctype)
         self.h.proxied += 1
         d = self.last
         if d is None:
             return self.fail(where, f"the proxy answered {code} without asking the shield")
         headers_sent = {k.lower(): v for k, v in r.get("headers", {}).items()}
         headers_sent["x-forwarded-for"] = r["ip"]
-        if self.asked != (r["ip"], r.get("method", "GET"), r["path"], self.h.query, headers_sent):
-            self.fail(where, f"the shield was asked about {self.asked}")
+        payload, cfg = vector_body(r), self.shield.cfg
+        if payload is not None:
+            headers_sent["content-length"] = str(len(payload))
+        read_ahead = payload[:cfg.honeytoken_body_limit] if payload and cfg.honeytokens and cfg.honeytoken_body_limit \
+            else None
+        if self.asked != (r["ip"], r.get("method", "GET"), r["path"], self.h.query, headers_sent, read_ahead):
+            self.fail(where, f"the shield was asked about {str(self.asked)[:300]}")
         if expect is not None:
             self.compare(where, d, expect, full)
         method = r.get("method", "GET")
-        forwarded = not d.stop and method != "CONNECT"
-        want = (403 if d.action in ("block", "refuse") else 429) if d.stop else 405 if not forwarded else status
+        route = type(self.shield).client_check_route(self.shield, r["path"])
+        forwarded = not d.stop and not route and method != "CONNECT"
+        want = ((403 if d.action in ("block", "refuse") else 429) if d.stop else
+                {"script": 200, "check": 204}[route] if route else 405 if not forwarded else status)
         if code != want:
             self.fail(where, f"HTTP {code}, expected {want} for {d.action} (enforced {d.enforced})")
         if d.stop and d.action == "throttle" and headers.get("retry-after") != str(d.retry_after):
             self.fail(where, f"Retry-After {headers.get('retry-after')}, expected {d.retry_after}")
-        if self.reported != ([(r["ip"], r["path"], status, d.induced)] if forwarded else []):
+        if self.reported != ([(r["ip"], r["path"], status, d.induced, ctype)] if forwarded else []):
             self.fail(where, f"the proxy reported {self.reported} to observe()")
         if observe is not None:
-            self.observe(observe["ip"], observe["path"], observe["status"], observe.get("induced", False))
+            self.observe(observe["ip"], observe["path"], observe["status"], observe.get("induced", False), ctype)
 
     def run(self):
         super().run()

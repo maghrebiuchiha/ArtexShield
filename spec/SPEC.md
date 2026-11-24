@@ -4,11 +4,15 @@ What every implementation (Python, the proxy, Node, PHP, OpenResty) must do with
 
 ## Test vectors
 
-`vectors.json` is exported from the Python test suite by `spec/export_vectors.py`: every decision the detection tests make, recorded as it happened. Only the tests of Python-specific plumbing are left out (adapters, block file, locking, timing). `tests/test_vectors.py` replays them against the Python shield, and `tests/test_proxy.py` sends every request in them through `artex-shield-proxy` over HTTP.
+`vectors.json` is exported from the Python test suite by `spec/export_vectors.py`: every decision the detection tests make (`test_shield.py`, `test_client_check.py`, `test_honeytokens.py`), recorded as it happened. Only the tests of Python-specific plumbing are left out (adapters, block file, locking, timing). `tests/test_vectors.py` replays them against the Python shield, and `tests/test_proxy.py` sends every request in them through `artex-shield-proxy` over HTTP.
 
 ```json
-{"version": 1, "t0": 1800000000.0,
+{"version": 2, "t0": 1800000000.0,
+ "client_check_script": "(function () { ... PATH ... })();",
+ "canaries":      [{"secret": "s", "count": 5, "paths": ["/api/v1/internal/audit-...", ...]}],
+ "honeytokens":   [{"secret": "s", "count": 5, "api_keys": [...], "users": [...], "passwords": [...]}],
  "client_ip":     [{"trusted_proxies": [...], "remote": "10.0.0.2", "forwarded_for": "203.0.113.7:44321", "expect": "203.0.113.7"}],
+ "client_check_routes": [{"config": {"client_check": true}, "path": "/_artex/check.js", "expect": "script"}],
  "config_errors": [{"config": {"exempt_paths": ["/"]}, "error": "..."}],
  "cases":         [{"id": "Behaviour/test_payloads#3", "config": {"mode": "enforce"}, "steps": [...]}]}
 ```
@@ -17,18 +21,19 @@ A case starts a fresh shield with the default config (below) overridden by `conf
 
 | Step | Do | Check |
 | --- | --- | --- |
-| `{"at", "request": {ip, method, path, query?, headers?}, "expect"}` | decide on the request (`ip` is the client address, already resolved) | `action` equal; `hits` equal as a set (the file lists them sorted); `score` within 1e-6; `retry_after` equal when given |
-| `{"at", "observe": {ip, path, status, induced?}}` | feed back the status the app answered with | nothing |
+| `{"at", "request": {ip, method, path, query?, headers?, body?, body_base64?}, "expect"}` | decide on the request (`ip` is the client address, already resolved). `body` is UTF-8 text, `body_base64` any other bytes; only honeytokens read it | `action` equal; `hits` equal as a set (the file lists them sorted); `score` within 1e-6; `retry_after` equal when given |
+| `{"at", "observe": {ip, path, status, induced?, content_type?}}` | feed back the status (and `Content-Type`) the app answered with | nothing |
+| `{"at", "client_check": {ip, query, headers?, secure?}, "expect": {status, headers}}` | answer the client check endpoint (see "Client check") | `status` equal; `headers` equal, in order, as `[name, value]` pairs |
 | `{"at", "unblock": ip, "expect": bool}` | lift the block on `ip` (and any wider IPv6 block over it) | whether one was lifted |
 | `{"at", "expect_blocklist": [...]}` | list active blocks | the networks, sorted |
-| `{"repeat": n, "at", "every", "i_from", "steps": [...], "expect": [...]}` | run `steps` `n` times; see below | as below |
+| `{"repeat": n, "at", "dt": [...], "i_from", "steps": [...], "expect": [...]}` | run `steps` `n` times; see below | as below |
 
-A repeat block's iteration *k* (from 0) runs every template in `steps` with each `{i}` in a string replaced by `i_from + k`. All of an iteration's steps happen at one instant. The first iteration is at `t0 + at`, and each later one at the previous instant **plus** `every`, accumulated in IEEE double precision, never computed as `at + k * every`. The tests moved their clock that way, and the result differs in the last bits. `expect` is a list of runs, `{"times": m, "each": [...], "last": [...]}`, one entry per template step (`null` for an observe):
+A repeat block's iteration *k* (from 0) runs every template in `steps`, in order, with each `{i}` in a string replaced by `i_from + k`. The very first step runs at `t0 + at`. Every later step runs at the instant of the step before it **plus** `dt[j]`, where `j` is its place in the template (so `dt[0]` is the time from one iteration's last step to the next iteration's first). Accumulate in IEEE double precision, step by step; never compute an instant as `at + k * dt`. The tests moved their clock that way, and the result differs in the last bits. `expect` is a list of runs, `{"times": m, "each": [...], "last": [...]}`, one entry per template step (`null` for an observe):
 
 - `each`: `action` and `hits` for each of the first `m - 1` iterations;
 - `last`: the full decision for the run's final iteration.
 
-`config_errors` must be refused at start-up, and `client_ip` is the address-resolution function on its own.
+`config_errors` must be refused at start-up, and `client_ip` is the address-resolution function on its own. `client_check_routes` says which paths are the client check's endpoints under a config (see "Client check"). `canaries` and `honeytokens` are the derivations below, which a port that takes a secret in its settings must reproduce exactly. `client_check_script` is the check script, with the word `PATH` standing for the check path written as a JSON string.
 
 Header names are case-insensitive. `query` is the raw query string, without the `?`.
 
@@ -48,6 +53,11 @@ Only the keys that change decisions. `soft_cap` defaults to 80% of `throttle_sco
 | `trusted_proxies`, `allow_cidrs` | `[]` (CIDRs) | `tls_header`, `tls_denylist` | none |
 | `exempt_paths`, `canary_paths` | `[]` | `score_induced` | false |
 | `engagements` | `[]` | `v6_escalate_after` | 0 (off; 1 refused) |
+| `honeytokens` | `[]` (each at least 12 characters, no whitespace) | `honeytoken_body_limit` | 65536 bytes |
+| `client_check` | false | `client_check_secret` | none: a random key per process |
+| `client_check_path` | `/_artex/check` | `client_check_cookie` | `artex_check` |
+| `client_check_api_prefixes` | `["/api"]` | `client_check_grace` / `client_check_ttl` | 30 s / 86400 s |
+| `client_check_points` | 20 | | |
 
 ## Who a client is
 
@@ -65,7 +75,7 @@ In this order; the first that applies decides.
    - Matching an engagement's reference, source CIDR and time window: pass, `friendly`, hit `iff:engagement=<REF>`.
    - Otherwise: hit `artex:unverified-assessment-label` (100), and go on.
 4. **Blocked**, in enforce mode: `block`, score = `block_score`, hits `["blocklist"]`.
-5. **Read the request's signals** (table below).
+5. **Read the request's signals** (table below), honeytokens included.
 6. **Blocked**, in monitor mode: `block`, score = `block_score`, hits `blocklist` plus the signals. Nothing is stopped and the client's own score stays frozen until the block would have ended.
 7. **Induced:** a web page made the browser send it.
    - Which requests count: `Sec-Fetch-Site` is `cross-site` or `same-site`; or it is `same-origin` and `Sec-Fetch-Dest` is something a page embeds (not `document`, `empty` or absent); or, without `Sec-Fetch-Site`, a `Referer` from another host than `Host`.
@@ -74,7 +84,7 @@ In this order; the first that applies decides.
 8. **Score the client.**
    - Decay the score (below).
    - Count each soft signal at most once per `half_life` per label; a repeat inside that window is dropped from the hits.
-   - Add the volume and cadence signals.
+   - Add the volume and cadence signals, and the client check's (see "Client check").
    - In enforce mode only, add `behavior:ignored-retry-after` (5) if the client is still inside a `Retry-After` it was given.
    - Hard points add without limit; soft points add into a bucket capped at `soft_cap`. The score is hard + soft.
 9. **Respond.**
@@ -85,7 +95,7 @@ In this order; the first that applies decides.
      - `retry_after = max(retry_after, ceil(half_life × log2(score / throttle_score)) + 1)`, and the client is "told to wait" until then.
    - **Otherwise:** `pass`, which clears any wait.
 
-**After the app answers** (`observe`), only 404s count. They are skipped for induced requests, allowlisted paths and addresses, clients never seen, and blocked clients.
+**After the app answers** (`observe`), only 404s count, apart from one thing: with the client check on, a 2xx answer whose `Content-Type` is `text/html` or `application/xhtml+xml` (parameters ignored, any case) to a request that was not induced notes the time of the client's first HTML page, if its address is identified and it already has a score track. 404s are skipped for induced requests, allowlisted paths and addresses, clients never seen, and blocked clients.
 
 - `recon:probe-404` (25) and the missing dump or backup names (`decoy:sensitive-file-probe`, 60) score on every hit.
 - A path counts toward enumeration only the first time it is missing for this client, and again after a `half_life` without asking for it. Paths under `enum_ignore_prefixes` or with `enum_ignore_extensions` never count. 15 counted paths within 60 s add `behavior:path-enumeration` (40) and reset the count.
@@ -107,6 +117,7 @@ Labels are part of the contract. Patterns are in `src/artex_shield/signatures.py
 | `decoy:sensitive-file-probe` (dotfiles and keys on sight; dumps and backups on a 404) | 60 | hard |
 | `payload:sqli` `payload:xss` `payload:traversal` `payload:cmdi` `payload:ssti` `payload:ssrf-metadata` | 50 each | hard, URL only |
 | `payload:jndi` `payload:oob-callback` | 50 each | hard, URL and every header value |
+| `decoy:honeytoken-header` `-cookie` `-query` `-path` `-body` | `max(100, block_score)` | hard |
 | `ua:headless-browser` | 40 | soft |
 | `tls:denylisted-fingerprint` | 40 | soft |
 | `behavior:path-enumeration` | 40 | hard, from 404s |
@@ -115,12 +126,50 @@ Labels are part of the contract. Patterns are in `src/artex_shield/signatures.py
 | `method:PROPFIND` | 30 | soft |
 | `recon:probe-404` | 25 | hard, from 404s |
 | `behavior:metronomic-cadence` (the last `cadence_samples` gaps average 0.15–2 s with a coefficient of variation ≤ 0.35) | 20 | soft |
+| `client:no-check` `client:automation-reported` | `client_check_points` (20) | soft |
 | `shape:browser-ua-without-browser-headers` `ua:empty` | 20 each | soft |
 | `ua:http-library` | 15 | soft |
 | `behavior:slow-enumeration` | 10 | hard, from 404s |
 | `behavior:ignored-retry-after` | 5 | hard |
 
 Payload patterns read the decoded path and each query name and value, URL-decoded up to twice, joined by NUL. They are matched a second time with SQL comments turned into spaces. If a User-Agent signature fires, the soft User-Agent signals are not read.
+
+## Honeytokens
+
+A request carries a honeytoken when one of the configured values is a substring of one of these, looked at in this order; the first place found names the signal:
+
+1. **Each header value** but `Referer`, in the order the headers came, its first 16384 characters: `cookie` for the `Cookie` header, `header` for any other. For `Authorization` and `Proxy-Authorization` of the form `Basic <base64>` (any case, base64 of 4 to 8192 characters, standard or URL-safe alphabet, padding optional), the decoded credentials too, read as Latin-1: `header`.
+2. **The query string**, its first 65536 characters: `query`.
+3. **The path**, percent-decoded with `//` runs collapsed: `path`.
+4. **The body**, its first `honeytoken_body_limit` bytes read as Latin-1: `body`. Implementations that hand bodies on (adapters, proxies) read at most that much before deciding, and only when honeytokens are set.
+
+Each text is searched as it is and, if different, after undoing up to two layers of URL encoding (`+` as a space). A hit is a hard signal worth `max(100, block_score)`, so it blocks on its own however `block_score` is set. Like any hard signal, on an induced request it refuses the request and blocks no one.
+
+**Derivation** (`make_honeytokens(secret, count)`): for each `i` from 0, with `D(label) = HMAC-SHA256(secret, "honeytoken-" + label)` and `B62(bytes, n)` the bytes as a big-endian integer written as `n` base-62 digits (`0-9A-Za-z`), least significant first:
+
+- API key `i`: `"api_live_" + B62(D("key-i"), 32)`.
+- Password `i`: with `d = D("password-i")` and `b = B62(d, 14)`, insert `"!@#$*"[d[0] % 5]` into `b` at position `d[1] % 14`, then append the digit `d[2] % 10`.
+- User `i`: `["svc-deploy", "admin-legacy", "ops-backup", "staging-admin"][i % 4]`. Users are decoration and are not watched for.
+
+**Canaries** (`make_canaries(secret, count)`): for each `i`, the shape `i % 5` of `/api/v1/internal/audit-{}`, `/admin/legacy-{}/export`, `/api/v2/debug/session-{}`, `/backend/ops-{}/config`, `/api/v1/staff/reports-{}` with `{}` the first 10 hex digits of `HMAC-SHA256(secret, "canary-i")`.
+
+## Client check
+
+Optional, off unless `client_check` is true. It needs no state beyond the score tracks.
+
+**Endpoints.** With the check on, a request whose path (percent-decoded, `//` collapsed) equals `client_check_path` (with any trailing `/` removed) is the check, and that path plus `.js` is the script. Both are answered by the shield's host, never passed to the app, and only after the request itself has been decided on and not stopped.
+
+- **The script:** 200, `client_check_script` with `PATH` replaced, `Content-Type: text/javascript; charset=utf-8`, `Cache-Control: public, max-age=3600`, `X-Content-Type-Options: nosniff`.
+- **The check:** 204 with an empty body. It reads `f` from the query (decimal, at most 5 digits; anything else is 0) and masks it to `7`. If the address is identified, it records on the client's track (creating it if need be) that it checked now, and, if `f` is not 0, that it reported automation now. Its headers, in this order: `Set-Cookie: <cookie>=<value>; Path=/; Max-Age=<ttl as an integer>; HttpOnly; SameSite=Lax`, with `; Secure` added when the visitor used HTTPS; `Cache-Control: no-store`; `Content-Length: 0`.
+
+**The cookie value** is `1.<issued>.<flags>.<mac>`: `issued` the whole seconds of the clock, `mac` the first 22 characters of the URL-safe base64 of `HMAC-SHA256(client_check_secret, "1.<issued>.<flags>")`. It is valid when it has exactly those four parts, is at most 100 characters, has `issued` within `[now - client_check_ttl, now + 300]`, `flags` at most 7, and a matching `mac` (compare in constant time). It is read from the `Cookie` header's first 16384 characters: split on `;`, trim, first entry whose name equals `client_check_cookie`, value trimmed of spaces and `"`.
+
+**Which requests are judged.** Only requests under `client_check_api_prefixes` that a page's script made. With a `Sec-Fetch-Mode` header, that means mode `cors` or `same-origin` with `Sec-Fetch-Dest` `empty` or absent. Without one, it means `X-Requested-With: XMLHttpRequest`, or an `Accept` that names none of `text/html`, `application/xhtml`, `image/`, `text/css`, `video/`, `audio/`, `font/`. Induced requests never get this far (step 7).
+
+**Signals,** each at most once per `half_life`, soft:
+
+- `client:automation-reported` when the request's valid cookie has flags, or the client's track noted an automation report less than `client_check_ttl` ago.
+- `client:no-check` when the cookie is missing or invalid, the client never completed a check, and its first HTML page was served at least `client_check_grace` ago.
 
 ## Responses
 
