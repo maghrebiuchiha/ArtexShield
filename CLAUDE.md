@@ -10,10 +10,14 @@ Python middleware that detects and blocks ARTEX-style automated pentest traffic
 - `src/artex_shield/middleware.py` - WSGI and ASGI adapters
 - `tests/test_shield.py` - simulated traffic, fake clock, no network
 - `examples/simulate.py` - campaign vs. legitimate-traffic soak; exits 1 if any legit request is stopped
+- `tools/artex_watch.py`, `tools/artex_baseline.json` - weekly check that ARTEX still does what the shield relies on
+  (`.github/workflows/artex-watch.yml` files an `artex-drift` issue when it does not)
 
 ## Commands
 - Tests: `python -W error -m unittest discover -s tests`
 - Simulation: `python examples/simulate.py`
+- ARTEX drift: `python tools/artex_watch.py check --artex <clone of BaaRai/ARTEX>`; after adapting the shield,
+  `... baseline --artex <clone>` and commit the baseline
 
 ## Rules
 - No runtime dependencies. Optional integrations (e.g. Redis) go behind an extra.

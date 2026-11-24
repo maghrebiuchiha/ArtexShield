@@ -24,11 +24,14 @@ Soft signals cannot stop a request on their own, however many fire or however lo
 | API-harvest scripts send `Mozilla/5.0 (spa-api-recon)` and `(spa-api-recon spider)` | `skills/api-recon/scripts/` | Blocked on sight |
 | The harvester pulls quoted `/api…`, `/admin…`, `/v1…` strings out of JS bundles and requests them | `harvest_static.py` | `js_trap()` plants a dead constant in that exact shape; the first request to it is a block |
 | Ships sqlmap, ffuf, nuclei, katana, httpx, dalfox, nmap | `Dockerfile` | Default User-Agents blocked on sight |
+| Also ships bbot, subfinder, hydra and ncrack, and drives Chromium through Playwright and Puppeteer, headless by default and without hiding `navigator.webdriver` | `Dockerfile`, `skills/` | No User-Agent signature for these. A headless browser User-Agent is a soft signal; the rest are caught, if at all, by behaviour |
 | Opt-in label `ARTEX-Assessment/1.0 (engagement=REF)` | `config/task_user_agents.go` | Friendly only if reference, source range and time window all match a record you configured; otherwise hostile |
 | Noise profiles pace requests evenly at 2, 5 or 20 per second with at most 250 ms jitter | `egress/egress.go` | Cadence sensor (even spacing) and flood sensor |
 | On 429 it honours `Retry-After`, and gives up when the wait exceeds 10, 30 or 60 s | `egress/egress.go` | Throttle replies always ask for at least 120 s; clients that keep coming anyway escalate to a block |
 | Probes API docs, admin and debug routes | skills, prompts | Scored only when your app answers 404, so routes you really serve cost nobody anything |
 | Browser disguise from Go and Python clients | recorded MITM proxy, scripts | Browser User-Agent without `Accept-Language` is flagged |
+
+Every row above was checked against ARTEX's source at commit `0c64c39` (November 2026), and a weekly job keeps checking: see "Keeping up with ARTEX".
 
 ## Install
 
@@ -218,6 +221,25 @@ For the TLS sensor, have your edge pass a JA3 or JA4 value in a header and set `
 - **Scores are per process.** With several workers each keeps its own scores, so thresholds are effectively multiplied, and a block made by one worker is enforced by the others only at the edge, through the shared deny file. Run one worker, or enforce the file in nginx, until a shared store is added.
 - **Search engines.** Crawlers that honour `robots.txt` will not touch canaries. Verified-bot checks by reverse DNS are not included; add crawler ranges to `allow_cidrs` if you see them scored. A crawler working through many dead links will also run into the hourly allowance.
 
+## Keeping up with ARTEX
+
+This shield is only as good as its reading of ARTEX, and ARTEX changes. `.github/workflows/artex-watch.yml` runs every Monday: it clones ARTEX, and `tools/artex_watch.py` reads it as text (it never runs ARTEX code) and checks two things.
+
+- **Has anything the shield relies on changed?** It compares against `tools/artex_baseline.json`: the harvester, spider, update-check and assessment User-Agents; the pacing profiles, jitter cap and Retry-After handling; the harvest patterns; the tools the Dockerfile installs; and whether the browser runs headless or hides `navigator.webdriver`. Code the shield depends on but cannot reduce to a value (the backoff, the jitter, the endpoint extraction) is compared by a hash of its source.
+- **Does the shield still cover it?** Each User-Agent must match a signature, each pacing profile must trip the flood or cadence sensor and give up before the shield's `Retry-After`, and ARTEX's current harvest rules must still pick up every canary shape.
+
+If anything changed, it opens one issue labelled `artex-drift` that lists exactly what: each changed value as before and after, each new or removed profile and tool, each gap, and a link to the upstream diff. The issue is updated when the findings change, left alone while they stay the same, and closed when none are left. If ARTEX cannot be cloned at all, that is reported too.
+
+Once the shield is adjusted, record the new state and commit it:
+
+```bash
+git clone --depth 1 https://github.com/BaaRai/ARTEX /tmp/artex
+python tools/artex_watch.py check --artex /tmp/artex      # what changed
+python tools/artex_watch.py baseline --artex /tmp/artex   # accept it
+```
+
+GitHub turns scheduled workflows off in a public repository after 60 days without activity; re-enable it in the Actions tab if that happens. It can also be run by hand from there (`workflow_dispatch`).
+
 ## Layout
 
 ```
@@ -227,6 +249,7 @@ src/artex_shield/
   decoys.py       canary generation and trap snippets
   middleware.py   WSGI and ASGI adapters
   util.py         address and decoding helpers
-tests/            104 tests on simulated traffic
+tests/            121 tests on simulated traffic
 examples/         Flask, FastAPI, nginx, and a campaign simulation
+tools/            artex_watch.py and its baseline: the weekly check against ARTEX
 ```

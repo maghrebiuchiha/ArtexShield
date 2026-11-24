@@ -1,0 +1,72 @@
+name: artex-watch
+
+# Weekly: clone ARTEX and check that the User-Agents, pacing limits, harvest
+# rules, bundled tools and browser behaviour artex-shield relies on are still
+# there (tools/artex_watch.py). If anything changed, one issue labelled
+# artex-drift says exactly what; it is updated when the findings change and
+# closed when none are left. On a pull request that touches the watcher, the
+# same check runs as a status check and files nothing.
+
+on:
+  schedule:
+    - cron: "37 4 * * 1"        # Mondays, 04:37 UTC
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "tools/artex_watch.py"
+      - "tools/artex_baseline.json"
+      - ".github/workflows/artex-watch.yml"
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: artex-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      ARTEX_REPO: https://github.com/BaaRai/ARTEX
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install .
+
+      - name: Clone ARTEX
+        run: |
+          for attempt in 1 2 3; do
+            if git clone --quiet --depth 1 "$ARTEX_REPO" "$RUNNER_TEMP/artex"; then exit 0; fi
+            rm -rf "$RUNNER_TEMP/artex"
+            sleep $((attempt * 30))
+          done
+          echo "::warning::could not clone $ARTEX_REPO after 3 attempts; the check reports it"
+
+      - name: Compare with the baseline
+        id: compare
+        run: |
+          set +e
+          python tools/artex_watch.py check --artex "$RUNNER_TEMP/artex" \
+            --report "$RUNNER_TEMP/report.md" --findings "$RUNNER_TEMP/findings.json"
+          code=$?
+          [ -f "$RUNNER_TEMP/report.md" ] && cat "$RUNNER_TEMP/report.md" >> "$GITHUB_STEP_SUMMARY"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          # 0: nothing changed, 1: changes found, anything else: the check itself broke
+          [ "$code" -le 1 ]
+
+      - name: Open, update or close the drift issue
+        if: github.event_name != 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python tools/artex_watch.py sync-issue --findings "$RUNNER_TEMP/findings.json" --report "$RUNNER_TEMP/report.md"
+
+      - name: Fail the pull request check if ARTEX has drifted
+        if: github.event_name == 'pull_request' && steps.compare.outputs.code == '1'
+        run: |
+          echo "::error::ARTEX no longer matches tools/artex_baseline.json; see the job summary"
+          exit 1

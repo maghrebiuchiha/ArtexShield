@@ -1,0 +1,172 @@
+{
+  "artex_commit": "0c64c3958ca8fb815aed6f1c1dc8cd499cd7dcf9",
+  "artex_repository": "https://github.com/BaaRai/ARTEX",
+  "facts": {
+    "browser.automation_hiding": {
+      "file": "(whole repository)",
+      "value": []
+    },
+    "browser.runtime_headless_default": {
+      "file": "skills/api-recon/scripts/runtime_harvest.js",
+      "value": true
+    },
+    "harvest.api_hint": {
+      "file": "skills/api-recon/scripts/harvest_static.py",
+      "value": {
+        "ignorecase": true,
+        "pattern": "/(?:api|rest|service|services|gateway|graphql|v\\d|web|admin|backend|open)\\b"
+      }
+    },
+    "harvest.asset_ext": {
+      "file": "skills/api-recon/scripts/harvest_static.py",
+      "value": {
+        "ignorecase": true,
+        "pattern": "\\.(js|css|png|jpe?g|svg|gif|woff2?|ttf|ico|map|json|mp4|webp)(\\?|$)"
+      }
+    },
+    "harvest.endpoint_pattern": {
+      "file": "skills/api-recon/scripts/harvest_static.py",
+      "value": "[\"'`](/[A-Za-z0-9_\\-./{}$:]+)[\"'`]"
+    },
+    "harvest.extract_endpoints_source": {
+      "file": "skills/api-recon/scripts/harvest_static.py",
+      "value": "sha256:57ec92f32ae5d40e"
+    },
+    "pacing.backoff_source": {
+      "file": "egress/egress.go",
+      "value": "sha256:425bf4cc26eb28bf"
+    },
+    "pacing.jitter_source": {
+      "file": "egress/egress.go",
+      "value": "sha256:71d0494f336027ab"
+    },
+    "pacing.max_jitter_s": {
+      "file": "egress/egress.go",
+      "value": 0.25
+    },
+    "pacing.profiles": {
+      "file": "egress/egress.go",
+      "value": {
+        "aggressive": {
+          "burst": 40,
+          "jitter": 0.1,
+          "max_delay_s": 10.0,
+          "rps": 20.0
+        },
+        "balanced": {
+          "burst": 10,
+          "jitter": 0.2,
+          "max_delay_s": 30.0,
+          "rps": 5.0
+        },
+        "quiet": {
+          "burst": 4,
+          "jitter": 0.5,
+          "max_delay_s": 60.0,
+          "rps": 2.0
+        }
+      }
+    },
+    "pacing.retry_after_read": {
+      "file": "egress/egress.go",
+      "value": true
+    },
+    "tools.apt": {
+      "file": "Dockerfile",
+      "value": [
+        "arp-scan",
+        "arping",
+        "ca-certificates",
+        "chromium",
+        "curl",
+        "dnsutils",
+        "fping",
+        "git",
+        "hashcat",
+        "hydra",
+        "inetutils-telnet",
+        "iproute2",
+        "iputils-ping",
+        "john",
+        "jq",
+        "ncrack",
+        "net-tools",
+        "netcat-openbsd",
+        "netdiscover",
+        "nfs-common",
+        "nmap",
+        "openssh-client",
+        "python3-impacket",
+        "python3-paramiko",
+        "python3-scapy",
+        "ripgrep",
+        "rpcbind",
+        "sqlite3",
+        "ssh-audit",
+        "sshpass",
+        "unzip",
+        "vim",
+        "wget",
+        "whois",
+        "xxd",
+        "xz-utils"
+      ]
+    },
+    "tools.git_clones": {
+      "file": "Dockerfile",
+      "value": [
+        "projectdiscovery/nuclei-templates",
+        "sqlmapproject/sqlmap"
+      ]
+    },
+    "tools.npm": {
+      "file": "Dockerfile",
+      "value": [
+        "@playwright/cli",
+        "@playwright/mcp",
+        "playwright"
+      ]
+    },
+    "tools.pip": {
+      "file": "Dockerfile",
+      "value": [
+        "bbot"
+      ]
+    },
+    "tools.release_binaries": {
+      "file": "Dockerfile",
+      "value": [
+        "ffuf/ffuf",
+        "hahwul/dalfox",
+        "projectdiscovery/httpx",
+        "projectdiscovery/katana",
+        "projectdiscovery/nuclei",
+        "projectdiscovery/subfinder"
+      ]
+    },
+    "ua.assessment": {
+      "file": "config/task_user_agents.go",
+      "value": "ARTEX-Assessment/1.0"
+    },
+    "ua.assessment_format": {
+      "file": "config/task_user_agents.go",
+      "value": " (engagement=REF)"
+    },
+    "ua.assessment_reference": {
+      "file": "config/task_user_agents.go",
+      "value": "^[A-Za-z0-9._-]{0,64}$"
+    },
+    "ua.harvester": {
+      "file": "skills/api-recon/scripts/harvest_static.py",
+      "value": "Mozilla/5.0 (spa-api-recon)"
+    },
+    "ua.spider": {
+      "file": "skills/api-recon/scripts/spider_mpa.py",
+      "value": "Mozilla/5.0 (spa-api-recon spider)"
+    },
+    "ua.update_check": {
+      "file": "server/update_check.go",
+      "value": "artex-update-check"
+    }
+  }
+}
