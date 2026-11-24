@@ -4,6 +4,23 @@ from __future__ import annotations
 from typing import Dict, List, Tuple
 
 from .core import Decision, Shield
+from .util import _in_nets
+
+
+def _https(shield: Shield, scheme: str, peer: str, headers: Dict[str, str]) -> bool:
+    """Did the visitor use HTTPS? Behind your own proxy, believe its X-Forwarded-Proto."""
+    if scheme == "https":
+        return True
+    proto = headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    return proto == "https" and _in_nets(peer, shield._trusted)
+
+
+def _content_type(hdrs) -> str:
+    for k, v in hdrs or ():
+        name = k.decode("latin-1") if isinstance(k, bytes) else k
+        if name.lower() == "content-type":
+            return v.decode("latin-1") if isinstance(v, bytes) else v
+    return ""
 
 
 def _reply(d: Decision) -> Tuple[int, str, List[Tuple[str, str]], bytes]:
@@ -35,10 +52,19 @@ class ShieldWSGI:
             _, status, hdrs, body = _reply(d)
             start_response(status, hdrs)
             return [body]
+        route = s.client_check_route(path)
+        if route:
+            lower = {k.lower(): v for k, v in headers.items()}
+            code, hdrs, body = (s.client_check_asset() if route == "script" else
+                                s.client_check_reply(ip, environ.get("QUERY_STRING", ""), lower,
+                                                     _https(s, environ.get("wsgi.url_scheme", ""),
+                                                            environ.get("REMOTE_ADDR", ""), lower)))
+            start_response({200: "200 OK", 204: "204 No Content"}[code], hdrs)
+            return [body]
 
         def watching(status, hdrs, exc_info=None):
             try:
-                s.observe(ip, path, int(status.split(" ", 1)[0]), d.induced)
+                s.observe(ip, path, int(status.split(" ", 1)[0]), d.induced, _content_type(hdrs))
             except Exception:
                 s.log.exception("observe failed")
             return start_response(status, hdrs, exc_info) if exc_info else start_response(status, hdrs)
@@ -79,11 +105,20 @@ class ShieldASGI:
             await send({"type": "http.response.start", "status": code,
                         "headers": [(k.lower().encode(), v.encode()) for k, v in hdrs]})
             return await send({"type": "http.response.body", "body": body})
+        route = s.client_check_route(path)
+        if route:
+            code, hdrs, body = (s.client_check_asset() if route == "script" else
+                                s.client_check_reply(ip, (scope.get("query_string") or b"").decode("latin-1"), headers,
+                                                     _https(s, scope.get("scheme", ""), peer, headers)))
+            await send({"type": "http.response.start", "status": code,
+                        "headers": [(k.lower().encode(), v.encode()) for k, v in hdrs]})
+            return await send({"type": "http.response.body", "body": body})
 
         async def watching(message):
             if message.get("type") == "http.response.start":
                 try:
-                    s.observe(ip, path, int(message.get("status", 200)), d.induced)
+                    s.observe(ip, path, int(message.get("status", 200)), d.induced,
+                              _content_type(message.get("headers")))
                 except Exception:
                     s.log.exception("observe failed")
             await send(message)

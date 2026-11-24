@@ -17,9 +17,17 @@ ARTEX is self-hosted, so there is no list of "ARTEX IPs" to import. Addresses
 are blocked because of how they behave, and blocks expire.
 """
 from .core import Config, Decision, Engagement, Shield
+from .client_check import tag as _client_check_tag
 from .decoys import html_trap, js_trap, make_canaries, robots_txt_block
 from .middleware import ShieldASGI, ShieldWSGI
 
+
+
+def client_check_tag(config: Config) -> str:
+    """The <script> tag for the optional client check, to put on every HTML page."""
+    return _client_check_tag(config.client_check_path.rstrip("/"))
+
+
 __all__ = ["Shield", "Config", "Engagement", "Decision", "ShieldWSGI", "ShieldASGI",
-           "make_canaries", "robots_txt_block", "html_trap", "js_trap"]
+           "make_canaries", "robots_txt_block", "html_trap", "js_trap", "client_check_tag"]
 __version__ = "1.0.0"
