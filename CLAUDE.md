@@ -13,7 +13,9 @@ Python middleware that detects and blocks ARTEX-style automated pentest traffic
   `examples/wordpress/` (compose file and CI smoke test), `examples/proxy.toml`
 - `tests/test_shield.py` - simulated traffic, fake clock, no network
 - `tests/test_proxy.py` - the proxy against a local origin on 127.0.0.1, and spec/vectors.json replayed through it
-- `spec/vectors.json`, `spec/SPEC.md` - the cases and rules every port must match; `tests/test_vectors.py` runs them
+- `spec/vectors.json`, `spec/patterns.json`, `spec/SPEC.md` - the cases, signature patterns and rules every port must
+  match; `tests/test_vectors.py` runs them
+- `ports/node/` - the Node.js / Express port (no dependencies); `lib/patterns.json` is a copy of `spec/patterns.json`
 - `examples/simulate.py` - campaign vs. legitimate-traffic soak; exits 1 if any legit request is stopped
 
 ## Commands
@@ -21,7 +23,8 @@ Python middleware that detects and blocks ARTEX-style automated pentest traffic
 - Simulation: `python examples/simulate.py`
 - Proxy latency: `python examples/bench_proxy.py`; update the numbers in README.md ("What it costs") if the proxy changes
 - Vectors: `python spec/export_vectors.py` after a deliberate behaviour change (review the diff: it binds every port);
-  CI runs `--check`
+  CI runs `--check`. If signatures.py changed, also `cd ports/node && npm run sync-patterns`
+- Node port: `cd ports/node && npm test` (the Express example runs when `npm install --no-save express` is done)
 
 ## Rules
 - No runtime dependencies. Optional integrations (e.g. Redis) go behind an extra.
@@ -29,6 +32,7 @@ Python middleware that detects and blocks ARTEX-style automated pentest traffic
   `examples/simulate.py` still reports 0 legitimate requests stopped.
 - Soft signals must not be able to throttle on their own.
 - Default mode stays `monitor`.
+- Every port passes every case in spec/vectors.json; change the reference and the ports together.
 
 ## Roadmap
 1. Shared state (Redis) so scores and blocks hold across workers

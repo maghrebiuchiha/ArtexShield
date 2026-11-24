@@ -165,6 +165,18 @@ class Vectors(unittest.TestCase):
             self.assertEqual((list(t.api_keys), list(t.users), list(t.passwords)),
                              (item["api_keys"], item["users"], item["passwords"]))
 
+    def test_pattern_probes(self):
+        from artex_shield import signatures as sig
+        probes = self.data["pattern_probes"]
+        table = {f"hard_ua:{label}": rx for rx, _, label in sig.HARD_UA}
+        table.update({f"soft_ua:{label}": rx for rx, _, label in sig.SOFT_UA})
+        table.update({f"payloads:{label}": rx for rx, label in sig.PAYLOADS})
+        table.update({f"oob:{label}": rx for rx, label in sig.OOB})
+        for name, want in probes["matches"].items():
+            rx = table.get(name) or getattr(sig, name.upper())
+            got = "".join("1" if rx.search(text) else "0" for text in probes["texts"])
+            self.assertEqual(got, want, name)
+
     def test_client_check_script(self):
         self.assertEqual(self.data["client_check_script"].replace("PATH", json.dumps("/_artex/check")),
                          client_check.script("/_artex/check"))

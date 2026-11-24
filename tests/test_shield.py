@@ -1368,6 +1368,37 @@ class WebSockets(unittest.TestCase):
         self.assertEqual(reached, ["lifespan"])
 
 
+class TextEdges(unittest.TestCase):
+    """Where reading text the way Python does decides the outcome. Ports
+    follow spec/SPEC.md's porting notes; these cases put it in the vectors."""
+
+    def test_a_newline_at_the_end_does_not_hide_a_name(self):
+        s, _ = shield()
+        d = s.check("192.0.2.150", "GET", "/id_rsa%0A", headers=BROWSER)   # $ matches before a final newline
+        self.assertIn("decoy:sensitive-file-probe", d.hits)
+
+    def test_names_are_whole_words_in_any_script(self):
+        s, _ = shield()
+        self.assertIn("decoy:sensitive-file-probe", s.check("192.0.2.151", "GET", "/.env.local", headers=BROWSER).hits)
+        self.assertEqual(s.check("192.0.2.152", "GET", "/.env%C3%A9", headers=BROWSER).hits, [])   # é: no boundary
+
+    def test_cadence_turns_on_the_spread_of_the_gaps(self):
+        for spread, flagged in ((0.34, True), (0.36, False)):           # the limit is a 0.35 coefficient of variation
+            s, c = shield()
+            hits = []
+            for i in range(40):
+                c.t += 1.0 + (spread if i % 2 else -spread)
+                hits += s.check("203.0.113.160", "GET", "/api/items", headers=BROWSER).hits
+            self.assertEqual("behavior:metronomic-cadence" in hits, flagged, spread)
+
+    def test_ipv6_networks_are_written_in_canonical_form(self):
+        s, _ = shield()
+        for addr in ("2001:db8:0:5::1", "2001:0:0:5:1::", "2001:db8:a:0:ffff::1", "2001:DB8:B::1"):
+            s.check(addr, "GET", "/", headers={"User-Agent": "sqlmap/1.9"})
+        self.assertEqual(sorted(s.blocklist()),
+                         ["2001:0:0:5::/64", "2001:db8:0:5::/64", "2001:db8:a::/64", "2001:db8:b::/64"])
+
+
 class Cost(unittest.TestCase):
     """The shield reads attacker-controlled text on every request, so no input
     may make that slow. Budgets are several times what a linear scan needs."""

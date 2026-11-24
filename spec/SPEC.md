@@ -4,7 +4,7 @@ What every implementation (Python, the proxy, Node, PHP, OpenResty) must do with
 
 ## Test vectors
 
-`vectors.json` is exported from the Python test suite by `spec/export_vectors.py`: every decision the detection tests make (`test_shield.py`, `test_client_check.py`, `test_honeytokens.py`), recorded as it happened. Only the tests of Python-specific plumbing are left out (adapters, block file, locking, timing). `tests/test_vectors.py` replays them against the Python shield, and `tests/test_proxy.py` sends every request in them through `artex-shield-proxy` over HTTP.
+`vectors.json` is exported from the Python test suite by `spec/export_vectors.py`: every decision the detection tests make (`test_shield.py`, `test_client_check.py`, `test_honeytokens.py`), recorded as it happened. Only the tests of Python-specific plumbing are left out (adapters, block file, locking, timing). `tests/test_vectors.py` replays them against the Python shield, `tests/test_proxy.py` sends every request in them through `artex-shield-proxy` over HTTP, and `ports/node/test/vectors.test.js` replays them against the Node port.
 
 ```json
 {"version": 2, "t0": 1800000000.0,
@@ -33,7 +33,7 @@ A repeat block's iteration *k* (from 0) runs every template in `steps`, in order
 - `each`: `action` and `hits` for each of the first `m - 1` iterations;
 - `last`: the full decision for the run's final iteration.
 
-`config_errors` must be refused at start-up, and `client_ip` is the address-resolution function on its own. `client_check_routes` says which paths are the client check's endpoints under a config (see "Client check"). `canaries` and `honeytokens` are the derivations below, which a port that takes a secret in its settings must reproduce exactly. `client_check_script` is the check script, with the word `PATH` standing for the check path written as a JSON string.
+`config_errors` must be refused at start-up, and `client_ip` is the address-resolution function on its own. `client_check_routes` says which paths are the client check's endpoints under a config (see "Client check"). `canaries` and `honeytokens` are the derivations below, which a port that takes a secret in its settings must reproduce exactly. `client_check_script` is the check script, with the word `PATH` standing for the check path written as a JSON string. `pattern_probes` gives, for every pattern in `patterns.json`, whether it matches each of a list of short texts chosen where regex dialects disagree: one `0` or `1` per text, in order.
 
 Header names are case-insensitive. `query` is the raw query string, without the `?`.
 
@@ -183,9 +183,18 @@ Monitor mode decides the same way but never stops a request.
 
 ## Porting notes
 
-The patterns use Python `re` syntax: `(?P<q>...)` and `(?P=q)`, `\A`, lookbehind, `[\s\S]`, and case-insensitive matching throughout.
+`spec/patterns.json` holds every pattern from `signatures.py`, generated with the vectors; translate it rather than copying patterns by hand. The patterns use Python `re` syntax on `str`: `(?P<q>...)` and `(?P=q)`, `\A`, lookbehind, `[\s\S]`, and case-insensitive matching throughout, with these meanings:
 
-- **JavaScript and PCRE (PHP, OpenResty's `ngx.re`):** use `(?<q>...)` and `\k<q>`.
-- **JavaScript:** has no `\A`; anchor with `^` and no multiline flag.
+- `\w` is a Unicode letter, number or `_` (`[\p{L}\p{N}_]`); `\d` is a Unicode decimal digit (`\p{Nd}`); `\s` is `[\t\n\v\f\r\x1c-\x1f \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]`; `\b` is a boundary between `\w` and anything else.
+- `$` (no multiline flag) matches at the end and also before a newline that ends the text.
+- `.` matches anything but `\n`, `\r` and `\u2028` included.
+- Case-insensitive matching folds case as Unicode simple case folding does: `ſ` matches `s`.
+
+Notes per target:
+
+- **JavaScript:** compile with the `u` and `i` flags; write `(?<q>...)` and `\k<q>`, `^` for `\A`, `(?=\n?$)` for `$`, `[^\n]` for `.`, and the classes above. JS's own `\w`, `\b` and `\d` are ASCII, so they must be replaced. `ports/node/lib/py.js` does all this.
+- **PCRE (PHP, OpenResty's `ngx.re`):** `(?P<q>...)`, `(?P=q)` and `$` already mean the same. Use UTF mode with Unicode properties, then check `.`, the classes and case folding against `pattern_probes`.
+
+`pattern_probes` in the vectors checks a translation on the texts where these differ.
 
 Every pattern must run in linear time on hostile input. Before adding one, read the warning at the top of `signatures.py`.

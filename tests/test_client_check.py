@@ -111,6 +111,13 @@ class Fires(unittest.TestCase):
                 hits += client_hits(v.get("/api/items", FETCH, gap=3))
             self.assertEqual(hits, ["client:automation-reported"], flag)
 
+    def test_the_grace_period_runs_from_the_first_page(self):
+        s, c = shield(client_check_grace=30)
+        v = Visitor(s, c, "192.0.2.40")
+        v.get("/", PAGE)
+        v.get("/products", PAGE, gap=25)              # more pages do not start it again
+        self.assertIn("client:no-check", client_hits(v.get("/api/items", FETCH, gap=6)))
+
     def test_the_report_holds_even_if_the_cookie_is_thrown_away(self):
         s, c = shield()
         v = Visitor(s, c, "203.0.113.22")

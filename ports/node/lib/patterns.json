@@ -1,0 +1,118 @@
+{
+ "about": "Generated from src/artex_shield/signatures.py by spec/export_vectors.py. Python re syntax, all case-insensitive with Unicode classes; see spec/SPEC.md, Porting notes.",
+ "hard_ua": [
+  [
+   "spa-api-recon",
+   100,
+   "artex:api-recon-harvester"
+  ],
+  [
+   "artex-update-check",
+   100,
+   "artex:update-check"
+  ],
+  [
+   "sqlmap",
+   100,
+   "tool:sqlmap"
+  ],
+  [
+   "fuzz faster u fool",
+   100,
+   "tool:ffuf"
+  ],
+  [
+   "nmap scripting engine",
+   100,
+   "tool:nmap-nse"
+  ],
+  [
+   "nuclei",
+   100,
+   "tool:nuclei"
+  ],
+  [
+   "dalfox",
+   100,
+   "tool:dalfox"
+  ],
+  [
+   "katana",
+   100,
+   "tool:katana"
+  ],
+  [
+   "projectdiscovery",
+   100,
+   "tool:projectdiscovery"
+  ],
+  [
+   "masscan|zgrab|nikto|wpscan|gobuster|feroxbuster|dirsearch|dirbuster|wfuzz|acunetix|nessus|openvas",
+   100,
+   "tool:scanner"
+  ]
+ ],
+ "soft_ua": [
+  [
+   "headlesschrome|phantomjs|puppeteer|playwright",
+   40,
+   "ua:headless-browser"
+  ],
+  [
+   "go-http-client|python-requests|python-urllib|python-httpx|aiohttp|^curl/|^wget/|libwww-perl|node-fetch|axios|undici",
+   15,
+   "ua:http-library"
+  ]
+ ],
+ "assessment_ua": "ARTEX-Assessment/\\d+(?:\\.\\d+)*(?:\\s*\\(engagement=([A-Za-z0-9._-]{1,64})\\))?",
+ "browser_ua": "\\A(?:(?!mozilla/5\\.0).)*mozilla/5\\.0.*(?:chrome|firefox|safari|edg)/",
+ "crawler_ua": "bot|crawl|spider|slurp|preview|facebookexternalhit|monitor|uptime",
+ "sensitive_paths": "/\\.(env|git|svn|hg|aws|ssh|DS_Store|htpasswd|htaccess|npmrc|dockerenv)(\\b|/|$)|/(id_rsa|id_dsa|wp-config\\.php\\.[a-z~]+|web\\.config|phpinfo\\.php|server-status|server-info)$",
+ "missing_sensitive": "/(?=[\\w.-]*\\.(?:sql|zip|tar|gz|bak|7z)$)[\\w.-]*(?:backup|dump|database|(?<![a-z])db|db(?![a-z]))|\\.(bak|old|swp|orig)$",
+ "recon_paths": "^/(?:admin|debug)(?:/|$)|^/(?:console|metrics)$|/(?:swagger(?:-ui)?(?:\\.json$|\\.yaml$|/|$)|openapi\\.(?:json|yaml)$|(?:v[23]/)?api-docs|graphi?ql$|actuator(?:/|$)|wp-login\\.php$|wp-admin(?:/|$)|xmlrpc\\.php$|phpmyadmin(?:/|$)|manager/html$|druid(?:/|$)|nacos(?:/|$)|jenkins(?:/|$)|solr(?:/|$)|\\.well-known/security\\.txt$)",
+ "payloads": [
+  [
+   "union\\s+(?:all\\s+|distinct\\s+)?select\\s*(?:null\\b|\\d+\\s*(?:[,)#;'\\\"\\x00]|--|/\\*|from\\b|into\\b|$)|\\*|@@|0x[0-9a-f]|['\\\"(]|[\\w$]+(?:\\(|\\s*\\)*\\s*(?:,|--|#|/\\*|;))|[\\w$.]+\\s+from\\b)|(?:['\\\")]|\\b\\d+)\\s*union\\s+(?:all\\s+|distinct\\s+)?select\\b|\\binto\\s+(?:out|dump)file\\b|from\\s+information_schema\\b|(?<![\\w.])sleep\\(\\s*\\d|(?<![\\w.])pg_sleep\\s*\\(\\s*\\d|(?<![\\w.])benchmark\\(\\s*\\d+\\s*,|waitfor\\s+(?:delay|time)\\s+['\\\"]|['\\\"]\\s*\\)?\\s*(?:or|and)\\s+\\(?\\s*(?:(?:['\\\"][^'\\\"]{0,20}['\\\"]|\\d+)\\s*(?:=|<>|!=|[<>]\\s*\\d)|\\d+\\s*\\)*\\s*(?:--|#|/\\*|;)|\\d+\\s+(?:or|and)\\s|\\d+\\s+like\\s+\\d|['\\\"][^'\\\"\\s]{0,20}['\\\"]\\s+like\\s+['\\\"]|(?:true|false)\\s*\\)*\\s*(?:--|#|/\\*|;|\\x00|$)|[\\w$]+\\(|['\\\"]\\d+[^'\\\"\\x00]{0,20}(?:\\x00|$))|xp_cmdshell|extractvalue\\s*\\(|updatexml\\s*\\(|\\b(?:or|and)(?:\\s+\\d+\\s*=\\s*\\d+|\\s*(?P<q>['\\\"])[^'\\\"]{0,20}(?P=q)\\s*=\\s*(?P=q))",
+   "payload:sqli"
+  ],
+  [
+   "<script\\b[^<>]{0,256}\\bsrc\\s*=|<script\\b[^<>]{0,256}>\\s*(?:[\\w.$\\[\\]'\\\"]{1,64}(?:[(`]|\\s*=)|</script)|<script\\b[^<>]{0,256}>[\\s\\S]{0,256}?</script|javascript\\s*:(?!\\s*void\\s*\\(\\s*0\\s*\\)\\s*;?\\s*(?:$|[\\s\\\"'>\\x00]))\\s*\\S{0,64}?[(`=;/]|(?<![\\w.])on(?:error|load|mouseover|focus)\\s*=\\s*\\S{0,64}?[(`=;]|(?:<[a-z][^<>]{0,256}[\\s/\\\"']|[\\\"']\\s*)on(?:abort|animation(?:end|iteration|start)|auxclick|before\\w+|begin|blur|cancel|canplay\\w*|change|click|close|contextmenu|copy|cut|dblclick|drag\\w*|drop|end|ended|error|finish|focus(?:in|out)?|formdata|hashchange|input|invalid|key(?:down|press|up)|load\\w*|message|mouse\\w+|page(?:hide|show)|paste|pointer\\w+|popstate|repeat|reset|resize|scroll\\w*|search|select\\w*|show|start|submit|toggle|touch\\w+|transition\\w+|unload|wheel)\\s*=\\s*\\S{0,64}?[(`=;]|<iframe\\b[^<>]{0,256}\\bsrc(?:doc)?\\s*=",
+   "payload:xss"
+  ],
+  [
+   "(?:\\.\\.[/\\\\]){3}|(?:\\.\\.[/\\\\])+(?:etc|proc|sys|boot|windows|winnt|inetpub|web-inf|root|\\.env|\\.git|\\.ssh|\\.aws|\\.htpasswd)\\b|(?:\\.\\.[/\\\\]){2}[\\w./\\\\-]{0,128}?\\.(?:php\\d?|phtml|aspx?|jsp|cgi|ini|conf|cfg|config|xml|ya?ml|env|log|bak|sql|key|pem)\\b|/etc/(?:passwd|shadow)|win\\.ini|/proc/self/",
+   "payload:traversal"
+  ],
+  [
+   "[;|&`\\n\\r][ \\t]*whoami\\b|[;|&`\\n\\r][ \\t]*(?:cat|id|uname|nc|bash|sh|ls)\\s+[-/.~$]|[;|&`\\n\\r][ \\t]*(?:curl|wget)\\s+\\S|[;|&`\\n\\r][ \\t]*(?:sleep\\s+\\d|ping\\s+-[cnw])|(?:&&|\\|\\|)[ \\t]*(?:cat|id|uname|curl|wget|nc|bash|sh|ls|sleep|ping)\\b|`[ \\t]*(?:cat|id|uname|curl|wget|nc|bash|sh)\\b|\\$\\([ \\t]*(?:cat|id|whoami|uname|curl|wget|nc|bash|sh|ls|sleep|ping)\\b",
+   "payload:cmdi"
+  ],
+  [
+   "\\{\\{\\s*['\\\"]?\\d+['\\\"]?\\s*\\*\\s*['\\\"]?\\d+['\\\"]?\\s*\\}\\}|\\$\\{\\s*\\d+\\s*\\*\\s*\\d+\\s*\\}|<%=\\s*\\d+\\s*\\*|#\\{\\s*\\d+\\s*\\*\\s*\\d+\\s*\\}|\\$\\{\\s*T\\(|\\{\\{\\s*(?:config|self|request|cycler|joiner|namespace|lipsum|url_for|get_flashed_messages)\\s*(?:\\}\\}|\\[|\\|\\s*attr|\\.\\s*(?:_|items\\s*\\(|application|environ))",
+   "payload:ssti"
+  ],
+  [
+   "169\\.254\\.169\\.254|metadata\\.google\\.internal",
+   "payload:ssrf-metadata"
+  ]
+ ],
+ "oob": [
+  [
+   "\\$\\{\\s*(jndi|\\$\\{|lower:|upper:|env:|sys:|::-)",
+   "payload:jndi"
+  ],
+  [
+   "(?<=[a-z0-9-])\\.(?:oast\\.(?:fun|pro|live|site|online|me)|interact\\.sh|oastify\\.com|burpcollaborator\\.net)",
+   "payload:oob-callback"
+  ]
+ ],
+ "odd_methods": [
+  "CONNECT",
+  "DEBUG",
+  "TRACE",
+  "TRACK"
+ ],
+ "soft_methods": [
+  "PROPFIND"
+ ]
+}

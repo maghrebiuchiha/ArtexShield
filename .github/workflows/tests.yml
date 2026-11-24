@@ -17,6 +17,30 @@ jobs:
         run: python spec/export_vectors.py --check
       - run: python examples/simulate.py
 
+  node:
+    name: Node ${{ matrix.node-version }}, Express ${{ matrix.express }}
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - {node-version: "20", express: "4"}
+          - {node-version: "22", express: "5"}
+          - {node-version: "24", express: "5"}
+    defaults:
+      run:
+        working-directory: ports/node
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: No runtime dependencies
+        run: node -e "const p = require('./package.json'); if (Object.keys(p.dependencies || {}).length) process.exit(1)"
+      - name: Express for the example (not a dependency)
+        run: npm install --no-save --no-audit --no-fund express@${{ matrix.express }}
+      - name: spec/vectors.json, the middleware, pattern cost and the examples
+        run: npm test
+
   proxy:
     name: proxy in Docker, in front of WordPress
     runs-on: ubuntu-24.04

@@ -1,6 +1,6 @@
 # artex-shield
 
-Layered detection and blocking for [ARTEX](https://github.com/BaaRai/ARTEX)-style automated penetration-testing traffic. Drop-in middleware for Python web apps (Flask, Django, FastAPI, Starlette, any WSGI or ASGI app), and a reverse proxy, `artex-shield-proxy`, for any other website: WordPress, PHP, Node, a static site. Standard library only.
+Layered detection and blocking for [ARTEX](https://github.com/BaaRai/ARTEX)-style automated penetration-testing traffic. Drop-in middleware for Python web apps (Flask, Django, FastAPI, Starlette, any WSGI or ASGI app), Express and plain Node.js servers (`ports/node`), and a reverse proxy, `artex-shield-proxy`, for any other website: WordPress, PHP, a static site. No dependencies.
 
 ARTEX is a self-hosted, LLM-driven pentest platform: a planner breaks a goal into intents and workers run real scanners against the target. It is meant for authorised testing, but nothing stops someone pointing it at a site they do not own. This project is built from a read of its source and targets what it actually does on the wire.
 
@@ -199,6 +199,19 @@ One proxy process handled 3,400–4,600 requests a second on that machine. Below
 - **One process.** Scores and blocks live in that process's memory and are lost on restart. Set `blocklist_export_path` to keep blocks at your edge as well (see "Pushing blocks to the edge"). Several proxy processes would each keep their own scores; see "Limits".
 - **HTTP/1.1 to the site.** The proxy does not terminate TLS and does not speak HTTP/2; the terminator in front of it does both.
 
+## Node.js and Express
+
+`ports/node` is the shield for Express, Connect and plain `http` servers. It has no dependencies and needs Node 20 or newer. It is a port of this package, and CI holds it to the same cases, `spec/vectors.json`, on Node 20, 22 and 24.
+
+```js
+const { Shield, artexShield, makeCanaries } = require("artex-shield");     // ports/node
+
+const shield = new Shield({ mode: "monitor", canaryPaths: makeCanaries(process.env.ARTEX_SECRET) });
+app.use(artexShield(shield));          // first, before body parsers
+```
+
+Settings are the ones above in camelCase (`throttleScore`, `trustedProxies`, `clientCheck`, `honeytokens`, ...), and the decoy helpers give the same values from the same secret. See [ports/node/README.md](ports/node/README.md) for the plain `http` wrapper, WebSocket upgrades, and what the middleware does with bodies.
+
 ## Plant the decoys
 
 ```python
@@ -367,8 +380,9 @@ src/artex_shield/
   proxy.py        artex-shield-proxy, the reverse proxy
   util.py         address and decoding helpers
   client_check.py the optional client-side check: script, signed cookie
-tests/            225 tests, including every case in spec/vectors.json, run directly and through the proxy
+tests/            231 tests, including every case in spec/vectors.json, run directly and through the proxy
 examples/         Flask, FastAPI, nginx, WordPress in Docker, a proxy config and benchmark, and a campaign simulation
-spec/             vectors.json and SPEC.md: the cases and rules every port is checked against
+spec/             vectors.json, patterns.json and SPEC.md: the cases, patterns and rules every port is checked against
+ports/node/       the Node.js / Express port
 Dockerfile        the proxy's image
 ```
