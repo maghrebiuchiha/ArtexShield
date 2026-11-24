@@ -82,9 +82,15 @@ if PART == "admin":
                  "artex_shield_settings[exempt_paths]": "/healthz", "artex_shield_settings[store]": "auto"})
     status, headers, page = fetch("/wp-admin/options.php", form)
     expect(f"the settings are saved ({status})", status == 302 and "settings-updated=true" in headers.get("Location", ""), page[:500])
+    # The scanner above came from this address too, so monitor mode put it on the block list. Saving
+    # enforce mode must not shut the admin out with it.
     status, _, page = fetch("/wp-admin/options-general.php?page=artex-shield&settings-updated=true")
-    expect("an invalid proxy is refused with a reason", "Trusted proxies" in page and "not a network" in page, page[:300])
+    expect(f"the admin is not shut out by switching to enforce ({status})", status == 200, page[:300])
+    expect("they are told their own address was unblocked", page.count("was on the block list") == 1, page[:300])
+    expect("an invalid proxy is refused with a reason, once",
+           page.count("Trusted proxies: not a network: not-a-network") == 1, page[:300])
     expect("enforce mode is now chosen", re.search(r'value="enforce"\s+checked', page) is not None)
+    no_php_errors(page, "the saved settings page")
 
 elif PART == "visitor":
     status, _, page = fetch("/")

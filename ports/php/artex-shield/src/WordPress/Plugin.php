@@ -128,6 +128,16 @@ final class Plugin
         return (defined('ARTEX_SHIELD_DATA_DIR') ? (string) constant('ARTEX_SHIELD_DATA_DIR') : WP_CONTENT_DIR . '/artex-shield-data');
     }
 
+    /** The address the shield scores this request under, as guard() works it out, or null outside a web request. */
+    public static function visitor(): ?string
+    {
+        if (!isset($_SERVER['REMOTE_ADDR'])) {
+            return null;
+        }
+        $request = Request::fromGlobals($_SERVER);
+        return self::shield()->clientIp($request->peer, $request->headers['x-forwarded-for'] ?? null);
+    }
+
     /** Decide on this request before WordPress goes on, and plant the decoys. */
     private static function guard(): void
     {

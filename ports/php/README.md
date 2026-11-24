@@ -31,6 +31,8 @@ The page also lists what is blocked now, with an Unblock button for each entry, 
 
 Leave it in monitor mode until a week of events shows no visitor you would have stopped.
 
+Blocks recorded in monitor mode take effect when you switch to enforce. So that one on your own address (from trying a scanner on your own site, say) cannot shut you out, saving the settings in enforce mode unblocks the address you save them from, and says so.
+
 ### Where scores and blocks live
 
 PHP forgets everything between requests, so the shield keeps each client's track and the block table in a store:

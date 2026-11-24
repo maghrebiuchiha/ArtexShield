@@ -49,7 +49,8 @@ final class Admin
         return $out;
     }
 
-    /** Check what was submitted; anything invalid keeps its old value and says why. */
+    /** Check what was submitted; anything invalid keeps its old value and says why. WordPress
+     * prints these messages as HTML, and they quote what was typed: escape them. */
     public static function sanitize(mixed $input): array
     {
         $old = Plugin::settings();
@@ -60,7 +61,7 @@ final class Admin
         if (strlen($secret) >= 16) {
             $out['secret'] = $secret;
         } else {
-            add_settings_error(Plugin::OPTION, 'secret', __('The secret must be at least 16 characters; it was not changed.', 'artex-shield'));
+            add_settings_error(Plugin::OPTION, 'secret', esc_html__('The secret must be at least 16 characters; it was not changed.', 'artex-shield'));
         }
         foreach (['decoys', 'honeytokens', 'client_check'] as $flag) {
             $out[$flag] = !empty($in[$flag]);
@@ -71,17 +72,34 @@ final class Admin
                 array_map([Ip::class, 'network'], $nets);
                 $out[$name] = $nets;
             } catch (\InvalidArgumentException $e) {
-                add_settings_error(Plugin::OPTION, $name, sprintf('%s: %s. %s', $label, $e->getMessage(), __('Not changed.', 'artex-shield')));
+                add_settings_error(Plugin::OPTION, $name, esc_html(sprintf('%s: %s. %s', $label, $e->getMessage(), __('Not changed.', 'artex-shield'))));
             }
         }
         $paths = self::lines($in['exempt_paths'] ?? '');
         try {
             $out['exempt_paths'] = Util::prefixes($paths, 'Exempt paths');
         } catch (\InvalidArgumentException $e) {
-            add_settings_error(Plugin::OPTION, 'exempt_paths', $e->getMessage() . '. ' . __('Not changed.', 'artex-shield'));
+            add_settings_error(Plugin::OPTION, 'exempt_paths', esc_html($e->getMessage() . '. ' . __('Not changed.', 'artex-shield')));
         }
         $out['store'] = in_array($in['store'] ?? '', ['auto', 'files', 'cache'], true) ? $in['store'] : $old['store'];
+        if ($out['mode'] === 'enforce') {
+            self::spareSelf();
+        }
         return $out;
+    }
+
+    /** Blocks recorded in monitor mode take effect in enforce mode, and an
+     * admin who tried a scanner on their own site, or was misjudged, would be
+     * shut out of it by the save that switches. So the address saving the
+     * settings is unblocked, and told so. */
+    private static function spareSelf(): void
+    {
+        $me = Plugin::visitor();
+        if ($me !== null && Plugin::shield()->unblock($me)) {
+            add_settings_error(Plugin::OPTION, 'unblocked', esc_html(sprintf(
+                __('Your own address, %s, was on the block list. It has been unblocked, so that enforce mode does not shut you out.', 'artex-shield'),
+                $me)), 'info');
+        }
     }
 
     public static function unblock(): void
@@ -111,7 +129,7 @@ final class Admin
                 ? '<div class="notice notice-success"><p>' . esc_html__('Unblocked.', 'artex-shield') . '</p></div>'
                 : '<div class="notice notice-warning"><p>' . esc_html__('That network was not blocked.', 'artex-shield') . '</p></div>';
         }
-        settings_errors($name);
+        // No settings_errors() here: on a page under Settings, WordPress's options-head.php shows them already.
         echo '<p>' . esc_html__('Detects and blocks ARTEX-style automated penetration testing before WordPress handles the request.', 'artex-shield') . '</p>';
         echo '<form method="post" action="options.php">';
         settings_fields(self::PAGE);

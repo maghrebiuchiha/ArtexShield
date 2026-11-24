@@ -205,6 +205,33 @@ check('the settings page keeps what is valid and refuses the rest', function () 
     same(['secret', 'trusted_proxies'], array_column($GLOBALS['__settings_errors'], 0));
     $bad = ArtexShield\WordPress\Admin::sanitize(['mode' => 'block-everyone', 'exempt_paths' => '/', 'store' => 'redis']);
     same(['monitor', [], 'auto'], [$bad['mode'], $bad['exempt_paths'], $bad['store']]);
+    $GLOBALS['__settings_errors'] = [];
+    ArtexShield\WordPress\Admin::sanitize(['secret' => SECRET, 'allow_cidrs' => '<img src=x onerror=alert(1)>']);
+    same([['allow_cidrs', 'Allowlist: not a network: &lt;img src=x onerror=alert(1)&gt;. Not changed.']],
+        $GLOBALS['__settings_errors'], 'WordPress prints messages as HTML: what was typed is escaped');
+});
+
+check('switching to enforce does not shut out the admin who saves it', function () {
+    global $tmp;
+    site(['mode' => 'monitor']);
+    ini_set('error_log', "$tmp/cli.log");                                   // the events, out of the test's output
+    $_SERVER['REMOTE_ADDR'] = '203.0.113.9';
+    $shield = ArtexShield\WordPress\Plugin::shield();
+    $shield->check('203.0.113.9', 'GET', '/', '', ['user-agent' => SCANNER['User-Agent']]);     // their own scan, in monitor mode
+    $shield->check('198.51.100.7', 'GET', '/', '', ['user-agent' => SCANNER['User-Agent']]);    // somebody else's
+    $blocked = array_keys($shield->blocklist());
+    sort($blocked);
+    same(['198.51.100.7', '203.0.113.9'], $blocked, 'both blocked');
+    $GLOBALS['__settings_errors'] = [];
+    ArtexShield\WordPress\Admin::sanitize(['mode' => 'monitor', 'secret' => SECRET]);
+    truthy(isset($shield->blocklist()['203.0.113.9']), 'saving monitor mode changes nothing');
+    ArtexShield\WordPress\Admin::sanitize(['mode' => 'enforce', 'secret' => SECRET]);
+    same(['198.51.100.7'], array_keys($shield->blocklist()), 'only their own address is unblocked');
+    same(['unblocked'], array_column($GLOBALS['__settings_errors'], 0));
+    truthy(str_contains($GLOBALS['__settings_errors'][0][1], '203.0.113.9'), 'the notice names it');
+    ArtexShield\WordPress\Admin::sanitize(['mode' => 'enforce', 'secret' => SECRET]);   // WordPress may sanitize twice
+    same(1, count($GLOBALS['__settings_errors']), 'said once');
+    unset($_SERVER['REMOTE_ADDR']);
 });
 
 proc_terminate($server);

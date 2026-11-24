@@ -26,7 +26,7 @@ It is a port of the open-source artex-shield Python package and is held to the s
 1. Upload the `artex-shield` folder to `wp-content/plugins/`, or the zip under Plugins → Add New.
 2. Activate it. It makes a random secret, plants the decoys and starts in monitor mode.
 3. Behind a load balancer, proxy or CDN, list its address ranges under Settings → ARTEX Shield → Trusted proxies. Otherwise every visitor looks like the proxy.
-4. Watch "Recent events" on the same page for a week. When it shows no visitor you would have stopped, choose Enforce.
+4. Watch "Recent events" on the same page for a week. When it shows no visitor you would have stopped, choose Enforce. Blocks recorded in monitor mode then take effect, except one on the address you saved from, which is lifted so that you are not shut out.
 
 == Frequently Asked Questions ==
 
