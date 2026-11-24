@@ -16,6 +16,8 @@ Python middleware that detects and blocks ARTEX-style automated pentest traffic
 - `spec/vectors.json`, `spec/patterns.json`, `spec/SPEC.md` - the cases, signature patterns and rules every port must
   match; `tests/test_vectors.py` runs them
 - `ports/node/` - the Node.js / Express port (no dependencies); `lib/patterns.json` is a copy of `spec/patterns.json`
+- `ports/php/artex-shield/` - the WordPress plugin and PHP port (PHP 8.1+, no dependencies); `patterns.json` is a copy of
+  `spec/patterns.json`, `patterns.php` its translation (`php ports/php/build.php`)
 - `examples/simulate.py` - campaign vs. legitimate-traffic soak; exits 1 if any legit request is stopped
 
 ## Commands
@@ -23,8 +25,11 @@ Python middleware that detects and blocks ARTEX-style automated pentest traffic
 - Simulation: `python examples/simulate.py`
 - Proxy latency: `python examples/bench_proxy.py`; update the numbers in README.md ("What it costs") if the proxy changes
 - Vectors: `python spec/export_vectors.py` after a deliberate behaviour change (review the diff: it binds every port);
-  CI runs `--check`. If signatures.py changed, also `cd ports/node && npm run sync-patterns`
+  CI runs `--check`. If signatures.py changed, also `cd ports/node && npm run sync-patterns`, and copy
+  spec/patterns.json to ports/php/artex-shield/ and run `php ports/php/build.php`
 - Node port: `cd ports/node && npm test` (the Express example runs when `npm install --no-save express` is done)
+- PHP port: `cd ports/php && php tests/vectors.php && php tests/vectors.php --files && php tests/vectors.php --cache
+  && php tests/cost.php && php tests/plugin.php`; real WordPress runs in CI only (`tests/wordpress/`)
 
 ## Rules
 - No runtime dependencies. Optional integrations (e.g. Redis) go behind an extra.

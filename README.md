@@ -1,6 +1,6 @@
 # artex-shield
 
-Layered detection and blocking for [ARTEX](https://github.com/BaaRai/ARTEX)-style automated penetration-testing traffic. Drop-in middleware for Python web apps (Flask, Django, FastAPI, Starlette, any WSGI or ASGI app), Express and plain Node.js servers (`ports/node`), and a reverse proxy, `artex-shield-proxy`, for any other website: WordPress, PHP, a static site. No dependencies.
+Layered detection and blocking for [ARTEX](https://github.com/BaaRai/ARTEX)-style automated penetration-testing traffic. Drop-in middleware for Python web apps (Flask, Django, FastAPI, Starlette, any WSGI or ASGI app), Express and plain Node.js servers (`ports/node`), a WordPress plugin with a PHP port (`ports/php`), and a reverse proxy, `artex-shield-proxy`, for any other website. No dependencies.
 
 ARTEX is a self-hosted, LLM-driven pentest platform: a planner breaks a goal into intents and workers run real scanners against the target. It is meant for authorised testing, but nothing stops someone pointing it at a site they do not own. This project is built from a read of its source and targets what it actually does on the wire.
 
@@ -212,6 +212,12 @@ app.use(artexShield(shield));          // first, before body parsers
 
 Settings are the ones above in camelCase (`throttleScore`, `trustedProxies`, `clientCheck`, `honeytokens`, ...), and the decoy helpers give the same values from the same secret. See [ports/node/README.md](ports/node/README.md) for the plain `http` wrapper, WebSocket upgrades, and what the middleware does with bodies.
 
+## WordPress and PHP
+
+`ports/php/artex-shield` is a WordPress plugin, with a dependency-free PHP port of the shield inside it, for PHP 8.1 or newer. CI holds it to the same cases, `spec/vectors.json`, and runs it on real WordPress 7.
+
+Activate it, and it checks each request as soon as it loads, before themes and most plugins run. It plants the decoys on your pages itself. It keeps scores and blocks in the object cache when that is persistent, otherwise in files, so every PHP worker sees the same ones. Settings → ARTEX Shield sets the mode, the secret, trusted proxies, the allowlist and exempt paths, and lists blocks and recent events. See [ports/php/README.md](ports/php/README.md).
+
 ## Plant the decoys
 
 ```python
@@ -384,5 +390,6 @@ tests/            231 tests, including every case in spec/vectors.json, run dire
 examples/         Flask, FastAPI, nginx, WordPress in Docker, a proxy config and benchmark, and a campaign simulation
 spec/             vectors.json, patterns.json and SPEC.md: the cases, patterns and rules every port is checked against
 ports/node/       the Node.js / Express port
+ports/php/        the WordPress plugin and PHP port
 Dockerfile        the proxy's image
 ```

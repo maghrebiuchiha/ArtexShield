@@ -397,7 +397,8 @@ PROBES = [
     "abc.oast.fun", ".oast.fun", "É.oast.fun", "ß.interact.sh", "x-.burpcollaborator.net", "python-requests/2.32",
     "curl/8.5", " curl/8.5", "Wget/1.21", "HeadlessChrome/131", "Go-http-client/1.1", "node-fetch/1.0",
     "ARTEX-Assessment/1.0 (engagement=ENG-1)", "artex-assessment/2", "Googlebot/2.1", "facebookexternalhit/1.1",
-    "", " ", "\u00a0",
+    "", " ", "\u00a0", "1\x1cunion\x1cselect\x1cnull", "' or\x1f1=1--", "1\x85union select null",
+    "\x1d<script>alert(1)</script>", "x\x1ewhoami",
 ]
 
 

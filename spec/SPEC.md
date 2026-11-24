@@ -4,7 +4,7 @@ What every implementation (Python, the proxy, Node, PHP, OpenResty) must do with
 
 ## Test vectors
 
-`vectors.json` is exported from the Python test suite by `spec/export_vectors.py`: every decision the detection tests make (`test_shield.py`, `test_client_check.py`, `test_honeytokens.py`), recorded as it happened. Only the tests of Python-specific plumbing are left out (adapters, block file, locking, timing). `tests/test_vectors.py` replays them against the Python shield, `tests/test_proxy.py` sends every request in them through `artex-shield-proxy` over HTTP, and `ports/node/test/vectors.test.js` replays them against the Node port.
+`vectors.json` is exported from the Python test suite by `spec/export_vectors.py`: every decision the detection tests make (`test_shield.py`, `test_client_check.py`, `test_honeytokens.py`), recorded as it happened. Only the tests of Python-specific plumbing are left out (adapters, block file, locking, timing). `tests/test_vectors.py` replays them against the Python shield, `tests/test_proxy.py` sends every request in them through `artex-shield-proxy` over HTTP, `ports/node/test/vectors.test.js` replays them against the Node port, and `ports/php/tests/vectors.php` against the PHP port (with its state kept in memory, in files, or in the object cache).
 
 ```json
 {"version": 2, "t0": 1800000000.0,

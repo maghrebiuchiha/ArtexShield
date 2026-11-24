@@ -41,6 +41,82 @@ jobs:
       - name: spec/vectors.json, the middleware, pattern cost and the examples
         run: npm test
 
+  php:
+    name: PHP ${{ matrix.php }}
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        php: ["8.1", "8.3", "8.5"]
+    defaults:
+      run:
+        working-directory: ports/php
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+      - name: Every file parses
+        run: find artex-shield tests -name '*.php' -print0 | xargs -0 -n1 php -l
+      - name: spec/vectors.json, state in memory
+        run: php tests/vectors.php
+      - name: spec/vectors.json, state in files
+        run: php tests/vectors.php --files
+      - name: spec/vectors.json, state in the object cache
+        run: php tests/vectors.php --cache
+      - name: Pattern cost
+        run: php tests/cost.php
+      - name: The plugin's request path and settings
+        run: php tests/plugin.php
+
+  wordpress:
+    name: WordPress plugin (${{ matrix.tag }})
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        tag: ["7-php8.2-apache", "7-php8.5-apache"]
+    env:
+      WP_TAG: ${{ matrix.tag }}
+      COMPOSE: docker compose -f ports/php/tests/wordpress/docker-compose.yml
+      SMOKE: ports/php/tests/wordpress/smoke.py
+    steps:
+      - uses: actions/checkout@v4
+      - name: WordPress, MariaDB and WP-CLI
+        run: $COMPOSE up -d --wait wordpress db
+      - name: Install WordPress and activate the plugin
+        run: |
+          for i in $(seq 1 30); do                 # 0 installed, 1 not yet: either way WordPress can be reached
+            status=0; $COMPOSE run --rm -T cli core is-installed 2>/dev/null || status=$?
+            if [ "$status" -le 1 ]; then break; fi; sleep 2
+          done
+          $COMPOSE run --rm -T cli core install --url=http://localhost:8090 --title=Shielded --admin_user=admin \
+            --admin_password=ci-only-admin --admin_email=admin@example.com --skip-email
+          $COMPOSE run --rm -T cli rewrite structure '/%postname%/'
+          $COMPOSE run --rm -T cli plugin activate artex-shield
+      - name: Monitor mode, the decoys, and the settings page switching to enforce
+        run: python3 $SMOKE admin http://localhost:8090 ci-only-admin
+      - name: Enforce mode against a visitor and a scanner
+        run: |
+          $COMPOSE run --rm -T cli eval 'foreach (array_keys(ArtexShield\WordPress\Plugin::shield()->blocklist()) as $n) { ArtexShield\WordPress\Plugin::shield()->unblock(explode("/", $n)[0]); }'
+          python3 $SMOKE visitor http://localhost:8090
+      - name: A planted password, replayed from another address, is blocked
+        run: |
+          password=$($COMPOSE run --rm -T cli eval 'echo ArtexShield\Decoys::honeytokens(get_option("artex_shield_settings")["secret"])["passwords"][1];')
+          docker run --rm --network artex-shield-wp-plugin_default -v "$PWD/ports/php/tests/wordpress:/smoke:ro" python:3.13-slim \
+            python /smoke/smoke.py replay http://wordpress "$password"
+      - name: The events record both, and PHP logged no warnings
+        run: |
+          events=$($COMPOSE run --rm -T cli eval 'echo json_encode(ArtexShield\WordPress\Plugin::events());')
+          echo "$events" | grep -q 'decoy:honeytoken-body'
+          echo "$events" | grep -q 'tool:sqlmap'
+          if $COMPOSE logs wordpress | grep -iE 'PHP (Warning|Notice|Deprecated|Fatal)'; then exit 1; fi
+      - name: Logs
+        if: always()
+        run: $COMPOSE logs wordpress
+      - name: Clean up
+        if: always()
+        run: $COMPOSE down -v
+
   proxy:
     name: proxy in Docker, in front of WordPress
     runs-on: ubuntu-24.04
