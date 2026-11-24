@@ -17,6 +17,9 @@ classifiers = [
 ]
 dependencies = []
 
+[project.scripts]
+artex-shield-proxy = "artex_shield.proxy:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

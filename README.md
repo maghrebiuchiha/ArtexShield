@@ -1,6 +1,6 @@
 # artex-shield
 
-Layered detection and blocking for [ARTEX](https://github.com/BaaRai/ARTEX)-style automated penetration-testing traffic. Drop-in middleware for Python web apps (Flask, Django, FastAPI, Starlette, any WSGI or ASGI app). Standard library only.
+Layered detection and blocking for [ARTEX](https://github.com/BaaRai/ARTEX)-style automated penetration-testing traffic. Drop-in middleware for Python web apps (Flask, Django, FastAPI, Starlette, any WSGI or ASGI app), and a reverse proxy, `artex-shield-proxy`, for any other website: WordPress, PHP, Node, a static site. Standard library only.
 
 ARTEX is a self-hosted, LLM-driven pentest platform: a planner breaks a goal into intents and workers run real scanners against the target. It is meant for authorised testing, but nothing stops someone pointing it at a site they do not own. This project is built from a read of its source and targets what it actually does on the wire.
 
@@ -90,6 +90,75 @@ If you call `check()` and `observe()` yourself, pass the decision's flag on: `sh
 ### Monitor mode
 
 Monitor mode reports what enforce mode would do, and stops nothing. Two details keep the report honest. A client over the throttle score is reported as `throttle` on each request, but is not scored for ignoring a wait nobody told it about. An address enforce mode would have blocked keeps its score frozen, as it would be, and its later requests are reported as `blocked` events: every one that carries a hard signal, and the rest once per half-life. A person who browses on normally while "blocked" is what a false positive looks like in the log.
+
+## In front of any website: `artex-shield-proxy`
+
+For a site that is not a Python app, run the shield as a reverse proxy. Every request goes through the same checks as the middleware, and the ones it allows are forwarded to your site. The site's answers stream back, and their status codes feed the 404 sensors as the middleware's do.
+
+```bash
+pip install .
+artex-shield-proxy --backend http://127.0.0.1:8000 --listen 0.0.0.0:8080
+```
+
+Then send your traffic to port 8080 instead of the site, and stop the site being reachable any other way. The proxy speaks plain HTTP/1.1. For HTTPS, keep your TLS terminator (Caddy, nginx, a load balancer, a CDN) in front of it and list its addresses in `trusted_proxies`, so the shield scores your visitors and not the terminator.
+
+### WordPress, in Docker
+
+```bash
+docker compose -f examples/wordpress/docker-compose.yml up -d --build
+```
+
+This starts WordPress, MariaDB and the proxy, with only the proxy published, on port 8080. Open `http://localhost:8080` and run the WordPress installer through it. The official WordPress image already believes `X-Forwarded-For` from private addresses, so WordPress and its access log see each visitor's address. Watch the shield's decisions with `docker compose -f examples/wordpress/docker-compose.yml logs -f shield`. It starts in monitor mode; set `ARTEX_SHIELD_MODE=enforce` when a week of logs shows no visitor you would have stopped. CI installs WordPress through the proxy and checks that a scanner is blocked before it reaches WordPress.
+
+The image alone: `docker build -t artex-shield-proxy .`, then `docker run -p 8080:8080 -e ARTEX_SHIELD_BACKEND=http://your-site:80 artex-shield-proxy`.
+
+### Settings
+
+Settings come from a TOML file (`--config`, or `ARTEX_SHIELD_CONFIG`; Python 3.11 or newer), then from environment variables, then from the command line (`--backend`, `--listen`, `--mode`), each overriding the one before. `examples/proxy.toml` lists them all. `artex-shield-proxy --check-config` prints what is in effect and exits.
+
+Every setting has an environment variable named `ARTEX_SHIELD_` plus the setting in upper case. Lists are comma-separated, true or false is `1`/`0`, `true`/`false`, `yes`/`no` or `on`/`off`, and `ARTEX_SHIELD_ENGAGEMENTS` is a JSON list. An unknown `ARTEX_SHIELD_*` variable stops the proxy at start-up, so a typo cannot go unnoticed.
+
+| `[proxy]` | Default | |
+| --- | --- | --- |
+| `backend` | none | The site: `http://host:port` or `https://host:port`, with no path |
+| `listen` | `0.0.0.0:8080` | Also `[::]:8080`, or a bare port |
+| `backend_host_header` | `preserve` | Pass the visitor's `Host` on, or `backend` to send the backend's own |
+| `backend_tls_verify` | true | For an `https://` backend |
+| `connect_timeout` / `read_timeout` | 10 / 60 s | `read_timeout` covers waiting on the backend, and on a visitor part-way through a request |
+| `idle_timeout` | 75 s | A visitor's kept-alive connection between requests |
+| `backend_idle_timeout` | 4 s | How long an idle backend connection is reused. Keep it below the backend's own keep-alive timeout |
+| `max_idle_backend` | 32 | Idle backend connections kept open |
+| `max_header_bytes` | 65536 | Larger request heads are answered 431 |
+| `access_log` | false | One line per request on stderr |
+
+Under `[shield]` goes any `Config` field from "Scoring" and the sections above (`mode`, `trusted_proxies`, `exempt_paths`, `allow_cidrs`, the thresholds, and the rest), plus `canary_secret` (and `canary_count`, default 3) to generate canary paths with `make_canaries`. Authorised assessments are `[[shield.engagements]]` tables with `reference`, `cidrs`, `start` and `end`. Events go to stderr as JSON lines, as from the middleware.
+
+### What it does with HTTP
+
+- **Client addresses.** From an untrusted peer, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host` and `Forwarded` are thrown away and replaced: the site receives the peer's address and `http`. From a peer in `trusted_proxies` they are kept, and the peer is appended to `X-Forwarded-For`.
+- **Bodies stream both ways**, sized or chunked, and are never held whole in memory. The one exception is an answer of 64 KiB or less with a `Content-Length`, which is sent out together with its head. `Expect: 100-continue` is answered by the proxy once the shield has allowed the request. Interim answers such as `103 Early Hints` are passed on.
+- **Keep-alive.** Visitors' connections are kept open between requests, and pipelined requests are answered in order, each checked by the shield. Connections to the site are pooled. A `GET`, `HEAD` or other idempotent request without a body, sent on a pooled connection the site had just closed, is retried once on a new one. A `POST` never is.
+- **WebSockets.** The handshake is checked like any other request. After the site answers `101`, bytes pass both ways untouched; messages on the socket are not inspected.
+- **Hop-by-hop headers** (`Connection` and the headers it names, `Keep-Alive`, `TE`, `Trailer`, `Upgrade` outside a WebSocket handshake, `Proxy-Connection`, `Proxy-Authorization`, `Proxy-Authenticate`) stay on their own connection.
+- **Requests that two servers could read differently are refused**, so nothing can ride past the shield inside another request's body. That covers `Content-Length` with `Transfer-Encoding`, lengths that disagree, codings other than `chunked` (501), malformed chunks, folded or malformed headers, control characters in a header, and two `Host` headers. These all answer 400 unless noted. An oversized head answers 431, and `CONNECT` 405.
+- **Failures.** A site that cannot be reached answers 502. One that does not answer within `read_timeout` answers 504.
+- **Shutting down.** On `SIGTERM` the proxy stops accepting, closes idle connections, and gives requests in flight 10 seconds.
+
+### What it costs
+
+Measured with `python examples/bench_proxy.py` on a 4-vCPU cloud container with Python 3.13: 20,000 requests per row, the range over five runs. Each request carries a fresh visitor address, so it is scored in full. The origin answers 1 KiB.
+
+| | Straight to the site, p50 | Through the proxy, p50 | Added, p50 | Through the proxy, p99 |
+| --- | --- | --- | --- | --- |
+| One request at a time | 0.09 ms | 0.45–0.54 ms | **0.36–0.44 ms** | 1.1–1.6 ms |
+| 32 connections at once | 0.7–1.1 ms | 6.9–10 ms | 6–9 ms, queueing | 12–14 ms |
+
+One proxy process handled 3,400–4,200 requests a second on that machine. Below that rate it adds about 0.4 ms to a request; above it, requests queue, as the 32-connection row shows. About 120 µs of each request is the shield's own decision, and the rest is HTTP handling in Python.
+
+### Limits of the proxy
+
+- **One process.** Scores and blocks live in that process's memory and are lost on restart. Set `blocklist_export_path` to keep blocks at your edge as well (see "Pushing blocks to the edge"). Several proxy processes would each keep their own scores; see "Limits".
+- **HTTP/1.1 to the site.** The proxy does not terminate TLS and does not speak HTTP/2; the terminator in front of it does both.
 
 ## Plant the decoys
 
@@ -212,10 +281,10 @@ For the TLS sensor, have your edge pass a JA3 or JA4 value in a header and set `
 - **A link someone is talked into opening** is not induced as far as the browser can tell if it is pasted or opened from a mail client (`Sec-Fetch-Site: none`), so a canary link sent by e-mail still blocks the person who opens it.
 - **About 60 guessed paths an hour per address are still free**, and 14 a minute until that allowance is spent. Guessing values of one query parameter (`/item?id=1`, `?id=2`) is not counted at all, because the path is the same.
 - **Payload patterns are a net, not a parser.** A bare `;id` or `|id` is not scored, because it reads the same as a list. Injection sent only in a `Referer`, cookie or other header is not scored, apart from JNDI lookups and callback domains. Encodings a pattern does not expect get through. To let search text through, some payload forms are not scored: a bare `<script>` tag with no code, a lone `<svg>` or `<iframe>`, a number left dangling after `OR` (`' or 1`), `UNION SELECT` after a plain word with a one-word list (`x union select a`), and two levels of `../` to a file with no server-side extension. And a search that is itself a payload (`sleep(5)`, `{{7*7}}`, `' or 1=1--`) still scores.
-- **Request bodies are not inspected**, nor are messages on an open WebSocket, and nmap port scans never reach a web app at all. Keep your firewall and, if you have one, your WAF.
+- **Request bodies are not inspected**, nor are messages on an open WebSocket, by the middleware or the proxy, and nmap port scans never reach a web app at all. Keep your firewall and, if you have one, your WAF.
 - **An exposed dump that really exists is served.** The shield cannot tell `db-backup.sql` from `employee-handbook.zip` until the app answers, so it waits for the 404.
 - **Shared addresses.** Blocking an address also blocks everyone behind the same NAT, VPN or campus network. IPv6 block widening, if you turn it on, covers more: a /56 can be one household or, with some providers, hundreds of customers. This is why blocks expire and why `monitor` is the default mode.
-- **Scores are per process.** With several workers each keeps its own scores, so thresholds are effectively multiplied, and a block made by one worker is enforced by the others only at the edge, through the shared deny file. Run one worker, or enforce the file in nginx, until a shared store is added.
+- **Scores are per process.** With several workers each keeps its own scores, so thresholds are effectively multiplied, and a block made by one worker is enforced by the others only at the edge, through the shared deny file. Run one worker, or enforce the file in nginx, until a shared store is added. `artex-shield-proxy` is a single process, so it keeps one set of scores.
 - **Search engines.** Crawlers that honour `robots.txt` will not touch canaries. Verified-bot checks by reverse DNS are not included; add crawler ranges to `allow_cidrs` if you see them scored. A crawler working through many dead links will also run into the hourly allowance.
 
 ## Layout
@@ -226,8 +295,10 @@ src/artex_shield/
   signatures.py   patterns for ARTEX and its toolchain
   decoys.py       canary generation and trap snippets
   middleware.py   WSGI and ASGI adapters
+  proxy.py        artex-shield-proxy, the reverse proxy
   util.py         address and decoding helpers
-tests/            109 tests, including every case in spec/vectors.json
-examples/         Flask, FastAPI, nginx, and a campaign simulation
+tests/            166 tests, including every case in spec/vectors.json, run directly and through the proxy
+examples/         Flask, FastAPI, nginx, WordPress in Docker, a proxy config and benchmark, and a campaign simulation
 spec/             vectors.json and SPEC.md: the cases and rules every port is checked against
+Dockerfile        the proxy's image
 ```

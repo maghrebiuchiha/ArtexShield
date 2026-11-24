@@ -1,0 +1,33 @@
+# artex-shield-proxy settings (Python 3.11 or newer reads TOML).
+#   artex-shield-proxy --config examples/proxy.toml
+# Every key can also be set as ARTEX_SHIELD_<KEY> (upper case), which wins
+# over this file; the command line's --backend, --listen and --mode win over both.
+
+[proxy]
+backend = "http://127.0.0.1:8000"   # the site; a bare origin, http or https
+listen = "0.0.0.0:8080"             # also "[::]:8080", or a bare port
+# backend_host_header = "preserve"  # pass the visitor's Host on; "backend" sends the backend's
+# backend_tls_verify = true
+# connect_timeout = 10.0            # seconds
+# read_timeout = 60.0               # waiting on the backend, or on a visitor mid-request
+# idle_timeout = 75.0               # a visitor's kept-alive connection between requests
+# backend_idle_timeout = 4.0        # keep below the backend's own keep-alive timeout
+# max_idle_backend = 32
+# max_header_bytes = 65536
+# access_log = false                # one line per request on stderr
+
+[shield]
+mode = "monitor"                    # "enforce" once the logs show no visitor you would have stopped
+# A long random string you keep; it decides the canary paths (see README).
+# canary_secret = "..."
+# trusted_proxies = ["10.0.0.0/8"]  # your TLS terminator or load balancer, if any
+# allow_cidrs = []
+# exempt_paths = ["/healthz"]
+# Any other Config field works here too: throttle_score, block_score,
+# half_life, block_ttl, rate_limit, tls_header, v6_escalate_after, ...
+
+# [[shield.engagements]]            # an authorised ARTEX assessment
+# reference = "ENG-2026-014"
+# cidrs = ["198.51.100.0/24"]
+# start = 2026-03-01T09:00:00Z
+# end = 2026-03-14T18:00:00Z

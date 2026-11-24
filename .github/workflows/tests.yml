@@ -16,3 +16,33 @@ jobs:
       - name: spec/vectors.json matches the test suite
         run: python spec/export_vectors.py --check
       - run: python examples/simulate.py
+
+  proxy:
+    name: proxy in Docker, in front of WordPress
+    runs-on: ubuntu-24.04
+    env:
+      COMPOSE: docker compose -f examples/wordpress/docker-compose.yml
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t artex-shield-proxy .
+      - name: spec/vectors.json through the proxy, inside the image
+        run: >
+          docker run --rm -v "$PWD/tests:/work/tests:ro" -v "$PWD/spec:/work/spec:ro" -w /work
+          --entrypoint python artex-shield-proxy -W error -m unittest discover -s tests -p test_proxy.py -v
+      - name: WordPress behind the proxy, in enforce mode
+        env:
+          ARTEX_SHIELD_MODE: enforce
+        run: $COMPOSE up -d --wait
+      - name: Install WordPress and browse it through the proxy, then send a scanner
+        run: python3 examples/wordpress/smoke.py http://localhost:8080
+      - name: The scanner was blocked and never reached WordPress
+        run: |
+          $COMPOSE logs shield | grep '"action":"block"'
+          if $COMPOSE logs wordpress | grep -i sqlmap; then exit 1; fi
+      - name: Logs
+        if: always()
+        run: $COMPOSE logs
+      - name: Clean up
+        if: always()
+        run: $COMPOSE down -v

@@ -4,7 +4,7 @@ What every implementation (Python, the proxy, Node, PHP, OpenResty) must do with
 
 ## Test vectors
 
-`vectors.json` is exported from the Python test suite by `spec/export_vectors.py`: every decision the detection tests make, recorded as it happened. Only the tests of Python-specific plumbing are left out (adapters, block file, locking, timing).
+`vectors.json` is exported from the Python test suite by `spec/export_vectors.py`: every decision the detection tests make, recorded as it happened. Only the tests of Python-specific plumbing are left out (adapters, block file, locking, timing). `tests/test_vectors.py` replays them against the Python shield, and `tests/test_proxy.py` sends every request in them through `artex-shield-proxy` over HTTP.
 
 ```json
 {"version": 1, "t0": 1800000000.0,

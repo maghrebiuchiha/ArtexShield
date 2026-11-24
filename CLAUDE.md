@@ -8,13 +8,17 @@ Python middleware that detects and blocks ARTEX-style automated pentest traffic
 - `src/artex_shield/signatures.py` - User-Agent, path and payload patterns
 - `src/artex_shield/decoys.py` - canary paths and trap snippets
 - `src/artex_shield/middleware.py` - WSGI and ASGI adapters
+- `src/artex_shield/proxy.py` - `artex-shield-proxy`, the asyncio reverse proxy for non-Python sites; `Dockerfile`,
+  `examples/wordpress/` (compose file and CI smoke test), `examples/proxy.toml`
 - `tests/test_shield.py` - simulated traffic, fake clock, no network
+- `tests/test_proxy.py` - the proxy against a local origin on 127.0.0.1, and spec/vectors.json replayed through it
 - `spec/vectors.json`, `spec/SPEC.md` - the cases and rules every port must match; `tests/test_vectors.py` runs them
 - `examples/simulate.py` - campaign vs. legitimate-traffic soak; exits 1 if any legit request is stopped
 
 ## Commands
 - Tests: `python -W error -m unittest discover -s tests`
 - Simulation: `python examples/simulate.py`
+- Proxy latency: `python examples/bench_proxy.py`; update the numbers in README.md ("What it costs") if the proxy changes
 - Vectors: `python spec/export_vectors.py` after a deliberate behaviour change (review the diff: it binds every port);
   CI runs `--check`
 
