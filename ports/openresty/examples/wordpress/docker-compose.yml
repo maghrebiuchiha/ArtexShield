@@ -1,0 +1,77 @@
+# WordPress behind OpenResty with artex-shield. Only OpenResty is published:
+# WordPress and its database are reachable on the compose network alone, so
+# every request goes through the shield.
+#
+#   docker compose -f ports/openresty/examples/wordpress/docker-compose.yml up -d --wait
+#   open http://localhost:8080 and run the WordPress installer
+#   docker compose -f ports/openresty/examples/wordpress/docker-compose.yml logs -f edge
+#
+# The shield starts in monitor mode: it logs what it would block and blocks
+# nothing. When a week of logs shows no visitor you would have stopped, run
+# with ARTEX_SHIELD_MODE=enforce.
+#
+# What to plant on the site for the decoys (canary links, fake credentials):
+#   docker compose -f ports/openresty/examples/wordpress/docker-compose.yml run --rm --no-deps -T edge decoys
+name: artex-shield-openresty
+
+services:
+  edge:
+    image: openresty/openresty:1.27.1.2-bookworm-fat
+    restart: unless-stopped
+    depends_on:
+      - wordpress
+    ports:
+      - "8080:8080"
+    environment:
+      ARTEX_SHIELD_MODE: ${ARTEX_SHIELD_MODE:-monitor}
+      # Long random strings you keep: they decide the canary paths and the fake credentials.
+      ARTEX_SHIELD_CANARY_SECRET: ${ARTEX_SHIELD_CANARY_SECRET:-}
+      ARTEX_SHIELD_HONEYTOKEN_SECRET: ${ARTEX_SHIELD_HONEYTOKEN_SECRET:-}
+      # Your TLS terminator, load balancer or CDN in front of port 8080, if any.
+      ARTEX_SHIELD_TRUSTED_PROXIES: ${ARTEX_SHIELD_TRUSTED_PROXIES:-}
+    volumes:
+      - ../../lib:/opt/artex-shield/lib:ro
+      - ../artex_settings.lua:/opt/artex-shield/artex_settings.lua:ro
+      - ../nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
+      - ../decoys:/usr/local/bin/decoys:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8080/_artex/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  wordpress:
+    image: wordpress:7-apache
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: ${WORDPRESS_DB_PASSWORD:-change-me}
+      WORDPRESS_DB_NAME: wordpress
+    volumes:
+      - wordpress:/var/www/html
+    # No ports. The image believes X-Forwarded-For from private ranges
+    # (mod_remoteip), so WordPress sees each visitor's address as OpenResty passes it on.
+
+  db:
+    image: mariadb:lts
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: ${WORDPRESS_DB_PASSWORD:-change-me}
+      MARIADB_RANDOM_ROOT_PASSWORD: "1"
+    volumes:
+      - db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  wordpress:
+  db:

@@ -153,3 +153,71 @@ jobs:
       - name: Clean up
         if: always()
         run: $COMPOSE down -v
+
+  openresty:
+    name: OpenResty ${{ matrix.openresty }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        openresty: ["1.21.4.3-bullseye-fat", "1.27.1.2-bookworm-fat"]
+    env:
+      IMAGE: openresty/openresty:${{ matrix.openresty }}
+      COMPOSE: docker compose -f ports/openresty/examples/wordpress/docker-compose.yml
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"                    # unicode.lua holds this Python's Unicode data
+      - name: patterns.lua and unicode.lua are up to date
+        run: python ports/openresty/build.py --check
+      - name: Pull the image
+        run: docker pull $IMAGE
+      - name: spec/vectors.json, state in shared dicts
+        run: docker run --rm -v "$PWD:/w:ro" -w /w/ports/openresty $IMAGE sh tests/run.sh vectors
+      - name: The shared dicts, the adapter, and pattern cost
+        run: docker run --rm -v "$PWD:/w:ro" -w /w/ports/openresty $IMAGE sh tests/run.sh store adapter cost
+      - name: spec/vectors.json through OpenResty over HTTP
+        run: |
+          docker run -d --name harness --network host -v "$PWD/ports/openresty:/srv/artex:ro" $IMAGE \
+            sh -c 'mkdir -p /tmp/harness/logs && exec openresty -p /tmp/harness -c /srv/artex/tests/nginx/harness.conf'
+          for i in $(seq 1 40); do curl -s -o /dev/null http://127.0.0.1:8399/__test/report && break; sleep 0.5; done
+          python3 ports/openresty/tests/edge.py
+      - name: Four workers in enforce mode, in front of an origin
+        run: |
+          docker run -d --name smoke --network host -v "$PWD/ports/openresty:/srv/artex:ro" $IMAGE \
+            sh -c 'mkdir -p /tmp/smoke/logs && exec openresty -p /tmp/smoke -c /srv/artex/tests/nginx/smoke.conf'
+          for i in $(seq 1 40); do curl -s -o /dev/null http://127.0.0.1:8498/__origin/seen && break; sleep 0.5; done
+          python3 ports/openresty/tests/smoke.py
+      - name: No pattern failed and no worker crashed
+        run: if docker logs smoke 2>&1 | grep -E 'pattern failed|exited on signal|\[(error|crit|alert|emerg)\]'; then exit 1; fi
+      - name: WordPress behind OpenResty, in enforce mode
+        if: matrix.openresty == '1.27.1.2-bookworm-fat'
+        env:
+          ARTEX_SHIELD_MODE: enforce
+          ARTEX_SHIELD_HONEYTOKEN_SECRET: ci-only-honeytoken-secret
+        run: |
+          $COMPOSE up -d --wait
+          python3 examples/wordpress/smoke.py http://localhost:8080
+          password=$($COMPOSE run --rm --no-deps -T edge decoys | sed -n 's/.* login [^ ]* \/ \([^ ]*\) ;.*/\1/p')
+          docker run --rm --network artex-shield-openresty_default -v "$PWD/examples/wordpress:/smoke:ro" \
+            python:3.13-slim python /smoke/smoke.py http://edge:8080 --replay "$password"
+      - name: The edge logged both blocks, and WordPress saw neither request
+        if: matrix.openresty == '1.27.1.2-bookworm-fat'
+        run: |
+          $COMPOSE logs --no-color edge > edge.log
+          grep '"action":"block"' edge.log | grep -q tool:sqlmap
+          grep '"action":"block"' edge.log | grep -q decoy:honeytoken-body
+          if $COMPOSE logs wordpress | grep -i -e sqlmap -e "POST /wp-login.php"; then exit 1; fi
+          if grep -E '\[(error|crit|alert|emerg)\]' edge.log; then exit 1; fi
+      - name: Logs
+        if: always()
+        run: |
+          docker logs harness 2>&1 | tail -50 || true
+          docker logs smoke 2>&1 | grep -v 'artex-shield: {' | tail -50 || true
+          $COMPOSE logs --no-color 2>&1 | tail -80 || true
+      - name: Clean up
+        if: always()
+        run: |
+          docker rm -f harness smoke || true
+          $COMPOSE down -v || true

@@ -218,6 +218,18 @@ Settings are the ones above in camelCase (`throttleScore`, `trustedProxies`, `cl
 
 Activate it, and it checks each request as soon as it loads, before themes and most plugins run. It plants the decoys on your pages itself. It keeps scores and blocks in the object cache when that is persistent, otherwise in files, so every PHP worker sees the same ones. Settings → ARTEX Shield sets the mode, the secret, trusted proxies, the allowlist and exempt paths, and lists blocks and recent events. See [ports/php/README.md](ports/php/README.md).
 
+## nginx and OpenResty
+
+`ports/openresty` is the shield as an nginx module for OpenResty 1.21.4 or newer. It decides on every request in the access phase, before nginx passes it to anything behind it, so it fits any site nginx serves or proxies: static files, PHP, Node, Python or another server. Scores and blocks live in `lua_shared_dict`s, shared by every worker. CI holds it to the same cases, `spec/vectors.json`, both directly and sent through nginx over HTTP. It also runs it in front of WordPress.
+
+```nginx
+init_by_lua_block   { require("resty.artex_shield").configure({mode = "monitor", canary_secret = "..."}) }
+access_by_lua_block { require("resty.artex_shield").access() }
+log_by_lua_block    { require("resty.artex_shield").log() }
+```
+
+Settings are the ones above in snake_case, plus `canary_secret` and `honeytoken_secret` as for the proxy. See [ports/openresty/README.md](ports/openresty/README.md) for the shared dicts, what to plant, the admin location and what it costs: about 70 µs of one core per request.
+
 ## Plant the decoys
 
 ```python
@@ -351,6 +363,8 @@ Turn it on only if you know how your visitors' providers allocate addresses, or 
 
 Set `blocklist_export_path="/etc/nginx/artex-deny.conf"` and include that file in your nginx `server` block; see `examples/nginx.conf`. Reload nginx on a timer or with a file watcher.
 
+If your nginx is OpenResty, the edge module in `ports/openresty` decides at the edge itself, with every worker sharing scores and blocks and no file to reload (see "nginx and OpenResty").
+
 - **All workers write one file.** Each worker merges its blocks with what the others wrote, so the file holds the union and this is the way to share blocks between workers. Expiry times are kept next to it in `artex-deny.conf.state`, and writers take turns on `artex-deny.conf.lock`. Both the file and its state are replaced atomically.
 - **Entries leave when they expire.** The file is rewritten on each new block, on `unblock()`, and when its earliest entry expires. A timer does the last one, so it happens even if no request arrives; the timer is a daemon thread and exists only while an export path is set.
 - **Only networks are written.** Anything else in the state file is dropped, so a damaged file cannot break `nginx -t`.
@@ -391,5 +405,6 @@ examples/         Flask, FastAPI, nginx, WordPress in Docker, a proxy config and
 spec/             vectors.json, patterns.json and SPEC.md: the cases, patterns and rules every port is checked against
 ports/node/       the Node.js / Express port
 ports/php/        the WordPress plugin and PHP port
+ports/openresty/  the nginx edge module for OpenResty
 Dockerfile        the proxy's image
 ```
