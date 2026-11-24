@@ -17,9 +17,11 @@ ARTEX is self-hosted, so there is no list of "ARTEX IPs" to import. Addresses
 are blocked because of how they behave, and blocks expire.
 """
 from .core import Config, Decision, Engagement, Shield
-from .decoys import html_trap, js_trap, make_canaries, robots_txt_block
+from .decoys import (Honeytokens, honeytoken_html, honeytoken_js, html_trap, js_trap, make_canaries,
+                     make_honeytokens, robots_txt_block)
 from .middleware import ShieldASGI, ShieldWSGI
 
 __all__ = ["Shield", "Config", "Engagement", "Decision", "ShieldWSGI", "ShieldASGI",
-           "make_canaries", "robots_txt_block", "html_trap", "js_trap"]
+           "make_canaries", "robots_txt_block", "html_trap", "js_trap",
+           "Honeytokens", "make_honeytokens", "honeytoken_js", "honeytoken_html"]
 __version__ = "1.0.0"

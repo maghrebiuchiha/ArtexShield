@@ -1,10 +1,13 @@
 """Configuration, tracking, sensors and fire control."""
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import math
 import os
+import re
 import secrets
 import statistics
 import threading
@@ -104,6 +107,13 @@ class Config:
     slow_enum_budget: int = 60
     slow_enum_window: float = 3600.0
     slow_enum_points: float = 10.0
+    # Credential honeytokens (see make_honeytokens): fake API keys and
+    # passwords you planted. A request presenting one, in any header (Basic
+    # auth included), a cookie, the query, the path or the body, is blocked
+    # on the spot. Bodies are read up to honeytoken_body_limit bytes, and
+    # only when honeytokens are set.
+    honeytokens: Iterable[str] = ()
+    honeytoken_body_limit: int = 65536
 
     def __post_init__(self):
         if self.mode not in ("monitor", "enforce"):
@@ -119,6 +129,15 @@ class Config:
                 raise ValueError(f"{name} must be positive")
         _prefixes(self.exempt_paths, "exempt_paths")
         _prefixes(self.enum_ignore_prefixes, "enum_ignore_prefixes")
+        if isinstance(self.honeytokens, str):
+            raise ValueError("honeytokens must be a list of values (or make_honeytokens(...)), not one string")
+        self.honeytokens = tuple(dict.fromkeys(str(t) for t in self.honeytokens))
+        for token in self.honeytokens:
+            if len(token) < 12 or any(c.isspace() for c in token):
+                raise ValueError(f"honeytoken {token[:4]}... must be at least 12 characters with no whitespace: "
+                                 "anything shorter could turn up in ordinary requests")
+        if self.honeytoken_body_limit < 0:
+            raise ValueError("honeytoken_body_limit must not be negative")
         if not 0 < self.throttle_score <= self.block_score:
             raise ValueError("need 0 < throttle_score <= block_score")
         if self.soft_cap is None:
@@ -258,7 +277,10 @@ class Shield:
 
     # ---- before the app runs --------------------------------------------
     def check(self, ip: str, method: str, path: str, query: str = "",
-              headers: Optional[Dict[str, str]] = None) -> Decision:
+              headers: Optional[Dict[str, str]] = None, body: Optional[bytes] = None) -> Decision:
+        """Decide on one request before the app sees it. `body` is only looked
+        at for honeytokens: pass its first Config.honeytoken_body_limit bytes
+        (the adapters do)."""
         cfg, now = self.cfg, self.clock()
         h = {k.lower(): v for k, v in (headers or {}).items()}
         ua = h.get("user-agent", "")
@@ -311,6 +333,10 @@ class Shield:
         # Reading the request needs no shared state, so it is done without the
         # lock: a large request must not make every other one wait.
         seen = self._scan(method, npath, query, h, ua)
+        if cfg.honeytokens:
+            where = self._honeytoken(npath, query, h, body)
+            if where:                                # worth a block on its own, whatever block_score is
+                seen.append((f"decoy:honeytoken-{where}", max(100.0, cfg.block_score), False))
 
         with self._state():
             if self._blocked(key, now):
@@ -411,6 +437,44 @@ class Shield:
         while len(t.missing) > _MISSING_MEMORY:
             t.missing.popitem(last=False)
         return last is None or now - last > self.cfg.half_life
+
+    # ---- honeytokens ----------------------------------------------------------
+    def _honeytoken(self, npath: str, query: str, h: Dict[str, str], body: Optional[bytes]) -> Optional[str]:
+        """Where a planted credential turns up in this request, or None. Each
+        place is searched as sent and URL-decoded; Basic auth is unpacked.
+        The Referer is skipped: it is the browser repeating an address."""
+        tokens = self.cfg.honeytokens
+
+        def has(text: str) -> bool:
+            if not text:
+                return False
+            if any(t in text for t in tokens):
+                return True
+            decoded = _decode(text)
+            return decoded != text and any(t in decoded for t in tokens)
+
+        for name, value in h.items():
+            if name == "referer":
+                continue
+            value = value[:16384]
+            if has(value):
+                return "cookie" if name == "cookie" else "header"
+            if name in ("authorization", "proxy-authorization"):
+                m = re.match(r"\s*basic\s+([A-Za-z0-9+/_=-]{4,8192})", value, re.I)
+                if m:
+                    try:
+                        raw = base64.b64decode(m.group(1) + "===", altchars=b"-_" if "-" in m.group(1) or "_" in m.group(1) else None)
+                    except (ValueError, binascii.Error):
+                        raw = b""
+                    if has(raw.decode("latin-1")):
+                        return "header"
+        if has(query[:65536]):
+            return "query"
+        if has(npath):
+            return "path"
+        if body and self.cfg.honeytoken_body_limit and has(body[:self.cfg.honeytoken_body_limit].decode("latin-1")):
+            return "body"
+        return None
 
     # ---- sensors ----------------------------------------------------------
     def _scan(self, method: str, npath: str, query: str, h: Dict[str, str], ua: str) -> List[_Hit]:
