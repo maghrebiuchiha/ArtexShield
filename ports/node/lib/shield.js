@@ -137,14 +137,21 @@ class Shield {
     const ref = crypto.randomBytes(4).toString("hex");
     const enforce = cfg.mode === "enforce";
     const npath = normPath(path);
-    const exempt = under(path, this.exempt) || ip.inNets(clientIp, this.allowed);
+    const allowed = ip.inNets(clientIp, this.allowed);
+    const exempt = !allowed && under(path, this.exempt);
     const induced = !cfg.scoreInduced && isInduced(h);
     const m = S.ASSESSMENT_UA.exec(ua);
     const hits = [];
     query = query || "";
 
     this.stats.requests += 1;
-    if (exempt) return new Decision("pass", enforce, 0, [], ref, clientIp);
+    // An allowlisted address is never scored. Nor is a request for an exempt
+    // path, but a client blocked for what it did elsewhere stays blocked there too.
+    if (allowed) return new Decision("pass", enforce, 0, [], ref, clientIp);
+    if (exempt) {
+      if (this.blocked(key, now)) return new Decision("block", enforce, cfg.blockScore, ["blocklist"], ref, clientIp);
+      return new Decision("pass", enforce, 0, [], ref, clientIp);
+    }
     if (!this.identified(clientIp)) {
       this.stats.unidentified += 1;
       const labels = ["config:unidentified-client"];

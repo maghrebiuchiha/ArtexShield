@@ -840,6 +840,37 @@ class ExemptPaths(unittest.TestCase):
             s2, _ = shield(exempt_paths=["/static", "/healthz", "/assets/"])
             self.assertEqual(s2.check("203.0.113.91", "GET", path, headers=self.BAD).action, "block", path)
 
+    def test_a_climb_in_another_servers_spelling_is_under_nothing(self):
+        # Tomcat, Jetty and Spring drop ";param" from a segment, so "..;" climbs
+        # there; some servers stop at a NUL, or trim dots and spaces.
+        for path in ["/static/..;/api/items", "/static/..;jsessionid=1/api", "/static/%2e%2e;/api", "/static/..%00/api",
+                     "/static/.../api", "/static/.. /api", "/static/..+/api", "/static/..;", "/static/%252e%252e;/api"]:
+            s, _ = shield(exempt_paths=["/static"])
+            self.assertEqual(s.check("203.0.113.92", "GET", path, headers=self.BAD).action, "block", path)
+        s, _ = shield(exempt_paths=["/static"])
+        for path in ["/static/app.js;v=2", "/static/..x/a.js", "/static/a..b.css", "/static/.well-known", "/static/x..",
+                     "/static/./app.js"]:
+            self.assertEqual(s.check("203.0.113.93", "GET", path, headers=self.BAD).action, "pass", path)
+
+    def test_a_blocked_client_stays_blocked_on_an_exempt_path(self):
+        for mode in ("enforce", "monitor"):
+            s, _ = shield(mode=mode, exempt_paths=["/static"])
+            self.assertEqual(s.check("203.0.113.94", "GET", "/static/app.js", headers=BROWSER).action, "pass")
+            s.check("203.0.113.94", "GET", "/", headers=self.BAD)                     # blocked for this
+            d = s.check("203.0.113.94", "GET", "/static/app.js", headers=BROWSER)
+            self.assertEqual((d.action, d.hits, d.stop), ("block", ["blocklist"], mode == "enforce"), mode)
+            self.assertEqual(s._tracks["203.0.113.94"].score, 0, mode)                # and still not scored there
+            self.assertEqual(s.check("203.0.113.95", "GET", "/static/app.js", headers=self.BAD).action, "pass", mode)
+
+    def test_an_allowlisted_address_is_never_blocked_even_inside_a_blocked_network(self):
+        s, _ = shield(allow_cidrs=["2001:db8:7:1::/64"], exempt_paths=["/static"], v6_escalate_after=2)
+        for net in ("2001:db8:7:2::1", "2001:db8:7:3::1"):                       # two /64s: their /56 is blocked
+            s.check(net, "GET", "/", headers=self.BAD)
+        self.assertIn("2001:db8:7::/56", s.blocklist())
+        self.assertEqual(s.check("2001:db8:7:4::1", "GET", "/static/app.js", headers=BROWSER).action, "block")
+        for path in ("/", "/static/app.js"):
+            self.assertEqual(s.check("2001:db8:7:1::1", "GET", path, headers=BROWSER).action, "pass", path)
+
     def test_404s_next_to_an_exempt_path_are_still_counted(self):
         s, c = shield(exempt_paths=["/static"])
         visit = wsgi_site(s)
@@ -1399,6 +1430,13 @@ class TextEdges(unittest.TestCase):
                          ["2001:0:0:5::/64", "2001:db8:0:5::/64", "2001:db8:a::/64", "2001:db8:b::/64"])
 
 
+# Starts of SQL, markup and paths that a pattern can almost match, and runs to
+# follow them: the same lists are in every port's cost test.
+LEADS = ["'", '"', "' or", "' or 1", "' or true", "' or '", "' )", "' ) or", "' or (", "union select a", "union select 1",
+         "or", "1", "<script", "javascript:", "../", "${", "{{"]
+RUNS = [" ", "\t", "\n", ")", ") ", " )", "(", "1", "'"]
+
+
 class Cost(unittest.TestCase):
     """The shield reads attacker-controlled text on every request, so no input
     may make that slow. Budgets are several times what a linear scan needs."""
@@ -1437,6 +1475,14 @@ class Cost(unittest.TestCase):
                     took = self.timed(lambda: (rx.search(subject), rx.match(subject)))
                     if took >= self.BUDGET:
                         slow.append(f"{name} on {atom!r} x {len(subject) // len(atom)}: {took:.2f} s")
+            # Something a pattern almost matches, then one long run: a run that
+            # two quantifiers can share (\s*\)?\s*) is retried split every way.
+            for lead in LEADS:
+                for run in RUNS:
+                    subject = lead + run * (30000 // len(run)) + "!"
+                    took = self.timed(lambda: rx.search(subject))
+                    if took >= self.BUDGET:
+                        slow.append(f"{name} on {lead!r} + {run!r} x {30000 // len(run)}: {took:.2f} s")
         self.assertEqual(slow, [])
 
     def test_oversized_requests_are_checked_quickly(self):
@@ -1446,6 +1492,7 @@ class Cost(unittest.TestCase):
                  "8000-character path": lambda: s.check("192.0.2.91", "GET", "/" + "db" * 4000 + "!", "", BROWSER),
                  "60000-character query": lambda: s.check("192.0.2.92", "GET", "/", "a" * 60000, BROWSER),
                  "20000 query parameters": lambda: s.check("192.0.2.93", "GET", "/", "a=b&" * 20000, BROWSER),
+                 "a quote, then 60000 spaces": lambda: s.check("192.0.2.97", "GET", "/", "q='+or" + "+" * 60000, BROWSER),
                  "8000-character user agent": lambda: s.check(
                      "192.0.2.94", "GET", "/", "", {"User-Agent": "Mozilla/5.0 " * 660}),
                  "8000-character referer": lambda: s.check(

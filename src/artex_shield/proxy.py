@@ -13,11 +13,12 @@ HTTP/1.1, strictly: requests whose framing is ambiguous (Content-Length and
 Transfer-Encoding together, conflicting lengths, folded headers, bad chunk
 sizes) are refused rather than guessed at, so the proxy cannot be used to
 smuggle a second request past it. Bodies stream in both directions without
-being held in memory. Keep-alive is kept with clients and backend
-connections are reused. WebSocket handshakes are checked like any request,
-then tunnelled. With honeytokens set, the first part of each request body is
-read before the request is decided on, and the optional client check's script
-and endpoint are answered by the proxy itself.
+being held in memory. Keep-alive is kept with clients and backend connections
+are reused. WebSocket handshakes are checked like any request, then tunnelled;
+one with a body is refused, and the backend connection of one the backend
+turns down is closed, never reused. With honeytokens set, the first part of
+each request body is read before the request is decided on, and the optional
+client check's script and endpoint are answered by the proxy itself.
 """
 from __future__ import annotations
 
@@ -587,6 +588,12 @@ class Proxy:
         has_body = chunked or bool(length)
         conn = head.tokens("connection")
         keep = ("keep-alive" in conn) if http10 else ("close" not in conn)
+        upgrade = "upgrade" in conn and any(t == "websocket" for t in head.tokens("upgrade")) and method == "GET"
+        if upgrade and has_body:
+            # A handshake has no body. Forwarded, its Content-Length would leave a
+            # backend that turns the upgrade down waiting for bytes the tunnel
+            # never sends, and it would read the next request as them.
+            raise ClientError(400, "a WebSocket handshake with a body")
 
         if len(head.get("host")) > 1:
             raise ClientError(400, "more than one Host header")
@@ -639,7 +646,6 @@ class Proxy:
             await self._error(writer, 405, "this is a reverse proxy")
             return False
 
-        upgrade = "upgrade" in conn and any(t == "websocket" for t in head.tokens("upgrade")) and method == "GET"
         if continued:
             writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")      # the backend is not asked: the shield said yes
             await writer.drain()
@@ -750,7 +756,7 @@ class Proxy:
         return ("\r\n".join(out) + "\r\n\r\n").encode("latin-1")
 
     async def _respond(self, response: Head, br, bw, writer, method, version, keep, peer, ip, target, path, d,
-                       started) -> bool:
+                       started, reuse: bool = True) -> bool:
         s = self.settings
         status = int(response.first[1])
         try:
@@ -798,7 +804,7 @@ class Proxy:
             _close(bw)                                        # nothing sensible to tell the client mid-body
             self._access(peer, ip, method, target, str(status), d, started)
             return False
-        if backend_keep:
+        if backend_keep and reuse:
             self.backend.release(br, bw)
         else:
             _close(bw)
@@ -822,8 +828,10 @@ class Proxy:
             await self._error(writer, 502, str(e) or "backend error")
             return False
         if response.first[1] != "101":
+            # Turned down. The connection was asked to switch protocols, so it is
+            # not one to hand the next request: close it, whatever it says.
             return await self._respond(response, br, bw, writer, method, "HTTP/1.1", False, peer, ip, target, path,
-                                       d, started)
+                                       d, started, reuse=False)
         try:
             self.shield.observe(ip, path, 101, d.induced)
         except Exception:

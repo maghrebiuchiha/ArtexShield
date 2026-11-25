@@ -738,13 +738,22 @@ local function decide(self, cx, addr, key, method, path, query, headers, body)
     local ref = new_ref()
     local enforce = cfg.mode == "enforce"
     local npath = util.norm_path(path)
-    local exempt = util.under(path, cfg.exempt_paths) or ip.in_nets(addr, self.allowed)
+    local allowed = ip.in_nets(addr, self.allowed)
+    local exempt = not allowed and util.under(path, cfg.exempt_paths)
     local induced = not cfg.score_induced and util.induced(h)
     local eref = signatures.capture(sig.assessment_ua, ua)
     local hits = {}
 
     self.stats.requests = self.stats.requests + 1
+    -- An allowlisted address is never scored. Nor is a request for an exempt
+    -- path, but a client blocked for what it did elsewhere stays blocked there too.
+    if allowed then
+        return decision("pass", enforce, 0, {}, ref, addr)
+    end
     if exempt then
+        if blocked(self, cx, key, now) then
+            return decision("block", enforce, cfg.block_score, {"blocklist"}, ref, addr)
+        end
         return decision("pass", enforce, 0, {}, ref, addr)
     end
     if not self:identified(addr) then

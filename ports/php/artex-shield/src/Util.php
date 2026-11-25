@@ -43,15 +43,31 @@ final class Util
         return $out;
     }
 
-    /** $path is one of $list or below one, by whole segments, never when it climbs with "..". */
+    /** Is this path segment a step up, as some server reads it? "..", and also
+     * "..;param" (Tomcat, Jetty and Spring drop the parameter), ".." cut short
+     * by a NUL, and dots and spaces after it, which some servers trim away. */
+    public static function climbs(string $segment): bool
+    {
+        foreach ([';', "\0"] as $stop) {
+            $cut = strpos($segment, $stop);
+            if ($cut !== false) {
+                $segment = substr($segment, 0, $cut);
+            }
+        }
+        return str_starts_with($segment, '..') && trim($segment, '. ') === '';
+    }
+
+    /** $path is one of $list or below one, by whole segments, never when it climbs (see climbs). */
     public static function under(string $path, array $list): bool
     {
         if (!$list) {
             return false;
         }
         $p = (string) preg_replace('~/{2,}~', '/', $path === '' ? '/' : $path);
-        if (in_array('..', explode('/', str_replace('\\', '/', self::decode($p))), true)) {
-            return false;
+        foreach (explode('/', str_replace('\\', '/', self::decode($p))) as $segment) {
+            if (self::climbs($segment)) {
+                return false;
+            }
         }
         foreach ($list as $prefix) {
             if ($p === $prefix || str_starts_with($p, $prefix . '/')) {

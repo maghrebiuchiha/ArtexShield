@@ -79,6 +79,9 @@ t.check("oversized requests are checked quickly", function()
         {"8000-character referer", function()
             s:check("192.0.2.95", "GET", "/", "", with({{"Host", "shop.example"}, {"Referer", "https://" .. string.rep("a.", 4000)}}))
         end},
+        {"a quote, then 60000 spaces", function()
+            s:check("192.0.2.89", "GET", "/", "q='+or" .. string.rep("+", 60000), BROWSER)
+        end},
         {"a 64 KB body with honeytokens set", function()
             fresh()
             core.new({honeytokens = {"api_live_0123456789abcdef"}, on_event = function() end})

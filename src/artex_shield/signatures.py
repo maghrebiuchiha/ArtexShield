@@ -1,10 +1,14 @@
-"""Radar signatures: what ARTEX and its bundled toolchain look like on the wire.
+r"""Radar signatures: what ARTEX and its bundled toolchain look like on the wire.
 
 Every pattern here runs on text a client chose, on every request, so each one
 must scan in time proportional to its input. Avoid shapes a backtracking
 engine retries from every position: an unbounded run in front of a literal,
-or two unbounded runs either side of one. tests/test_shield.py times every
-pattern against hostile input.
+or two unbounded runs either side of one. Two runs of the same characters with
+only something optional between them, such as \s*\)?\s*, are that shape too:
+a run of spaces can be split between them in every way. Write \s*(?:\)\s*)?,
+which matches the same text one way only. tests/test_shield.py times every
+pattern against hostile input, including a long run after something it
+almost matches.
 """
 import re
 
@@ -92,13 +96,13 @@ PAYLOADS = [(re.compile(p, re.I), label) for p, label in [
     #   a filter someone typed, and tautologies compare literals.
     # - A tautology after OR/AND: numeric (or 1=1) or quoted, spaced or not ('or'1'='1).
     (r"union\s+(?:all\s+|distinct\s+)?select\s*(?:null\b|\d+\s*(?:[,)#;'\"\x00]|--|/\*|from\b|into\b|$)|\*|@@"
-     r"|0x[0-9a-f]|['\"(]|[\w$]+(?:\(|\s*\)*\s*(?:,|--|#|/\*|;))|[\w$.]+\s+from\b)"
+     r"|0x[0-9a-f]|['\"(]|[\w$]+(?:\(|\s*(?:\)+\s*)?(?:,|--|#|/\*|;))|[\w$.]+\s+from\b)"
      r"|(?:['\")]|\b\d+)\s*union\s+(?:all\s+|distinct\s+)?select\b|\binto\s+(?:out|dump)file\b"
      r"|from\s+information_schema\b|(?<![\w.])sleep\(\s*\d|(?<![\w.])pg_sleep\s*\(\s*\d"
      r"|(?<![\w.])benchmark\(\s*\d+\s*,|waitfor\s+(?:delay|time)\s+['\"]"
-     r"|['\"]\s*\)?\s*(?:or|and)\s+\(?\s*(?:(?:['\"][^'\"]{0,20}['\"]|\d+)\s*(?:=|<>|!=|[<>]\s*\d)|\d+\s*\)*\s*(?:--|#|/\*|;)"
+     r"|['\"]\s*(?:\)\s*)?(?:or|and)\s+(?:\(\s*)?(?:(?:['\"][^'\"]{0,20}['\"]|\d+)\s*(?:=|<>|!=|[<>]\s*\d)|\d+\s*(?:\)+\s*)?(?:--|#|/\*|;)"
      r"|\d+\s+(?:or|and)\s|\d+\s+like\s+\d|['\"][^'\"\s]{0,20}['\"]\s+like\s+['\"]"
-     r"|(?:true|false)\s*\)*\s*(?:--|#|/\*|;|\x00|$)|[\w$]+\(|['\"]\d+[^'\"\x00]{0,20}(?:\x00|$))"
+     r"|(?:true|false)\s*(?:\)+\s*)?(?:--|#|/\*|;|\x00|$)|[\w$]+\(|['\"]\d+[^'\"\x00]{0,20}(?:\x00|$))"
      r"|xp_cmdshell|extractvalue\s*\(|updatexml\s*\("
      r"|\b(?:or|and)(?:\s+\d+\s*=\s*\d+|\s*(?P<q>['\"])[^'\"]{0,20}(?P=q)\s*=\s*(?P=q))", "payload:sqli"),
     # The same for markup: a tag or URL scheme counts with code behind it.

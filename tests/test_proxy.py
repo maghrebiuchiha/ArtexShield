@@ -764,6 +764,49 @@ class WebSockets(ProxyTest):
             self.assertEqual((r.status, r.body, r.one("Connection")), (403, b"no", "close"))
             self.assertTrue(await c.closed())
 
+    async def test_a_turned_down_upgrade_never_hands_its_backend_connection_on(self):
+        async def refuse(req, reader, writer):
+            writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            return True                                  # and keeps the connection open, as it may
+        self.origin.handler = refuse
+        r = await self.fetch(self.handshake())
+        self.assertEqual(r.status, 404)
+        self.assertEqual(len(self.proxy.backend.idle), 0)
+        await self.fetch(get())
+        self.assertEqual(self.proxy.backend.opened, 2)  # the next request got a connection of its own
+
+    async def test_a_handshake_with_a_body_is_refused_before_the_backend(self):
+        for framing in (b"Content-Length: 5\r\n\r\nhello", b"Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"):
+            async with self.client() as c:
+                r = await c.ask(self.handshake()[:-2] + framing)
+                self.assertEqual(r.status, 400, framing)
+                self.assertTrue(await c.closed())
+        self.assertEqual((self.origin.seen, self.decisions), ([], []))
+
+    async def test_no_request_can_be_smuggled_past_the_shield_in_a_turned_down_upgrade(self):
+        # A backend that answers first and reads the body after, as uvicorn's h11
+        # does: given an upgrade with a Content-Length and no body, it would wait
+        # on the pooled connection and take the next request's head for that body,
+        # then run the request hidden in that request's body, unchecked.
+        async def answer_then_read(req, reader, writer):
+            writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n" if req.target == "/socket" else
+                         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            await writer.drain()
+            await read_body(req.headers, reader)
+            return True
+        self.origin.handler = answer_then_read
+        hidden = b"GET /admin/.env HTTP/1.1\r\nHost: shop.example\r\nUser-Agent: sqlmap/1.8\r\n\r\n"
+        innocent = b"POST /innocent HTTP/1.1\r\nHost: shop.example\r\n" + BROWSER + b"Content-Length: %d\r\n\r\n" % len(hidden)
+        forwarded = len(innocent) + len(b"X-Forwarded-For: 127.0.0.1\r\nX-Forwarded-Proto: http\r\n"
+                                         b"X-Forwarded-Host: shop.example\r\nConnection: keep-alive\r\n")
+        for upgrade in (self.handshake()[:-2] + b"Content-Length: %d\r\n\r\n" % forwarded + b"x" * forwarded,
+                        self.handshake()):
+            await self.fetch(upgrade)
+            await self.fetch(innocent + hidden)
+        self.assertNotIn("/admin/.env", [req.target for req in self.origin.seen])
+        self.assertEqual([req.target for req in self.origin.seen], ["/innocent", "/socket", "/innocent"])
+
 
 # ---- failures ---------------------------------------------------------------------------------------------
 class BackendFailures(ProxyTest):
