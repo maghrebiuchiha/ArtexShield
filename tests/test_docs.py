@@ -39,7 +39,7 @@ class SetupSteps(unittest.TestCase):
     def test_every_repository_path_a_step_names_exists(self):
         named = set(re.findall(r"`((?:ports|examples|spec|tests)/[^`\s]+)`", self.text))
         named |= set(re.findall(r'"\$PWD/((?:ports|examples)/[^":]+)', self.text))
-        self.assertGreater(len(named), 10)
+        self.assertGreaterEqual(len(named), 8, "the steps name the files they use")
         for path in sorted(named):
             with self.subTest(path=path):
                 self.assertTrue(os.path.exists(os.path.join(ROOT, path)), path)

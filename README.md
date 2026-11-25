@@ -1,70 +1,92 @@
 # artex-shield
 
-Layered detection and blocking for [ARTEX](https://github.com/BaaRai/ARTEX)-style automated penetration-testing traffic. Drop-in middleware for Python web apps (Flask, Django, FastAPI, Starlette, any WSGI or ASGI app), Express and plain Node.js servers (`ports/node`), a WordPress plugin with a PHP port that also guards any PHP site (`ports/php`), an nginx module for OpenResty that guards whatever nginx serves (`ports/openresty`), and a reverse proxy, `artex-shield-proxy`, for any other website. No dependencies. See "Which one fits your site" to choose.
+Detects and blocks [ARTEX](https://github.com/BaaRai/ARTEX)-style automated penetration-testing traffic in front of almost any website you run on your own server. It covers Python, WordPress, Node and PHP apps, static sites and anything behind nginx, and anything else through a reverse proxy. No dependencies.
 
 ARTEX is a self-hosted, LLM-driven pentest platform: a planner breaks a goal into intents and workers run real scanners against the target. It is meant for authorised testing, but nothing stops someone pointing it at a site they do not own. This project is built from a read of its source and targets what it actually does on the wire.
 
 ## Which one fits your site
 
-Every option is the same shield, held to the same test cases (`spec/vectors.json`): the signals, scores, decoys and blocks below are the same everywhere. They differ in where they run, and in whether all of a site's worker processes share one set of scores and blocks.
+Every option is the same shield, held to the same test cases (`spec/vectors.json`). The signals, scores, decoys and blocks described below are the same in all of them.
 
-| Your site | Use | Where it decides | Workers share scores and blocks |
-| --- | --- | --- | --- |
-| A Python app: Flask, Django, FastAPI, Starlette, any WSGI or ASGI app | the middleware in this package | in the app, before your routes | no, one set per process |
-| WordPress | the plugin, `ports/php/artex-shield` | in WordPress, as the plugin loads | yes: the object cache, or files |
-| A Node app: Express, Connect, plain `http` | `ports/node` | in the app, before your routes | no, one set per process |
-| Any other PHP site: Laravel, Symfony, Drupal, your own | `ports/php`, with PHP's `auto_prepend_file` | before every PHP script | yes, files |
-| A static site | OpenResty with `ports/openresty` | in nginx, before a file is sent | yes, shared memory |
-| Anything behind nginx | OpenResty with `ports/openresty` | in nginx, before the request is passed on | yes, shared memory |
-| Anything else: Apache, Caddy, IIS, Java, Go, Ruby, a container | `artex-shield-proxy` | in a reverse proxy in front of the site | one process, one set |
+| Your site | Use | Workers share scores and blocks |
+| --- | --- | --- |
+| A Python app: Flask, Django, FastAPI, Starlette, any WSGI or ASGI app | the middleware in this package | no, one set per process |
+| WordPress | the plugin in `ports/php/artex-shield` | yes |
+| A Node app: Express, Connect, plain `http` | `ports/node` | no, one set per process |
+| Any other PHP site: Laravel, Symfony, Drupal, your own | `ports/php`, through PHP's `auto_prepend_file` | yes |
+| A static site | OpenResty with `ports/openresty` | yes |
+| Anything behind nginx | OpenResty with `ports/openresty` | yes |
+| Anything else: Apache, Caddy, IIS, Java, Go, Ruby, a container | `artex-shield-proxy`, a reverse proxy in front of the site | one process, one set |
 
-Some rules of thumb:
+OpenResty and the proxy stop a request before any app sees it; the other options run inside the app. If your app runs several worker processes, prefer an option that shares scores and blocks. With the others, a block holds only in the worker that made it.
 
-- **The edge covers everything behind it.** OpenResty and the proxy stop a request before any app sees it, whatever the app is written in. The in-app options see only what reaches the app.
-- **Several workers need shared state.** The Python middleware and the Node port keep scores per process, so with several worker processes each keeps its own: thresholds are in effect multiplied, and a block holds only in the worker that made it. The WordPress plugin, the PHP prepend and OpenResty share one set across every worker.
-- **WordPress has three ways in.** The plugin is the simplest, and plants the decoys on your pages itself. OpenResty or the proxy in front also works, and stops requests before PHP runs at all.
-- **A hosted static site has no server to run on.** GitHub Pages, Netlify or an S3 bucket leave nowhere to put the shield. Only an edge you control in front of it can: OpenResty or the proxy.
+Where it does not reach:
 
-### Setting up each
+- **Hosted static sites** (GitHub Pages, Netlify, an S3 bucket) give you no server to run it on, unless you control a server in front of them.
+- **Stock nginx without Lua** cannot load the module. Switch to OpenResty, which reads the same configuration, or put the proxy between nginx and the app.
+- **Apache, Caddy and IIS** have no module of their own; use the proxy.
+- **No package registry** (PyPI, npm, the WordPress plugin directory) has it. Every option installs from a copy of this repository.
 
-Each option starts in monitor mode: it logs what it would stop and stops nothing. Watch its events for a week, and switch to enforce when they show no visitor you would have stopped. Behind a load balancer, CDN or TLS terminator, list its addresses as trusted proxies, or every visitor looks like the proxy. Each option has a secret you keep, a long random string. It decides the canary paths and fake credentials ("Plant the decoys"), which you then put on your pages.
+### Install and set up
+
+Every option starts in **monitor mode**: it logs what it would stop and stops nothing. Run it for a week, then switch to enforce if the log shows no visitor you would have stopped.
+
+Behind a load balancer, CDN or TLS terminator, list its addresses as **trusted proxies**, or every visitor looks like the proxy.
+
+Choose a **secret**, a long random string you keep. It makes the canary paths and fake credentials you plant on your pages ("Plant the decoys").
 
 **A Python app** (Python 3.9 or newer)
 
-1. From a copy of this repository: `pip install .`
-2. Wrap the app as in "Quick start": `app.wsgi_app = ShieldWSGI(app.wsgi_app, shield)` for Flask, `ShieldWSGI(get_wsgi_application(), shield)` for Django, `app.add_middleware(ShieldASGI, shield=shield)` for FastAPI and Starlette.
-3. Events go to the `artex_shield` logger. When they are clean, set `mode="enforce"`.
-4. Plant the decoys with `robots_txt_block()`, `html_trap()`, `js_trap()` and the honeytoken helpers ("Plant the decoys").
+```bash
+pip install .                                             # from a copy of this repository
+```
 
-**WordPress** (PHP 8.1 and WordPress 6.0 or newer)
+```python
+from artex_shield import Config, Shield, ShieldASGI, ShieldWSGI, make_canaries
 
-1. Zip the plugin (`cd ports/php && zip -r artex-shield.zip artex-shield`) and upload it under Plugins → Add New Plugin → Upload Plugin, or copy `ports/php/artex-shield` into `wp-content/plugins/`.
-2. Activate it. It makes a secret, plants the decoys on your pages and starts in monitor mode.
-3. Behind a CDN or load balancer, list its ranges under Settings → ARTEX Shield → Trusted proxies.
-4. Watch Recent events on that page, then choose Enforce. See [ports/php/README.md](ports/php/README.md).
+shield = Shield(Config(mode="monitor", canary_paths=make_canaries("your-secret")))
+app.wsgi_app = ShieldWSGI(app.wsgi_app, shield)               # Flask
+# application = ShieldWSGI(get_wsgi_application(), shield)   # Django, in wsgi.py
+# app.add_middleware(ShieldASGI, shield=shield)               # FastAPI, Starlette
+```
+
+Events go to the `artex_shield` logger. See "Quick start".
+
+**WordPress** (WordPress 6.0 and PHP 8.1 or newer)
+
+```bash
+cd ports/php && zip -r artex-shield.zip artex-shield
+```
+
+Upload `artex-shield.zip` under Plugins → Add New Plugin → Upload Plugin, and activate it. It makes a secret, plants the decoys and starts in monitor mode. Settings → ARTEX Shield sets trusted proxies, lists events and blocks, and switches to Enforce. See [ports/php/README.md](ports/php/README.md).
 
 **A Node app** (Node 20 or newer)
 
-1. `npm install /path/to/this/repository/ports/node`. It has no dependencies and is not on npm.
-2. `app.use(artexShield(new Shield({ mode: "monitor", canaryPaths: makeCanaries(secret) })))` before any other middleware. For a plain `http` server, wrap your handler with `handler(shield, app)`.
-3. Events go to stderr as JSON lines. When they are clean, set `mode: "enforce"`.
-4. `ports/node/examples/express.js` plants every decoy. See [ports/node/README.md](ports/node/README.md).
+```bash
+npm install /path/to/ArtexShield/ports/node
+```
+
+```js
+const { Shield, artexShield, makeCanaries } = require("artex-shield");
+app.use(artexShield(new Shield({ mode: "monitor", canaryPaths: makeCanaries("your-secret") })));   // before other middleware
+```
+
+Events go to stderr. For plain `http` servers and the decoys, see [ports/node/README.md](ports/node/README.md).
 
 **Any other PHP site** (PHP 8.1 or newer)
 
-1. Copy `ports/php` to the server, say to `/opt/artex-shield`.
-2. Set `auto_prepend_file = /opt/artex-shield/examples/prepend.php` in `php.ini`, the PHP-FPM pool (`php_admin_value[auto_prepend_file]`) or a `.user.ini`, and restart PHP-FPM. The site's code does not change.
-3. Set `ARTEX_SHIELD_SECRET` (and `ARTEX_SHIELD_TRUSTED_PROXIES` behind a proxy) in the environment PHP runs with, or edit the settings at the top of `prepend.php`. Events go to the PHP error log.
-4. `ARTEX_SHIELD_SECRET=... php /opt/artex-shield/examples/decoys.php` prints what to plant. When the events are clean, set `ARTEX_SHIELD_MODE=enforce`.
+Copy `ports/php` to the server, say to `/opt/artex-shield`, and set this in `php.ini` or the PHP-FPM pool:
 
-It sees what PHP handles. With a front controller, as most frameworks have, that is every request. See [ports/php/README.md](ports/php/README.md), "Any other PHP site".
+```ini
+auto_prepend_file = /opt/artex-shield/examples/prepend.php
+```
 
-**A static site**
+Set `ARTEX_SHIELD_SECRET` in PHP's environment, and restart PHP-FPM. Events go to the PHP error log; set `ARTEX_SHIELD_MODE=enforce` when ready. `ARTEX_SHIELD_SECRET=... php /opt/artex-shield/examples/decoys.php` prints what to plant. See [ports/php/README.md](ports/php/README.md).
 
-Serve it with [OpenResty](https://openresty.org), which is nginx with Lua and reads nginx configurations unchanged. `ports/openresty/examples/static.conf` serves a directory with the shield in front, configured from environment variables. In Docker, from a copy of this repository:
+**A static site** (Docker, from a copy of this repository)
 
 ```bash
-docker run -d -p 80:8080 -e ARTEX_SHIELD_CANARY_SECRET='...' \
+docker run -d -p 80:8080 -e ARTEX_SHIELD_CANARY_SECRET='your-secret' \
   -v "$PWD/ports/openresty/lib:/opt/artex-shield/lib:ro" \
   -v "$PWD/ports/openresty/examples/artex_settings.lua:/opt/artex-shield/artex_settings.lua:ro" \
   -v "$PWD/ports/openresty/examples/static.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro" \
@@ -72,50 +94,57 @@ docker run -d -p 80:8080 -e ARTEX_SHIELD_CANARY_SECRET='...' \
   openresty/openresty:1.27.1.2-bookworm-fat
 ```
 
-Without Docker, install OpenResty, copy `ports/openresty/lib` and `ports/openresty/examples/artex_settings.lua` to `/opt/artex-shield`, and use `static.conf` as `nginx.conf`. `ports/openresty/examples/decoys`, run with the same settings, prints what to plant ([ports/openresty/README.md](ports/openresty/README.md)). Events go to nginx's error log; add `-e ARTEX_SHIELD_MODE=enforce` when they are clean.
+Events go to the container's log; add `-e ARTEX_SHIELD_MODE=enforce` when ready. Without Docker, install OpenResty and use `ports/openresty/examples/static.conf` as its `nginx.conf`.
 
 **Anything behind nginx** (OpenResty 1.21.4 or newer)
 
-1. Run OpenResty in place of nginx; your configuration carries over.
-2. Copy `ports/openresty/lib` to the server, and add the shared dicts, the package path and three lines to your configuration:
+Run OpenResty in place of nginx; it reads the same configuration. Copy `ports/openresty/lib` to `/opt/artex-shield/lib`, then add:
 
 ```nginx
-lua_shared_dict artex_shield 64m;
-lua_shared_dict artex_shield_blocks 16m;
-lua_package_path "/opt/artex-shield/lib/?.lua;;";
-init_by_lua_block   { require("resty.artex_shield").configure({mode = "monitor", canary_secret = "..."}) }
+error_log logs/error.log warn;                 # the shield's events are logged at warn
 
-server {
-    access_by_lua_block { require("resty.artex_shield").access() }
-    log_by_lua_block    { require("resty.artex_shield").log() }
-    ...
+http {
+    lua_shared_dict artex_shield        64m;
+    lua_shared_dict artex_shield_blocks 16m;
+    lua_package_path "/opt/artex-shield/lib/?.lua;;";
+    init_by_lua_block { require("resty.artex_shield").configure({mode = "monitor", canary_secret = "your-secret"}) }
+
+    server {
+        access_by_lua_block { require("resty.artex_shield").access() }
+        log_by_lua_block    { require("resty.artex_shield").log() }
+        location / {
+            proxy_pass http://your-app;
+            proxy_set_header X-Forwarded-For $remote_addr;
+        }
+    }
 }
 ```
 
-3. Pass the app each visitor's address with `proxy_set_header X-Forwarded-For $remote_addr;`.
-4. Set `error_log ... warn;` to see the events. When they are clean, set `mode = "enforce"`.
+`ports/openresty/examples/nginx.conf` is a whole configuration. See [ports/openresty/README.md](ports/openresty/README.md).
 
-`ports/openresty/examples/nginx.conf`, and the WordPress example beside it, show a whole configuration. See [ports/openresty/README.md](ports/openresty/README.md). If nginx must stay stock nginx, without Lua, put `artex-shield-proxy` between nginx and the app instead. For a Python app, you can also push its blocks into nginx ("Pushing blocks to the edge").
+**Anything else** (Python 3.9 or newer, or Docker)
 
-**Anything else**
+```bash
+pip install .                                             # from a copy of this repository
+artex-shield-proxy --backend http://127.0.0.1:8000 --listen 0.0.0.0:8080
 
-1. From a copy of this repository: `pip install .`, or `docker build -t artex-shield-proxy .`
-2. `artex-shield-proxy --backend http://127.0.0.1:8000 --listen 0.0.0.0:8080`, with your site at the backend address.
-3. Send traffic to port 8080, and stop the site being reachable any other way. Keep your TLS terminator in front, and list it in `trusted_proxies`.
-4. `artex-shield-proxy --print-decoys` prints what to plant. When the events (on stderr) are clean, set `ARTEX_SHIELD_MODE=enforce`.
+# or in Docker:
+docker build -t artex-shield-proxy .
+docker run -d -p 8080:8080 -e ARTEX_SHIELD_BACKEND=http://your-site:80 artex-shield-proxy
+```
 
-`examples/wordpress/docker-compose.yml` runs it in front of WordPress. See "In front of any website".
+Send your traffic to port 8080, and stop the site being reachable any other way. Events go to stderr; set `ARTEX_SHIELD_MODE=enforce` when ready. `artex-shield-proxy --print-decoys` prints what to plant. See "In front of any website".
 
 ### How each one is tested
 
-`spec/vectors.json` holds every decision the Python test suite makes, exported by `spec/export_vectors.py`, and `spec/SPEC.md` the rules behind them. Each port has its own CI job that replays every case. Most also run the port in front of a real site.
+Each port has a CI job that replays every case in `spec/vectors.json`, the decisions the Python test suite makes. Most also run the port in front of a real site.
 
 | CI job | Runs `spec/vectors.json` | In front of a real site |
 | --- | --- | --- |
 | `test` (Python 3.9, 3.11, 3.13) | against the shield; `examples/simulate.py` checks no legitimate request is stopped | |
 | `proxy` | through `artex-shield-proxy` over HTTP | WordPress in Docker |
 | `node` (Node 20, 22, 24) | against the port | the Express and `http` examples |
-| `php` (PHP 8.1, 8.3, 8.5) | three times, with state in memory, in files and in the object cache | the plugin and `prepend.php` under PHP's built-in server |
+| `php` (PHP 8.1, 8.3, 8.5) | with state in memory, in files and in the object cache | the plugin and `prepend.php` under PHP's built-in server |
 | `wordpress` (WordPress 7, PHP 8.2 and 8.5) | | the plugin on real WordPress |
 | `openresty` (OpenResty 1.21.4 and 1.27) | against the port, and through nginx over HTTP | four workers in enforce mode, a static site, and WordPress |
 
@@ -145,15 +174,14 @@ Soft signals cannot stop a request on their own, however many fire or however lo
 | Probes API docs, admin and debug routes | skills, prompts | Scored only when your app answers 404, so routes you really serve cost nobody anything |
 | Browser disguise from Go and Python clients | recorded MITM proxy, scripts | Browser User-Agent without `Accept-Language` is flagged |
 
-## Install
-
-The Python package: the middleware, and `artex-shield-proxy`. The ports have their own setup ("Setting up each").
+## Development
 
 ```bash
-pip install .            # from this directory
-python -m unittest discover -s tests
-python examples/simulate.py
+python -m unittest discover -s tests      # the Python package, every case in spec/vectors.json, and the READMEs
+python examples/simulate.py               # a campaign among legitimate traffic; exits 1 if any visitor is stopped
 ```
+
+Each port's own tests are listed in its README.
 
 ## Quick start
 
