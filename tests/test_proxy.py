@@ -1019,18 +1019,6 @@ class Smuggling(ProxyTest):
 
 # ---- settings -----------------------------------------------------------------------------------------------
 class Configuration(unittest.TestCase):
-    def test_every_setting_is_in_proxy_toml_and_the_readme(self):
-        from dataclasses import fields
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        with open(os.path.join(root, "examples", "proxy.toml"), encoding="utf-8") as f:
-            toml = f.read()
-        with open(os.path.join(root, "README.md"), encoding="utf-8") as f:
-            readme = f.read()
-        for name in (f.name for f in fields(Settings) if f.name != "shield"):
-            with self.subTest(setting=name):
-                self.assertRegex(toml, rf"(?m)^#? ?{name} =")
-                self.assertRegex(readme, rf"(?m)^\| `{name}`|^\| `\w+` / `{name}`|^\| `{name}` / `\w+`")
-
     def test_the_connection_cap_follows_the_open_file_limit(self):
         import resource
         base = dict(backend="http://127.0.0.1:1")

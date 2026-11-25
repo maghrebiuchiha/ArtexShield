@@ -52,6 +52,15 @@ class SetupSteps(unittest.TestCase):
                 self.assertIn(f"**{kind}", self.text.replace("**A Python app** (", "**A Python app (")
                               .replace("**A Node app** (", "**A Node app ("))
 
+    def test_every_proxy_setting_is_in_proxy_toml_and_the_settings_table(self):
+        from dataclasses import fields
+        from artex_shield.proxy import Settings
+        toml, readme = read("examples/proxy.toml"), read("README.md")
+        for name in (f.name for f in fields(Settings) if f.name != "shield"):
+            with self.subTest(setting=name):
+                self.assertRegex(toml, rf"(?m)^#? ?{name} =")
+                self.assertRegex(readme, rf"(?m)^\| `{name}`|^\| `\w+` / `{name}`|^\| `{name}` / `\w+`")
+
     def test_the_ci_jobs_it_names_are_the_workflow_s(self):
         jobs = set(re.findall(r"^  ([a-z][a-z0-9_-]*):\s*$", read(".github/workflows/tests.yml"), re.M))
         table = self.text[self.text.index("### How each one is tested"):]
