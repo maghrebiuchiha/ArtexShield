@@ -6,6 +6,8 @@ What every implementation (Python, the proxy, Node, PHP, OpenResty) must do with
 
 `vectors.json` is exported from the Python test suite by `spec/export_vectors.py`: every decision the detection tests make (`test_shield.py`, `test_client_check.py`, `test_honeytokens.py`), recorded as it happened. Only the tests of Python-specific plumbing are left out (adapters, block file, locking, timing). `tests/test_vectors.py` replays them against the Python shield, `tests/test_proxy.py` sends every request in them through `artex-shield-proxy` over HTTP, `ports/node/test/vectors.test.js` replays them against the Node port, `ports/php/tests/vectors.php` against the PHP port (with its state kept in memory, in files, or in the object cache), `ports/openresty/tests/vectors.lua` against the OpenResty port (with its state in shared dicts), and `ports/openresty/tests/edge.py` sends every request in them through OpenResty over HTTP.
 
+Each of these reads `vectors.json` (and `patterns.json`) from another directory when `ARTEX_SPEC` names one, so a set of cases made elsewhere, such as random ones with the reference's decisions as their expectations, can be run through every port. The HTTP runners skip cases with their own `trusted_proxies`, since they need to be the proxy the shield trusts.
+
 ```json
 {"version": 2, "t0": 1800000000.0,
  "client_check_script": "(function () { ... PATH ... })();",

@@ -77,7 +77,7 @@ function parseV6(s) {
     value <<= 16n * BigInt(skipped);
     for (let i = parts.length - lo; i < parts.length; i += 1) value = (value << 16n) | parseHextet(parts[i]);
     return { version: 6, value, scope };
-  } catch (e) {
+  } catch {
     return null;
   }
 }

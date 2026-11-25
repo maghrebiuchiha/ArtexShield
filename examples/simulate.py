@@ -10,7 +10,7 @@ import logging
 import random
 import urllib.parse
 
-from artex_shield import Config, Shield, honeytoken_html, honeytoken_js, make_canaries, make_honeytokens
+from artex_shield import Config, Shield, make_canaries, make_honeytokens
 
 logging.getLogger("artex_shield").addHandler(logging.NullHandler())
 logging.getLogger("artex_shield").propagate = False

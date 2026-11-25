@@ -224,7 +224,12 @@ function _M.reply(d)
         body = body}
 end
 
+-- An answer made here, not by the site. The body is discarded first:
+-- OpenResty 1.21 would otherwise read one that came with a 204 as the next
+-- request on the connection, which a client could fill with a request of its
+-- own, past any proxy in front that shares the connection (1.27 discards it).
 local function respond(r)
+    ngx.req.discard_body()
     ngx.status = r.status
     for _, pair in ipairs(r.headers) do
         ngx.header[pair[1]] = pair[2]

@@ -1059,7 +1059,7 @@ class Delivery(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             s, c = shield(logger="artex_shield.delivery", on_event=lambda e: probe("callback:" + e["action"]),
                           blocklist_export_path=os.path.join(d, "deny.conf"))
-            with mock.patch.object(core.os, "replace", replace):
+            with mock.patch("artex_shield.util.os.replace", replace):     # where the export writes
                 s.check("192.0.2.241", "GET", "/.env", headers=BROWSER)              # throttle
                 s.check("203.0.113.100", "GET", "/", headers=SCANNER)               # block, and an export
                 s.check("192.0.2.242", "GET", "/", headers=BROWSER)

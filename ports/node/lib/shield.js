@@ -275,7 +275,7 @@ class Shield {
           let decoded = "";
           try {
             decoded = py.b64decode(b64 + "===").toString("latin1");
-          } catch (e) {
+          } catch {
             decoded = "";
           }
           if (has(decoded)) return "header";

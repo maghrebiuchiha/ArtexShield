@@ -143,7 +143,7 @@ class EdgeRunner:
         if "engagements" in cfg:
             cfg["engagements"] = [dict(e, start=t0 + e["start"], end=t0 + e["end"]) for e in cfg["engagements"]]
         self.cfg = cfg
-        made = conn.control("/__test/case", {"config": cfg, "now": t0})
+        made = conn.control("/__test/case", {"config": cfg, "now": t0, "hold_replies": True})
         if not made["ok"]:
             raise RuntimeError(f"{case['id']}: the edge refused the config: {made.get('error')}")
 
@@ -163,6 +163,8 @@ class EdgeRunner:
 
     def direct(self, where, step, expect, full, now):
         self.stats.direct += 1
+        if "headers" in step.get("request", {}):              # as pairs: a JSON object loses its order in Lua
+            step = dict(step, request=dict(step["request"], headers=list(step["request"]["headers"].items())))
         out = self.conn.control("/__test/step", {"now": now, "step": step})
         if "request" in step:
             if expect is not None:
@@ -236,9 +238,14 @@ class EdgeRunner:
                 self.fail(where, f"Retry-After {headers.get('retry-after')}, expected {d['retry_after']}")
             # Only what observe() can act on is passed on: a 404, or a 2xx page with the client check on.
             matters = status == 404 or (bool(self.cfg.get("client_check")) and 200 <= status < 300)
-            want_reported = [[r["ip"], r["path"], status, d["induced"], ctype]] if forwarded and matters else []
+            sent = ctype.strip(" \t")         # what HTTP carries of it: a header value loses its outer spaces
+            want_reported = [[r["ip"], r["path"], status, d["induced"], sent]] if forwarded and matters else []
             if report["reported"] != want_reported:
                 self.fail(where, f"the edge passed on {report['reported']}, expected {want_reported}")
+            # The check's own path is answered by the edge; the reply is recorded, not made (edge_hooks.lua).
+            want_replied = [[r["ip"], query]] if route == "check" and not d["stop"] else []
+            if report["replied"] != want_replied:
+                self.fail(where, f"the edge replied {report['replied']}, expected {want_replied}")
         if observe is not None:
             self.direct(where, {"observe": observe}, None, True, t)
 
@@ -284,7 +291,8 @@ class EdgeRunner:
 
 def plumbing(conn):
     """How the edge reads requests the vectors cannot carry: repeated headers,
-    raw bytes, absolute-form targets, the client check's Secure flag."""
+    raw bytes, absolute-form targets, the client check's Secure flag, and a
+    body left behind by an answer the edge makes itself."""
     failures = []
     t0 = 1800000000.0
 
@@ -343,6 +351,25 @@ def plumbing(conn):
         cookie = headers.get("set-cookie", "")
         expect(f"X-Forwarded-Proto is believed {'from a trusted peer' if trusted else 'from no one else'}",
                code == 204 and cookie.endswith("; Secure") == secure, cookie)
+
+    # A body the edge does not read is discarded, not taken for the next request on the connection.
+    hidden = b"GET /hidden HTTP/1.1\r\nHost: shop.example\r\nX-Forwarded-For: 198.51.100.9\r\n\r\n"
+    for config, head in (
+            ({"client_check": True, "client_check_secret": "s"}, ["PUT /_artex/check?v=1&f=0 HTTP/1.1"]),
+            ({"mode": "enforce"}, ["POST /x HTTP/1.1", "User-Agent: sqlmap/1.8"]),
+            ({"mode": "enforce"}, ["POST /.env HTTP/1.1", "User-Agent: Mozilla/5.0 (X11; Linux x86_64) Firefox/140.0",
+                                   "Accept: text/html", "Accept-Language: en"])):
+        case(dict(config, trusted_proxies=["127.0.0.1/32"]))
+        try:
+            first, _, _, _ = ask(head + ["Host: shop.example", "X-Forwarded-For: 198.51.100.8",
+                                         f"Content-Length: {len(hidden)}"], hidden)
+            code, _, _, rep = ask(["GET /after HTTP/1.1", "Host: shop.example", "X-Forwarded-For: 198.51.100.10"])
+            ok = first in (204, 403, 429) and code == 200 and (rep["asked"] or [None] * 3)[2] == "/after"
+            detail = (first, code, rep["asked"])
+        except (ValueError, RuntimeError, OSError) as e:          # out of step: an answer to the hidden request
+            ok, detail = False, repr(e)
+            conn.close()
+        expect(f"the body of an answered {head[0]} is not read as a request", ok, detail)
     return failures
 
 

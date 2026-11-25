@@ -7,6 +7,7 @@
 
 local t = require "check"
 local cjson = require("cjson.safe").new()
+local ojson = require "ordered_json"     -- keeps header order, which cjson loses
 local client_check = require "resty.artex_shield.client_check"
 local config = require "resty.artex_shield.config"
 local core = require "resty.artex_shield.core"
@@ -15,7 +16,7 @@ local ip = require "resty.artex_shield.ip"
 local signatures = require "resty.artex_shield.signatures"
 
 local spec = os.getenv("ARTEX_SPEC") or (t.here() .. "/../../../spec")
-local data = assert(cjson.decode(t.read(spec .. "/vectors.json")), "cannot read vectors.json")
+local data = ojson.decode(t.read(spec .. "/vectors.json"))
 local NULL = cjson.null
 local TOLERANCE = 1e-6
 
@@ -55,7 +56,7 @@ local function fill(template, i)
         for k, v in pairs(template) do
             out[k] = fill(v, i)
         end
-        return out
+        return ojson.carry(template, out)
     end
     return template
 end
@@ -108,7 +109,7 @@ function Runner:step(where, step, expect, full)
     if not null(step.request) then
         local r = step.request
         local d = s:check(r.ip, null(r.method) and "GET" or r.method, r.path, null(r.query) and "" or r.query,
-            null(r.headers) and {} or r.headers, body(r))
+            null(r.headers) and {} or ojson.pairs_of(r.headers), body(r))
         if not null(expect) then
             self:compare(where, d, expect, full)
         end
