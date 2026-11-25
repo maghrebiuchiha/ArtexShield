@@ -5,6 +5,7 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime
@@ -222,6 +223,12 @@ def _url_text(path: str, query: str) -> str:
 
 
 # ---- the exported block file, shared by every worker process ---------------
+# Files are opened without following a symbolic link at their own name: in a
+# directory someone else can write to, a link planted there would point the
+# write at a file of their choosing.
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
 @contextmanager
 def _file_lock(path: str):
     """Hold an exclusive lock on `path` across processes. Where the platform
@@ -231,7 +238,8 @@ def _file_lock(path: str):
     except ImportError:
         yield
         return
-    with open(path, "a") as f:
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | _NOFOLLOW, 0o666)
+    with os.fdopen(fd, "a") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         try:
             yield
@@ -254,7 +262,19 @@ def _read_state(path: str) -> Dict[str, float]:
 
 
 def _write_atomic(path: str, text: str) -> None:
-    tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    """Write `path` whole or not at all. The temporary file has a name no one
+    can guess, and is created new (O_EXCL): a link planted in its place makes
+    the write fail instead of landing somewhere else. Its permissions are the
+    usual ones for a new file (the umask's), so nginx can read the block file."""
+    tmp = f"{path}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o666)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise

@@ -78399,6 +78399,175 @@
    ]
   },
   {
+   "id": "Cookie/test_numbers_are_ascii_digits_only#1",
+   "config": {
+    "mode": "enforce",
+    "client_check": true,
+    "client_check_secret": "test-secret"
+   },
+   "steps": [
+    {
+     "at": 1,
+     "request": {
+      "ip": "203.0.113.61",
+      "method": "GET",
+      "path": "/",
+      "headers": {
+       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+       "Accept": "*/*",
+       "Accept-Language": "en"
+      }
+     },
+     "expect": {
+      "action": "pass",
+      "hits": [],
+      "score": 0
+     }
+    },
+    {
+     "at": 1,
+     "observe": {
+      "ip": "203.0.113.61",
+      "path": "/",
+      "status": 200,
+      "content_type": "text/html; charset=utf-8"
+     }
+    },
+    {
+     "at": 602,
+     "request": {
+      "ip": "203.0.113.61",
+      "method": "GET",
+      "path": "/api/items",
+      "headers": {
+       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+       "Accept": "*/*",
+       "Accept-Language": "en",
+       "Cookie": "artex_check=1.².0.x"
+      }
+     },
+     "expect": {
+      "action": "pass",
+      "hits": [
+       "client:no-check"
+      ],
+      "score": 20
+     }
+    },
+    {
+     "at": 602,
+     "observe": {
+      "ip": "203.0.113.61",
+      "path": "/api/items",
+      "status": 200,
+      "content_type": "application/json"
+     }
+    },
+    {
+     "at": 1203,
+     "request": {
+      "ip": "203.0.113.61",
+      "method": "GET",
+      "path": "/api/items",
+      "headers": {
+       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+       "Accept": "*/*",
+       "Accept-Language": "en",
+       "Cookie": "artex_check=1.1800000000.٣.x"
+      }
+     },
+     "expect": {
+      "action": "pass",
+      "hits": [
+       "client:no-check"
+      ],
+      "score": 29.988454217
+     }
+    },
+    {
+     "at": 1203,
+     "observe": {
+      "ip": "203.0.113.61",
+      "path": "/api/items",
+      "status": 200,
+      "content_type": "application/json"
+     }
+    },
+    {
+     "at": 1203,
+     "client_check": {
+      "ip": "203.0.113.62",
+      "query": "v=1&f=²"
+     },
+     "expect": {
+      "status": 204,
+      "headers": [
+       [
+        "Set-Cookie",
+        "artex_check=1.1800001203.0.yZ_VRWY_XqaRzDN-jrGSNc; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax"
+       ],
+       [
+        "Cache-Control",
+        "no-store"
+       ],
+       [
+        "Content-Length",
+        "0"
+       ]
+      ]
+     }
+    },
+    {
+     "at": 1203,
+     "client_check": {
+      "ip": "203.0.113.62",
+      "query": "v=1&f=٣"
+     },
+     "expect": {
+      "status": 204,
+      "headers": [
+       [
+        "Set-Cookie",
+        "artex_check=1.1800001203.0.yZ_VRWY_XqaRzDN-jrGSNc; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax"
+       ],
+       [
+        "Cache-Control",
+        "no-store"
+       ],
+       [
+        "Content-Length",
+        "0"
+       ]
+      ]
+     }
+    },
+    {
+     "at": 1203,
+     "client_check": {
+      "ip": "203.0.113.62",
+      "query": "v=1&f=¹²"
+     },
+     "expect": {
+      "status": 204,
+      "headers": [
+       [
+        "Set-Cookie",
+        "artex_check=1.1800001203.0.yZ_VRWY_XqaRzDN-jrGSNc; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax"
+       ],
+       [
+        "Cache-Control",
+        "no-store"
+       ],
+       [
+        "Content-Length",
+        "0"
+       ]
+      ]
+     }
+    }
+   ]
+  },
+  {
    "id": "Cookie/test_workers_with_the_same_secret_accept_each_others_cookies#1",
    "config": {
     "mode": "enforce",

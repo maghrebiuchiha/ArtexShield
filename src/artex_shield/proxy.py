@@ -105,7 +105,7 @@ class Settings:
 
 def _host_port(text: str) -> Tuple[str, int]:
     text = str(text).strip()
-    if text.isdigit():
+    if text.isascii() and text.isdigit():
         return "0.0.0.0", int(text)
     m = re.fullmatch(r"\[([0-9A-Fa-f:.]+)\]:(\d+)|([^:\[\]]*):(\d+)", text)
     if not m:
@@ -550,9 +550,17 @@ class Proxy:
             self.connections.discard(task)
 
     async def _error(self, writer: asyncio.StreamWriter, status: int, why: str) -> None:
-        """Answer and mark the connection for closing; _connection lingers before it closes."""
-        body = f"{status} {_REASONS.get(status, 'Error')}: {why}\n".encode()
-        writer.write(f"HTTP/1.1 {status} {_REASONS.get(status, 'Error')}\r\nContent-Type: text/plain; charset=utf-8\r\n"
+        """Answer and mark the connection for closing; _connection lingers before it closes.
+        A 4xx says what was wrong with the request. A 5xx gives its status only:
+        what went wrong with the backend (its address, the error) is for the
+        log, not for whoever sent the request."""
+        reason = _REASONS.get(status, "Error")
+        if status >= 500:
+            log.warning("%d %s: %s", status, reason, why)
+            body = f"{status} {reason}\n".encode()
+        else:
+            body = f"{status} {reason}: {why}\n".encode()
+        writer.write(f"HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; charset=utf-8\r\n"
                      f"Content-Length: {len(body)}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n".encode()
                      + body)
         self.linger.add(writer)
