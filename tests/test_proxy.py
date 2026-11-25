@@ -24,7 +24,7 @@ from unittest import mock
 
 import artex_shield
 from artex_shield import Config, Shield, make_honeytokens
-from artex_shield.proxy import Proxy, Settings, _host_port, load_settings, main
+from artex_shield.proxy import Proxy, Settings, _connection_cap, _host_port, load_settings, main
 
 from test_vectors import Runner, body as vector_body, load
 
@@ -475,43 +475,6 @@ class Connections(ProxyTest):
 
 # ---- bodies ---------------------------------------------------------------------------------------
 class Streaming(ProxyTest):
-    async def test_a_chunked_upload_reaches_the_backend_while_the_client_is_still_sending(self):
-        first = asyncio.Event()
-
-        async def handler(req, reader, writer):
-            size = int((await reader.readuntil(b"\r\n")).split(b";")[0], 16)
-            data = await reader.readexactly(size)
-            first.set()                                    # the client only sends the rest after this
-            await reader.readexactly(2)
-            data += await read_body([("transfer-encoding", "chunked")], reader)
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (len(data), data))
-            await writer.drain()
-            return True
-        self.origin.handler = handler
-        async with self.client() as c:
-            await c.send(b"POST /upload HTTP/1.1\r\nHost: x\r\n" + BROWSER + b"Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n")
-            await asyncio.wait_for(first.wait(), WAIT)     # a proxy that buffered the body would hang here
-            r = await c.ask(b"6\r\n world\r\n0\r\n\r\n")
-        self.assertEqual(r.body, b"hello world")
-        self.assertEqual(self.origin.seen[0].get("Transfer-Encoding"), ["chunked"])
-
-    async def test_a_sized_upload_streams_too(self):
-        half = asyncio.Event()
-
-        async def handler(req, reader, writer):
-            data = await reader.readexactly(5)
-            half.set()
-            data += await reader.readexactly(5)
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (len(data), data))
-            await writer.drain()
-            return True
-        self.origin.handler = handler
-        async with self.client() as c:
-            await c.send(b"PUT /f HTTP/1.1\r\nHost: x\r\n" + BROWSER + b"Content-Length: 10\r\n\r\nhello")
-            await asyncio.wait_for(half.wait(), WAIT)
-            r = await c.ask(b"world")
-        self.assertEqual(r.body, b"helloworld")
-
     async def test_a_response_reaches_the_client_while_the_backend_is_still_sending(self):
         got_first = asyncio.Event()
 
@@ -594,6 +557,163 @@ class Streaming(ProxyTest):
             await c.send(get())
             hint, final = await read_response(c.reader), await read_response(c.reader)
         self.assertEqual((hint.status, hint.one("Link"), final.status, final.body), (103, "</app.css>; rel=preload", 200, b"ok"))
+
+
+class StreamedUploads(ProxyTest):
+    """buffer_requests = false: a body goes on to the backend as it arrives,
+    for a site that needs it to (a long upload it shows progress for)."""
+    settings = {"buffer_requests": False}
+
+    async def test_a_chunked_upload_reaches_the_backend_while_the_client_is_still_sending(self):
+        first = asyncio.Event()
+
+        async def handler(req, reader, writer):
+            size = int((await reader.readuntil(b"\r\n")).split(b";")[0], 16)
+            data = await reader.readexactly(size)
+            first.set()                                    # the client only sends the rest after this
+            await reader.readexactly(2)
+            data += await read_body([("transfer-encoding", "chunked")], reader)
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (len(data), data))
+            await writer.drain()
+            return True
+        self.origin.handler = handler
+        async with self.client() as c:
+            await c.send(b"POST /upload HTTP/1.1\r\nHost: x\r\n" + BROWSER + b"Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n")
+            await asyncio.wait_for(first.wait(), WAIT)     # a proxy that buffered the body would hang here
+            r = await c.ask(b"6\r\n world\r\n0\r\n\r\n")
+        self.assertEqual(r.body, b"hello world")
+        self.assertEqual(self.origin.seen[0].get("Transfer-Encoding"), ["chunked"])
+
+    async def test_a_sized_upload_streams_too(self):
+        half = asyncio.Event()
+
+        async def handler(req, reader, writer):
+            data = await reader.readexactly(5)
+            half.set()
+            data += await reader.readexactly(5)
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s" % (len(data), data))
+            await writer.drain()
+            return True
+        self.origin.handler = handler
+        async with self.client() as c:
+            await c.send(b"PUT /f HTTP/1.1\r\nHost: x\r\n" + BROWSER + b"Content-Length: 10\r\n\r\nhello")
+            await asyncio.wait_for(half.wait(), WAIT)
+            r = await c.ask(b"world")
+        self.assertEqual(r.body, b"helloworld")
+
+    async def test_time_the_backend_takes_does_not_count_against_the_visitor(self):
+        # The visitor sends at once; the backend stops reading for twice
+        # read_timeout part-way. The proxy waits on the backend meanwhile, and
+        # that is not the visitor being slow.
+        self.proxy.settings.read_timeout, self.proxy.settings.min_body_rate = 0.5, 10 ** 9
+        got = []
+
+        async def slow_reader(req, reader, writer):
+            data = await reader.readexactly(5)
+            await asyncio.sleep(1.0)
+            data += await reader.readexactly(int(req.one("Content-Length")) - 5)
+            got.append(len(data))
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            await writer.drain()
+            return True
+        self.origin.handler = slow_reader
+        blob = b"x" * (32 * 1024 * 1024)                 # more than the sockets between them can hold
+        r = await self.fetch(b"PUT /f HTTP/1.1\r\nHost: x\r\n" + BROWSER + b"Content-Length: %d\r\n\r\n" % len(blob) + blob)
+        self.assertEqual((r.status, got), (200, [len(blob)]))
+
+
+class SlowVisitors(ProxyTest):
+    """A request's body is read whole before the backend is asked, so a visitor
+    that sends slowly never holds one of the site's connections; one that
+    sends too slowly, or too much, is cut off; and past max_connections new
+    visitors are told to come back."""
+
+    async def test_the_backend_is_asked_only_once_the_whole_body_is_in(self):
+        async with self.client() as c:
+            await c.send(b"POST /form HTTP/1.1\r\nHost: x\r\n" + BROWSER + b"Content-Length: 10\r\n\r\nhello")
+            await asyncio.sleep(0.3)
+            self.assertEqual((self.origin.connections, self.origin.seen), (0, []))
+            r = await c.ask(b"world")
+        self.assertEqual((r.status, r.json()["length"]), (200, 10))
+        self.assertEqual(r.json()["body"], hashlib.sha256(b"helloworld").hexdigest())
+
+    async def test_a_chunked_body_reaches_the_backend_with_its_length(self):
+        r = await self.fetch(b"POST /up HTTP/1.1\r\nHost: x\r\n" + BROWSER + b"Transfer-Encoding: chunked\r\n\r\n"
+                             b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n")
+        seen = self.origin.seen[0]
+        self.assertEqual((r.status, seen.one("Content-Length"), seen.get("Transfer-Encoding")), (200, "11", []))
+        self.assertEqual(r.json()["body"], hashlib.sha256(b"hello world").hexdigest())
+
+    async def test_a_body_bigger_than_the_memory_buffer_goes_to_a_temporary_file(self):
+        self.proxy.settings.body_buffer_bytes = 4096
+        spools, real = [], tempfile.SpooledTemporaryFile
+
+        def spy(*args, **kwargs):
+            spools.append(real(*args, **kwargs))
+            return spools[-1]
+        blob = os.urandom(300 * 1024)
+        with mock.patch("artex_shield.proxy.tempfile.SpooledTemporaryFile", spy):
+            r = await self.fetch(b"POST /big HTTP/1.1\r\nHost: x\r\n" + BROWSER + b"Content-Length: %d\r\n\r\n" % len(blob)
+                                 + blob)
+        self.assertEqual((r.status, r.json()["body"]), (200, hashlib.sha256(blob).hexdigest()))
+        self.assertEqual(len(spools), 1)
+        self.assertTrue(spools[0]._rolled)                 # it went to a file
+        self.assertTrue(spools[0].closed)                  # and the file is gone again
+
+    async def test_a_body_dripped_in_is_cut_off_before_the_backend(self):
+        # Each byte comes well inside read_timeout; the body as a whole falls
+        # behind min_body_rate, so it gets read_timeout plus 10 ms a byte.
+        self.proxy.settings.read_timeout, self.proxy.settings.min_body_rate = 0.5, 100
+        async with self.client() as c:
+            await c.send(b"POST /form HTTP/1.1\r\nHost: x\r\n" + BROWSER + b"Content-Length: 1000\r\n\r\n")
+
+            async def drip():
+                try:
+                    for _ in range(100):
+                        await asyncio.sleep(0.1)
+                        await c.send(b"x")
+                except OSError:
+                    pass
+            dripping = asyncio.ensure_future(drip())
+            started = time.monotonic()
+            r = await read_response(c.reader)
+            took = time.monotonic() - started
+            dripping.cancel()
+        self.assertEqual(r.status, 408)
+        self.assertLess(took, 3)
+        self.assertEqual((self.origin.connections, self.origin.seen), (0, []))
+
+    async def test_a_fast_upload_is_not_cut_off_however_big(self):
+        self.proxy.settings.read_timeout, self.proxy.settings.min_body_rate = 0.5, 100
+        blob = os.urandom(2 * 1024 * 1024)
+        r = await self.fetch(b"POST /big HTTP/1.1\r\nHost: x\r\n" + BROWSER + b"Content-Length: %d\r\n\r\n" % len(blob) + blob)
+        self.assertEqual((r.status, r.json()["length"]), (200, len(blob)))
+
+    async def test_a_body_over_max_body_bytes_is_answered_413(self):
+        self.proxy.settings.max_body_bytes = 1000
+        for framing in (b"Content-Length: 2000\r\n\r\n" + b"x" * 2000,
+                        b"Transfer-Encoding: chunked\r\n\r\n7d0\r\n" + b"x" * 2000 + b"\r\n0\r\n\r\n"):
+            async with self.client() as c:
+                r = await c.ask(b"POST /up HTTP/1.1\r\nHost: x\r\n" + BROWSER + framing)
+                self.assertEqual(r.status, 413, framing[:30])
+                self.assertTrue(await c.closed())
+        self.assertEqual(self.origin.seen, [])
+        r = await self.fetch(b"POST /up HTTP/1.1\r\nHost: x\r\n" + BROWSER + b"Content-Length: 1000\r\n\r\n" + b"x" * 1000)
+        self.assertEqual(r.status, 200)
+
+    async def test_past_max_connections_a_visitor_is_told_to_come_back(self):
+        self.proxy.max_connections = 2
+        async with self.client() as a, self.client() as b:
+            self.assertEqual((await a.ask(get())).status, 200)
+            self.assertEqual((await b.ask(get())).status, 200)       # both kept alive, both counted
+            async with self.client() as c:
+                r = await read_response(c.reader)                       # answered without asking anything
+                self.assertEqual((r.status, r.one("Retry-After"), r.one("Connection")), (503, "5", "close"))
+        for _ in range(100):                                            # until the proxy has seen them go
+            if len(self.proxy.connections) < 2:
+                break
+            await asyncio.sleep(0.02)
+        self.assertEqual((await self.fetch(get())).status, 200)
 
 
 # ---- honeytokens and the client check -----------------------------------------------------------------
@@ -899,6 +1019,17 @@ class Smuggling(ProxyTest):
 
 # ---- settings -----------------------------------------------------------------------------------------------
 class Configuration(unittest.TestCase):
+    def test_the_connection_cap_follows_the_open_file_limit(self):
+        import resource
+        base = dict(backend="http://127.0.0.1:1")
+        self.assertEqual(_connection_cap(Settings(**base, max_connections=50)), 50)
+        for limit, cap in ((1024, (1024 - 64 - 32) // 2), (100, 16), (10 ** 7, 10000), (resource.RLIM_INFINITY, 10000)):
+            with mock.patch("resource.getrlimit", return_value=(limit, limit)):
+                self.assertEqual(_connection_cap(Settings(**base)), cap, limit)
+        for name in ("body_buffer_bytes", "max_body_bytes", "min_body_rate", "max_connections"):
+            with self.assertRaises(ValueError, msg=name):
+                Settings(**base, **{name: -1})
+
     def test_environment_variables(self):
         env = {"ARTEX_SHIELD_BACKEND": "http://wordpress:80", "ARTEX_SHIELD_LISTEN": "8081",
                "ARTEX_SHIELD_MODE": "enforce", "ARTEX_SHIELD_TRUSTED_PROXIES": "10.0.0.0/8, 172.16.0.0/12",
