@@ -327,7 +327,7 @@ A site behind the proxy may not be written in Python, so it cannot call the help
 - **WebSockets.** The handshake is checked like any other request. After the site answers `101`, bytes pass both ways untouched; messages on the socket are not inspected.
 - **Hop-by-hop headers** (`Connection` and the headers it names, `Keep-Alive`, `TE`, `Trailer`, `Upgrade` outside a WebSocket handshake, `Proxy-Connection`, `Proxy-Authorization`, `Proxy-Authenticate`) stay on their own connection.
 - **Requests that two servers could read differently are refused**, so nothing can ride past the shield inside another request's body. That covers `Content-Length` with `Transfer-Encoding`, lengths that disagree, codings other than `chunked` (501), malformed chunks, folded or malformed headers, control characters in a header, and two `Host` headers. These all answer 400 unless noted. An oversized head answers 431, and `CONNECT` 405.
-- **Failures.** A site that cannot be reached answers 502. One that does not answer within `read_timeout` answers 504.
+- **Failures.** A site that cannot be reached answers 502. One that does not answer within `read_timeout` answers 504. The answer gives the status only; what went wrong, with the backend's address, goes to the proxy's log.
 - **Shutting down.** On `SIGTERM` the proxy stops accepting, closes idle connections, and gives requests in flight 10 seconds.
 
 ### What it costs

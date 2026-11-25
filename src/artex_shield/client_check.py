@@ -74,13 +74,19 @@ def sign(key: bytes, issued: int, flags: int) -> str:
     return f"1.{issued}.{flags}.{_mac(key, issued, flags)}"
 
 
+def digits(text: str) -> bool:
+    """ASCII digits only: str.isdigit() also takes "²", which int() refuses,
+    and "٣", which int() reads as 3."""
+    return text.isascii() and text.isdigit()
+
+
 def verify(key: bytes, value: Optional[str], now: float, ttl: float) -> Optional[int]:
     """The reported flags if `value` is a cookie this key signed that has not
     expired; None for anything else."""
     if not value or len(value) > 100:
         return None
     parts = value.split(".")
-    if len(parts) != 4 or parts[0] != "1" or not parts[1].isdigit() or not parts[2].isdigit():
+    if len(parts) != 4 or parts[0] != "1" or not digits(parts[1]) or not digits(parts[2]):
         return None
     issued, flags = int(parts[1]), int(parts[2])
     if not now - ttl <= issued <= now + 300 or flags > FLAGS:

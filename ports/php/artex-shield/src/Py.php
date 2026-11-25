@@ -317,6 +317,6 @@ final class Py
     /** str.isdigit() for ASCII digits; other scripts' digits count as not digits. */
     public static function isDigits(string $s): bool
     {
-        return preg_match('/^[0-9]+$/', $s) === 1;
+        return preg_match('/\A[0-9]+\z/', $s) === 1;
     }
 }

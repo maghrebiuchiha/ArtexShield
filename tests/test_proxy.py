@@ -813,8 +813,13 @@ class BackendFailures(ProxyTest):
     async def test_502_when_the_backend_is_down(self):
         await self.origin.stop()
         self.origin.stop = lambda: asyncio.sleep(0)
-        r = await self.fetch(get())
+        with self.assertLogs("artex_shield.proxy", "WARNING") as logged:
+            r = await self.fetch(get())
         self.assertEqual((r.status, r.one("Connection")), (502, "close"))
+        # Where the backend is and what went wrong goes to the log, not to the client.
+        netloc = self.origin.url[len("http://"):]
+        self.assertEqual(r.body, b"502 Bad Gateway\n")
+        self.assertIn(netloc, "\n".join(logged.output))
 
     async def test_504_when_the_backend_is_too_slow(self):
         self.proxy.settings.read_timeout = 0.2
@@ -823,7 +828,8 @@ class BackendFailures(ProxyTest):
             await asyncio.sleep(3)
             return False
         self.origin.handler = slow
-        self.assertEqual((await self.fetch(get())).status, 504)
+        r = await self.fetch(get())
+        self.assertEqual((r.status, r.body), (504, b"504 Gateway Timeout\n"))
 
     async def test_502_when_the_backend_answers_nonsense(self):
         async def nonsense(req, reader, writer):
@@ -831,7 +837,8 @@ class BackendFailures(ProxyTest):
             await writer.drain()
             return False
         self.origin.handler = nonsense
-        self.assertEqual((await self.fetch(get())).status, 502)
+        r = await self.fetch(get())
+        self.assertEqual((r.status, r.body), (502, b"502 Bad Gateway\n"))
 
 
 class Smuggling(ProxyTest):

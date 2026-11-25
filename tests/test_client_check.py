@@ -247,6 +247,22 @@ class Cookie(unittest.TestCase):
             v.jar = {"artex_check": value}
             self.assertEqual(client_hits(v.get("/api/items", REPLAY, gap=601)), ["client:no-check"], value)
 
+    def test_numbers_are_ascii_digits_only(self):
+        # str.isdigit() also takes "²", which int() refuses, and "٣", which int() reads as 3.
+        for digit in ("²", "٣"):
+            for value in (f"1.{digit}.0.AAAAAAAAAAAAAAAAAAAAAA", f"1.{int(T0)}.{digit}.AAAAAAAAAAAAAAAAAAAAAA"):
+                self.assertIsNone(cc.verify(self.KEY, value, T0, 86400), value)
+        s, c = shield()
+        v = Visitor(s, c, "203.0.113.61")
+        v.get("/", REPLAY)
+        for value in ("1.².0.x", f"1.{int(T0)}.٣.x"):
+            v.jar = {"artex_check": value}
+            self.assertEqual(client_hits(v.get("/api/items", REPLAY, gap=601)), ["client:no-check"], value)
+        for flags in ("²", "٣", "¹²"):
+            _, hdrs, _ = s.client_check_reply("203.0.113.62", f"v=1&f={flags}", {})
+            value = dict(hdrs)["Set-Cookie"].split("=", 1)[1].split(";")[0]
+            self.assertEqual(cc.verify(self.KEY, value, c.t, 86400), 0, flags)     # not an automation report
+
     def test_workers_with_the_same_secret_accept_each_others_cookies(self):
         a, ca = shield()
         b, cb = shield()

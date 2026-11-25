@@ -959,6 +959,41 @@ class Export(unittest.TestCase):
         self.assertEqual(s.export_blocklist(self.path, "plain"), 1)
         self.assertEqual(self.read(), "203.0.113.12\n")
 
+    @unittest.skipUnless(os.name == "posix", "symbolic links")
+    def test_a_link_planted_at_a_temporary_name_is_not_written_through(self):
+        # Someone who can write to the directory plants a link where the next
+        # temporary file will go. Its name is random; here it is made known.
+        from artex_shield import util
+        victim = os.path.join(self.dir.name, "victim.conf")
+        with open(victim, "w") as f:
+            f.write("important\n")
+        s, _ = shield()
+        s.check("203.0.113.70", "GET", "/", headers=SCANNER)
+        with mock.patch.object(util, "secrets", mock.Mock(token_hex=lambda n: "known")):
+            for name in (f"{self.path}.state.{os.getpid()}.known.tmp", f"{self.path}.{os.getpid()}.known.tmp"):
+                os.symlink(victim, name)
+            with self.assertRaises(OSError):
+                s.export_blocklist(self.path)
+        with open(victim) as f:
+            self.assertEqual(f.read(), "important\n")
+
+    @unittest.skipUnless(os.name == "posix" and hasattr(os, "O_NOFOLLOW"), "symbolic links and O_NOFOLLOW")
+    def test_a_link_planted_at_the_lock_is_not_followed(self):
+        elsewhere = os.path.join(self.dir.name, "created-elsewhere")
+        os.symlink(elsewhere, self.path + ".lock")
+        s, _ = shield(blocklist_export_path=self.path)
+        self.assertEqual(s.check("203.0.113.71", "GET", "/", headers=SCANNER).action, "block")   # still decides
+        self.assertFalse(os.path.exists(elsewhere))
+        self.assertFalse(os.path.exists(self.path))         # nothing written without the lock
+
+    def test_the_block_file_gets_the_usual_permissions(self):
+        mask = os.umask(0o022)                              # read the umask, then put it back
+        os.umask(mask)
+        s, _ = shield(blocklist_export_path=self.path)
+        s.check("203.0.113.72", "GET", "/", headers=SCANNER)
+        for path in (self.path, self.path + ".state"):
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o666 & ~mask, path)    # nginx can read it
+
     def test_expiry_reaches_the_file_without_another_request(self):
         s = Shield(Config(mode="enforce", blocklist_export_path=self.path, block_ttl=0.4))    # real clock
         s.check("203.0.113.13", "GET", "/", headers=SCANNER)

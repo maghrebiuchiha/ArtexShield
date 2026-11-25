@@ -531,7 +531,7 @@ class Shield:
         for requests to Config.client_check_path."""
         now = self.clock()
         params = dict(p.partition("=")[::2] for p in query.split("&") if p)
-        flags = int(params["f"]) & _cc.FLAGS if params.get("f", "").isdigit() and len(params["f"]) < 6 else 0
+        flags = int(params["f"]) & _cc.FLAGS if _cc.digits(params.get("f", "")) and len(params["f"]) < 6 else 0
         if self._identified(ip):
             with self._state():
                 t = self._track(_track_key(ip), now)
