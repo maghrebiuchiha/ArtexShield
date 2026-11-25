@@ -57,8 +57,9 @@ class Signatures(unittest.TestCase):
 
     def test_http_library_alone_is_not_throttled(self):
         s, c = shield()
+        rng = random.Random(3)
         for _ in range(200):                      # an API client polling with irregular gaps
-            c.t += random.uniform(3, 40)
+            c.t += rng.uniform(3, 40)
             d = s.check("198.51.100.7", "GET", "/api/items", headers={"User-Agent": "python-requests/2.32"})
             self.assertEqual(d.action, "pass")
 
@@ -371,6 +372,16 @@ class Plumbing(unittest.TestCase):
         self.assertEqual(s.check(s.client_ip("", "203.0.113.7"), "GET", "/", headers={"User-Agent": "sqlmap/1"}).action,
                          "block")
         self.assertEqual(s.check(s.client_ip("", "198.51.100.9"), "GET", "/", headers=BROWSER).action, "pass")
+
+    def test_scores_halve_every_half_life_and_drop_to_zero_below_half_a_point(self):
+        s, c = shield()
+        quiet = dict(BROWSER, **{"Sec-Fetch-Site": "none"})
+        self.assertEqual(s.check("203.0.113.40", "TRACE", "/", headers=quiet).score, 30)
+        expected = [(300, 30 * 0.5 ** 0.5), (600, 15), (1200, 7.5), (1800, 3.75), (2400, 1.875), (3000, 0.9375),
+                    (3300, 0.9375 * 0.5 ** 0.5), (3600, 0)]           # 0.46875 is under half a point: 0
+        for at, score in expected:
+            c.t = T0 + at
+            self.assertAlmostEqual(s.check("203.0.113.40", "GET", "/", headers=quiet).score, score, places=9, msg=at)
 
     def test_ipv6_tracked_per_64(self):
         s, _ = shield()
@@ -1355,6 +1366,37 @@ class WebSockets(unittest.TestCase):
 
         asyncio.run(ShieldASGI(app, shield()[0])({"type": "lifespan"}, None, None))
         self.assertEqual(reached, ["lifespan"])
+
+
+class TextEdges(unittest.TestCase):
+    """Where reading text the way Python does decides the outcome. Ports
+    follow spec/SPEC.md's porting notes; these cases put it in the vectors."""
+
+    def test_a_newline_at_the_end_does_not_hide_a_name(self):
+        s, _ = shield()
+        d = s.check("192.0.2.150", "GET", "/id_rsa%0A", headers=BROWSER)   # $ matches before a final newline
+        self.assertIn("decoy:sensitive-file-probe", d.hits)
+
+    def test_names_are_whole_words_in_any_script(self):
+        s, _ = shield()
+        self.assertIn("decoy:sensitive-file-probe", s.check("192.0.2.151", "GET", "/.env.local", headers=BROWSER).hits)
+        self.assertEqual(s.check("192.0.2.152", "GET", "/.env%C3%A9", headers=BROWSER).hits, [])   # é: no boundary
+
+    def test_cadence_turns_on_the_spread_of_the_gaps(self):
+        for spread, flagged in ((0.34, True), (0.36, False)):           # the limit is a 0.35 coefficient of variation
+            s, c = shield()
+            hits = []
+            for i in range(40):
+                c.t += 1.0 + (spread if i % 2 else -spread)
+                hits += s.check("203.0.113.160", "GET", "/api/items", headers=BROWSER).hits
+            self.assertEqual("behavior:metronomic-cadence" in hits, flagged, spread)
+
+    def test_ipv6_networks_are_written_in_canonical_form(self):
+        s, _ = shield()
+        for addr in ("2001:db8:0:5::1", "2001:0:0:5:1::", "2001:db8:a:0:ffff::1", "2001:DB8:B::1"):
+            s.check(addr, "GET", "/", headers={"User-Agent": "sqlmap/1.9"})
+        self.assertEqual(sorted(s.blocklist()),
+                         ["2001:0:0:5::/64", "2001:db8:0:5::/64", "2001:db8:a::/64", "2001:db8:b::/64"])
 
 
 class Cost(unittest.TestCase):

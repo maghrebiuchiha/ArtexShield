@@ -7,10 +7,233 @@ jobs:
       matrix:
         python-version: ["3.9", "3.11", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install .
-      - run: python -W error -m unittest discover -s tests
+      - name: The tests, every case in spec/vectors.json and the READMEs' setup steps among them
+        run: python -W error -m unittest discover -s tests
+      - name: spec/vectors.json matches the test suite
+        run: python spec/export_vectors.py --check
       - run: python examples/simulate.py
+
+  node:
+    name: Node ${{ matrix.node-version }}, Express ${{ matrix.express }}
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - {node-version: "20", express: "4"}
+          - {node-version: "22", express: "5"}
+          - {node-version: "24", express: "5"}
+    defaults:
+      run:
+        working-directory: ports/node
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: No runtime dependencies
+        run: node -e "const p = require('./package.json'); if (Object.keys(p.dependencies || {}).length) process.exit(1)"
+      - name: Express for the example (not a dependency)
+        run: npm install --no-save --no-audit --no-fund express@${{ matrix.express }}
+      - name: spec/vectors.json, the middleware, pattern cost and the examples
+        run: npm test
+
+  php:
+    name: PHP ${{ matrix.php }}
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        php: ["8.1", "8.3", "8.5"]
+    defaults:
+      run:
+        working-directory: ports/php
+    steps:
+      - uses: actions/checkout@v5
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+      - name: Every file parses
+        run: find artex-shield examples tests -name '*.php' -print0 | xargs -0 -n1 php -l
+      - name: spec/vectors.json, state in memory
+        run: php tests/vectors.php
+      - name: spec/vectors.json, state in files
+        run: php tests/vectors.php --files
+      - name: spec/vectors.json, state in the object cache
+        run: php tests/vectors.php --cache
+      - name: Pattern cost
+        run: php tests/cost.php
+      - name: The plugin's request path and settings
+        run: php tests/plugin.php
+      - name: Any PHP site, through auto_prepend_file
+        run: php tests/prepend.php
+
+  wordpress:
+    name: WordPress plugin (${{ matrix.tag }})
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        tag: ["7-php8.2-apache", "7-php8.5-apache"]
+    env:
+      WP_TAG: ${{ matrix.tag }}
+      COMPOSE: docker compose -f ports/php/tests/wordpress/docker-compose.yml
+      SMOKE: ports/php/tests/wordpress/smoke.py
+    steps:
+      - uses: actions/checkout@v5
+      - name: WordPress, MariaDB and WP-CLI
+        run: $COMPOSE up -d --wait wordpress db
+      - name: Install WordPress and activate the plugin
+        run: |
+          for i in $(seq 1 30); do                 # 0 installed, 1 not yet: either way WordPress can be reached
+            status=0; $COMPOSE run --rm -T cli core is-installed 2>/dev/null || status=$?
+            if [ "$status" -le 1 ]; then break; fi; sleep 2
+          done
+          $COMPOSE run --rm -T cli core install --url=http://localhost:8090 --title=Shielded --admin_user=admin \
+            --admin_password=ci-only-admin --admin_email=admin@example.com --skip-email
+          $COMPOSE run --rm -T cli rewrite structure '/%postname%/'
+          $COMPOSE run --rm -T cli plugin activate artex-shield
+      - name: Monitor mode, the decoys, and the settings page switching to enforce
+        run: python3 $SMOKE admin http://localhost:8090 ci-only-admin
+      - name: Enforce mode against a visitor and a scanner
+        run: |
+          $COMPOSE run --rm -T cli eval 'foreach (array_keys(ArtexShield\WordPress\Plugin::shield()->blocklist()) as $n) { ArtexShield\WordPress\Plugin::shield()->unblock(explode("/", $n)[0]); }'
+          python3 $SMOKE visitor http://localhost:8090
+      - name: A planted password, replayed from another address, is blocked
+        run: |
+          password=$($COMPOSE run --rm -T cli eval 'echo ArtexShield\Decoys::honeytokens(get_option("artex_shield_settings")["secret"])["passwords"][1];')
+          docker run --rm --network artex-shield-wp-plugin_default -v "$PWD/ports/php/tests/wordpress:/smoke:ro" python:3.13-slim \
+            python /smoke/smoke.py replay http://wordpress "$password"
+      - name: The events record both, and PHP logged no warnings
+        run: |
+          events=$($COMPOSE run --rm -T cli eval 'echo json_encode(ArtexShield\WordPress\Plugin::events());')
+          echo "$events" | grep -q 'decoy:honeytoken-body'
+          echo "$events" | grep -q 'tool:sqlmap'
+          if $COMPOSE logs wordpress | grep -iE 'PHP (Warning|Notice|Deprecated|Fatal)'; then exit 1; fi
+      - name: Logs
+        if: always()
+        run: $COMPOSE logs wordpress
+      - name: Clean up
+        if: always()
+        run: $COMPOSE down -v
+
+  proxy:
+    name: proxy in Docker, in front of WordPress
+    runs-on: ubuntu-24.04
+    env:
+      COMPOSE: docker compose -f examples/wordpress/docker-compose.yml
+      ARTEX_SHIELD_HONEYTOKEN_SECRET: ci-only-honeytoken-secret
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the image
+        run: docker build -t artex-shield-proxy .
+      - name: spec/vectors.json through the proxy, inside the image
+        run: >
+          docker run --rm -v "$PWD/tests:/work/tests:ro" -v "$PWD/spec:/work/spec:ro" -w /work
+          --entrypoint python artex-shield-proxy -W error -m unittest discover -s tests -p test_proxy.py -v
+      - name: WordPress behind the proxy, in enforce mode
+        env:
+          ARTEX_SHIELD_MODE: enforce
+        run: $COMPOSE up -d --wait
+      - name: Install WordPress and browse it through the proxy, then send a scanner
+        run: python3 examples/wordpress/smoke.py http://localhost:8080
+      - name: A planted password, replayed from another address, is blocked before WordPress
+        run: |
+          password=$($COMPOSE run --rm --no-deps -T shield --print-decoys | sed -n 's/.* login [^ ]* \/ \([^ ]*\) ;.*/\1/p')
+          $COMPOSE run --rm --no-deps -T -v "$PWD/examples/wordpress:/smoke:ro" --entrypoint python shield \
+            /smoke/smoke.py http://artex-shield-wordpress-shield-1:8080 --replay "$password"
+      - name: Neither the scanner nor the replayed login reached WordPress
+        run: |
+          $COMPOSE logs shield | grep '"action":"block"' | grep tool:sqlmap
+          $COMPOSE logs shield | grep '"action":"block"' | grep decoy:honeytoken-body
+          if $COMPOSE logs wordpress | grep -i -e sqlmap -e "POST /wp-login.php"; then exit 1; fi
+      - name: Logs
+        if: always()
+        run: $COMPOSE logs
+      - name: Clean up
+        if: always()
+        run: $COMPOSE down -v
+
+  openresty:
+    name: OpenResty ${{ matrix.openresty }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        openresty: ["1.21.4.3-bullseye-fat", "1.27.1.2-bookworm-fat"]
+    env:
+      IMAGE: openresty/openresty:${{ matrix.openresty }}
+      COMPOSE: docker compose -f ports/openresty/examples/wordpress/docker-compose.yml
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"                    # unicode.lua holds this Python's Unicode data
+      - name: patterns.lua and unicode.lua are up to date
+        run: python ports/openresty/build.py --check
+      - name: Pull the image
+        run: docker pull $IMAGE
+      - name: spec/vectors.json, state in shared dicts
+        run: docker run --rm -v "$PWD:/w:ro" -w /w/ports/openresty $IMAGE sh tests/run.sh vectors
+      - name: The shared dicts, the adapter, and pattern cost
+        run: docker run --rm -v "$PWD:/w:ro" -w /w/ports/openresty $IMAGE sh tests/run.sh store adapter cost
+      - name: spec/vectors.json through OpenResty over HTTP
+        run: |
+          docker run -d --name harness --network host -v "$PWD/ports/openresty:/srv/artex:ro" $IMAGE \
+            sh -c 'mkdir -p /tmp/harness/logs && exec openresty -p /tmp/harness -c /srv/artex/tests/nginx/harness.conf'
+          for i in $(seq 1 40); do curl -s -o /dev/null http://127.0.0.1:8399/__test/report && break; sleep 0.5; done
+          python3 ports/openresty/tests/edge.py
+      - name: Four workers in enforce mode, in front of an origin
+        run: |
+          docker run -d --name smoke --network host -v "$PWD/ports/openresty:/srv/artex:ro" $IMAGE \
+            sh -c 'mkdir -p /tmp/smoke/logs && exec openresty -p /tmp/smoke -c /srv/artex/tests/nginx/smoke.conf'
+          for i in $(seq 1 40); do curl -s -o /dev/null http://127.0.0.1:8498/__origin/seen && break; sleep 0.5; done
+          python3 ports/openresty/tests/smoke.py
+      - name: No pattern failed and no worker crashed
+        run: if docker logs smoke 2>&1 | grep -E 'pattern failed|exited on signal|\[(error|crit|alert|emerg)\]'; then exit 1; fi
+      - name: A static site, served by OpenResty (examples/static.conf)
+        env:
+          ARTEX_SHIELD_CANARY_SECRET: ci-only-canary-secret
+        run: |
+          docker run -d --name static -p 8085:8080 -e ARTEX_SHIELD_MODE=enforce -e ARTEX_SHIELD_CANARY_SECRET \
+            -e ARTEX_SHIELD_TRUSTED_PROXIES=172.16.0.0/12 \
+            -v "$PWD/ports/openresty/lib:/opt/artex-shield/lib:ro" \
+            -v "$PWD/ports/openresty/examples/artex_settings.lua:/opt/artex-shield/artex_settings.lua:ro" \
+            -v "$PWD/ports/openresty/examples/static.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro" \
+            -v "$PWD/ports/openresty/tests/static-site:/var/www/site:ro" $IMAGE
+          for i in $(seq 1 40); do curl -s -o /dev/null http://127.0.0.1:8085/_artex/health && break; sleep 0.5; done
+          python3 ports/openresty/tests/static.py http://127.0.0.1:8085
+          if docker logs static 2>&1 | grep -E 'pattern failed|exited on signal|\[(error|crit|alert|emerg)\]'; then exit 1; fi
+      - name: WordPress behind OpenResty, in enforce mode
+        if: matrix.openresty == '1.27.1.2-bookworm-fat'
+        env:
+          ARTEX_SHIELD_MODE: enforce
+          ARTEX_SHIELD_HONEYTOKEN_SECRET: ci-only-honeytoken-secret
+        run: |
+          $COMPOSE up -d --wait
+          python3 examples/wordpress/smoke.py http://localhost:8080
+          password=$($COMPOSE run --rm --no-deps -T edge decoys | sed -n 's/.* login [^ ]* \/ \([^ ]*\) ;.*/\1/p')
+          docker run --rm --network artex-shield-openresty_default -v "$PWD/examples/wordpress:/smoke:ro" \
+            python:3.13-slim python /smoke/smoke.py http://edge:8080 --replay "$password"
+      - name: The edge logged both blocks, and WordPress saw neither request
+        if: matrix.openresty == '1.27.1.2-bookworm-fat'
+        run: |
+          $COMPOSE logs --no-color edge > edge.log
+          grep '"action":"block"' edge.log | grep -q tool:sqlmap
+          grep '"action":"block"' edge.log | grep -q decoy:honeytoken-body
+          if $COMPOSE logs wordpress | grep -i -e sqlmap -e "POST /wp-login.php"; then exit 1; fi
+          if grep -E '\[(error|crit|alert|emerg)\]' edge.log; then exit 1; fi
+      - name: Logs
+        if: always()
+        run: |
+          docker logs harness 2>&1 | tail -50 || true
+          docker logs smoke 2>&1 | grep -v 'artex-shield: {' | tail -50 || true
+          $COMPOSE logs --no-color 2>&1 | tail -80 || true
+      - name: Clean up
+        if: always()
+        run: |
+          docker rm -f harness smoke static || true
+          $COMPOSE down -v || true

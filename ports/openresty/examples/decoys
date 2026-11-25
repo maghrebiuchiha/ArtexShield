@@ -1,0 +1,9 @@
+#!/bin/sh
+# Print what to plant on the site for the decoys these settings watch for
+# (canary paths, fake credentials, the client check's tag), as
+# artex-shield-proxy --print-decoys does. Reads the same environment as nginx.conf.
+exec resty --shdict 'artex_shield 1m' --shdict 'artex_shield_blocks 1m' \
+    -I /opt/artex-shield/lib -I /opt/artex-shield \
+    -e 'local edge = require "resty.artex_shield"
+        edge.configure(require("artex_settings").from_env())
+        print(edge.decoys())'

@@ -1,0 +1,50 @@
+# Real WordPress with the plugin mounted, for CI (see smoke.py). Only port
+# 8090 is published. WP_TAG picks the PHP version: 7-php8.2-apache, ...
+name: artex-shield-wp-plugin
+
+x-wordpress-env: &wordpress-env
+  WORDPRESS_DB_HOST: db
+  WORDPRESS_DB_USER: wordpress
+  WORDPRESS_DB_PASSWORD: ci-only-password
+  WORDPRESS_DB_NAME: wordpress
+  WORDPRESS_DEBUG: "1"          # PHP warnings show on the page, so the smoke test sees them
+
+services:
+  wordpress:
+    image: wordpress:${WP_TAG:-7-php8.2-apache}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8090:80"
+    environment: *wordpress-env
+    volumes:
+      - wordpress:/var/www/html
+      - ../../artex-shield:/var/www/html/wp-content/plugins/artex-shield:ro
+
+  cli:
+    image: wordpress:cli
+    user: "33:33"                  # www-data, as the web server
+    depends_on:
+      - wordpress
+    environment: *wordpress-env
+    volumes:
+      - wordpress:/var/www/html
+      - ../../artex-shield:/var/www/html/wp-content/plugins/artex-shield:ro
+    entrypoint: ["wp"]
+
+  db:
+    image: mariadb:lts
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: ci-only-password
+      MARIADB_RANDOM_ROOT_PASSWORD: "1"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  wordpress:

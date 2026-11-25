@@ -1,0 +1,72 @@
+# WordPress behind artex-shield-proxy. Only the proxy is published: WordPress
+# and its database are reachable on the compose network alone, so every
+# request goes through the shield.
+#
+#   docker compose -f examples/wordpress/docker-compose.yml up -d --build
+#   open http://localhost:8080 and run the WordPress installer
+#   docker compose -f examples/wordpress/docker-compose.yml logs -f shield
+#
+# The shield starts in monitor mode: it logs what it would block and blocks
+# nothing. When a week of logs shows no visitor you would have stopped, run
+# with ARTEX_SHIELD_MODE=enforce.
+#
+# Put your TLS terminator (Caddy, nginx, a load balancer or CDN) in front of
+# port 8080, and add its address range to ARTEX_SHIELD_TRUSTED_PROXIES so the
+# shield scores visitors rather than the terminator.
+name: artex-shield-wordpress
+
+services:
+  shield:
+    build: ../..
+    image: artex-shield-proxy
+    restart: unless-stopped
+    depends_on:
+      - wordpress
+    ports:
+      - "8080:8080"
+    environment:
+      ARTEX_SHIELD_BACKEND: http://wordpress:80
+      ARTEX_SHIELD_MODE: ${ARTEX_SHIELD_MODE:-monitor}
+      # Long random strings you keep: they decide the canary paths and the
+      # fake credentials. Then plant them on your pages: run
+      #   docker compose -f examples/wordpress/docker-compose.yml run --rm --no-deps shield --print-decoys
+      ARTEX_SHIELD_CANARY_SECRET: ${ARTEX_SHIELD_CANARY_SECRET:-}
+      ARTEX_SHIELD_HONEYTOKEN_SECRET: ${ARTEX_SHIELD_HONEYTOKEN_SECRET:-}
+      ARTEX_SHIELD_TRUSTED_PROXIES: ${ARTEX_SHIELD_TRUSTED_PROXIES:-}
+
+  wordpress:
+    image: wordpress:7-apache
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: ${WORDPRESS_DB_PASSWORD:-change-me}
+      WORDPRESS_DB_NAME: wordpress
+    volumes:
+      - wordpress:/var/www/html
+    # No ports. The image believes X-Forwarded-For from private ranges
+    # (mod_remoteip), so WordPress and its access log see each visitor's
+    # address as the shield passes it on.
+
+  db:
+    image: mariadb:lts
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: ${WORDPRESS_DB_PASSWORD:-change-me}
+      MARIADB_RANDOM_ROOT_PASSWORD: "1"
+    volumes:
+      - db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  wordpress:
+  db:

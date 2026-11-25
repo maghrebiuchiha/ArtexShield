@@ -1,0 +1,20 @@
+{
+  "name": "artex-shield",
+  "version": "1.0.0",
+  "description": "Detection and blocking for ARTEX-style automated penetration-testing traffic: Express / Connect middleware and a wrapper for plain http servers. No dependencies.",
+  "main": "lib/index.js",
+  "files": [
+    "lib",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/vectors.test.js test/middleware.test.js test/cost.test.js test/examples.test.js",
+    "sync-patterns": "node -e \"require('fs').copyFileSync('../../spec/patterns.json', 'lib/patterns.json')\""
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": ["security", "waf", "middleware", "express", "bot-detection", "honeypot"],
+  "license": "MIT",
+  "dependencies": {}
+}
