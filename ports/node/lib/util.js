@@ -62,7 +62,7 @@ function induced(h) {
   let origin;
   try {
     origin = py.netloc(py.strip(referer));
-  } catch (e) {
+  } catch {
     return false;
   }
   origin = origin.slice(origin.lastIndexOf("@") + 1).toLowerCase();

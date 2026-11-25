@@ -40,7 +40,7 @@ test("the plain http example", async () => {
 let express = null;
 try {
   express = require.resolve("express");
-} catch (e) {
+} catch {
   express = null;
 }
 

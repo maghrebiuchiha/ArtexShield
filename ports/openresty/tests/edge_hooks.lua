@@ -4,6 +4,9 @@
 -- asked and what it decided are kept for /__test/report, and observe_later()
 -- records its calls instead of making them, because the harness feeds the
 -- vector's own observe steps (as tests/test_proxy.py does for the proxy).
+-- For the same reason a case can hold back the client check's replies: the
+-- edge answers a request to the check's path itself, which records the client
+-- as checked, where the vector's request step only asks check().
 
 local edge = require "resty.artex_shield"
 local cjson = require("cjson.safe").new()
@@ -21,7 +24,9 @@ local function record(key, value)
     test:set(key, cjson.encode(value))
 end
 
-local function configure(cfg)
+local real_reply
+
+local function configure(cfg, hold_replies)
     for _, name in ipairs({"artex_shield", "artex_shield_blocks"}) do
         ngx.shared[name]:flush_all()
         ngx.shared[name]:flush_expired()
@@ -36,6 +41,15 @@ local function configure(cfg)
         record("decision", {action = d.action, hits = d.hits, score = d.score, retry_after = d.retry_after,
             stop = d.stop, enforced = d.enforced, induced = d.induced})
         return d
+    end
+    real_reply = s.client_check_reply
+    if hold_replies then
+        s.client_check_reply = function(_, addr, query)
+            local list = cjson.decode(test:get("replied") or "[]")
+            list[#list + 1] = {addr, query}
+            record("replied", list)
+            return {status = 204, headers = {{"Cache-Control", "no-store"}, {"Content-Length", "0"}}, body = ""}
+        end
     end
     return s
 end
@@ -75,11 +89,11 @@ local function answer(value)
     return ngx.exit(ngx.HTTP_OK)
 end
 
--- POST {"config": {...}, "now": t}: a fresh shield for the next case.
+-- POST {"config": {...}, "now": t, "hold_replies": bool}: a fresh shield for the next case.
 function _M.case()
     local job = json_body()
     test:set("now", job.now)
-    local ok, err = pcall(configure, job.config)
+    local ok, err = pcall(configure, job.config, job.hold_replies == true)
     return answer({ok = ok, error = not ok and tostring(err) or nil})
 end
 
@@ -104,7 +118,7 @@ function _M.step()
         return answer({})
     elseif not null(step.client_check) then
         local c = step.client_check
-        local r = s:client_check_reply(c.ip, c.query, null(c.headers) and {} or c.headers, c.secure == true)
+        local r = real_reply(s, c.ip, c.query, null(c.headers) and {} or c.headers, c.secure == true)
         return answer({status = r.status, headers = r.headers})
     elseif not null(step.unblock) then
         return answer({unblocked = s:unblock(step.unblock)})
@@ -119,13 +133,14 @@ function _M.step()
     return answer({blocklist = networks})
 end
 
--- What the last request asked and got, and the statuses passed on since; then forget them.
+-- What the last request asked and got, the statuses passed on and the check replies held back
+-- since; then forget them.
 function _M.report()
     local out = {asked = cjson.decode(test:get("asked") or "null"), decision = cjson.decode(test:get("decision") or "null"),
-        reported = cjson.decode(test:get("reported") or "[]")}
-    test:delete("asked")
-    test:delete("decision")
-    test:delete("reported")
+        reported = cjson.decode(test:get("reported") or "[]"), replied = cjson.decode(test:get("replied") or "[]")}
+    for _, key in ipairs({"asked", "decision", "reported", "replied"}) do
+        test:delete(key)
+    end
     return answer(out)
 end
 

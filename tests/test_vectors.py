@@ -9,7 +9,8 @@ from datetime import datetime, timezone
 
 from artex_shield import Config, Engagement, Shield, client_check, make_canaries, make_honeytokens
 
-SPEC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "spec", "vectors.json")
+SPEC_DIR = os.environ.get("ARTEX_SPEC") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "spec")
+SPEC = os.path.join(SPEC_DIR, "vectors.json")      # ARTEX_SPEC: another spec/ directory
 logging.getLogger("artex_shield").disabled = True
 SCORE_TOLERANCE = 1e-6
 

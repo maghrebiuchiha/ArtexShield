@@ -1113,7 +1113,10 @@ class ProxyRunner(Runner):
     exactly the state the reference reached, even where a test fed back a
     status the proxy would not have seen. A request followed at the same
     instant by an observe step for the same address and path is sent with the
-    backend answering that status, and the proxy's report has to match it."""
+    backend answering that status, and the proxy's report has to match it.
+    client_check_reply() is held back the same way: the proxy answers a
+    request to the check's own path, which records the client as checked,
+    where the vector's request step only asks check()."""
 
     def __init__(self, case, t0, harness):
         case = dict(case, config=dict(case.get("config", {}), trusted_proxies=["127.0.0.1/32"]))
@@ -1129,7 +1132,12 @@ class ProxyRunner(Runner):
         self.shield.observe = lambda ip, path, status, induced=False, content_type="": self.reported.append(
             (ip, path, status, induced, content_type))
         self.observe = type(self.shield).observe.__get__(self.shield)
+        self.replied = []
         harness.proxy.shield = self.shield
+
+    def held_reply(self, ip, query, headers=None, secure=False):
+        self.replied.append((ip, query))
+        return 204, [("Cache-Control", "no-store"), ("Content-Length", "0")], b""
 
     def step(self, where, step, expect=None, full=True):
         if self.pending is not None:
@@ -1155,8 +1163,12 @@ class ProxyRunner(Runner):
     def send(self, where, r, expect, full, observe=None):
         status = observe["status"] if observe else 200
         ctype = observe.get("content_type", "") if observe else ""
-        self.last, self.reported = None, []
-        code, headers = self.h.request(r, status, ctype)
+        self.last, self.reported, self.replied = None, [], []
+        self.shield.client_check_reply = self.held_reply      # the proxy's call only; the vector's steps make theirs
+        try:
+            code, headers = self.h.request(r, status, ctype)
+        finally:
+            del self.shield.client_check_reply
         self.h.proxied += 1
         d = self.last
         if d is None:
@@ -1181,8 +1193,11 @@ class ProxyRunner(Runner):
             self.fail(where, f"HTTP {code}, expected {want} for {d.action} (enforced {d.enforced})")
         if d.stop and d.action == "throttle" and headers.get("retry-after") != str(d.retry_after):
             self.fail(where, f"Retry-After {headers.get('retry-after')}, expected {d.retry_after}")
-        if self.reported != ([(r["ip"], r["path"], status, d.induced, ctype)] if forwarded else []):
+        sent = ctype.strip(" \t")             # what HTTP carries of it: a header value loses its outer spaces
+        if self.reported != ([(r["ip"], r["path"], status, d.induced, sent)] if forwarded else []):
             self.fail(where, f"the proxy reported {self.reported} to observe()")
+        if self.replied != ([(r["ip"], self.h.query)] if route == "check" and not d.stop else []):
+            self.fail(where, f"the proxy replied {self.replied} for the client check")
         if observe is not None:
             self.observe(observe["ip"], observe["path"], observe["status"], observe.get("induced", False), ctype)
 

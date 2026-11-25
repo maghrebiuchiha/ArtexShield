@@ -8,7 +8,7 @@ const path = require("path");
 const { Shield, makeConfig, makeCanaries, makeHoneytokens, clientCheckScript } = require("../lib");
 const ip = require("../lib/ip");
 
-const SPEC = path.join(__dirname, "..", "..", "..", "spec");
+const SPEC = process.env.ARTEX_SPEC || path.join(__dirname, "..", "..", "..", "spec");     // ARTEX_SPEC: another spec/ directory
 const data = JSON.parse(fs.readFileSync(path.join(SPEC, "vectors.json"), "utf8"));
 const TOLERANCE = 1e-6;
 
@@ -121,7 +121,7 @@ class Runner {
 
 test("the file is the version this runner reads", () => {
   assert.deepStrictEqual([data.version, data.t0], [2, 1800000000.0]);
-  assert.ok(data.cases.length > 500);
+  if (!process.env.ARTEX_SPEC) assert.ok(data.cases.length > 500);    // the repository's own spec, read whole
 });
 
 test("every case", () => {
