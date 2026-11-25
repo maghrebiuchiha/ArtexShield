@@ -215,7 +215,9 @@ An app server bound to a unix socket reports no peer address. Add `"0.0.0.0/32"`
 
 ### Exempt paths
 
-`exempt_paths` entries cover a path and everything under it, by whole segments: `"/static"` covers `/static` and `/static/app.js`, and not `/static-admin` or `/static/../api`. An entry must start with `/` and name something below the root; `""` and `"/"` are rejected because they would switch the shield off.
+`exempt_paths` entries cover a path and everything under it, by whole segments: `"/static"` covers `/static` and `/static/app.js`, and not `/static-admin` or `/static/../api`. Nor does it cover `/static/..;/api`, which Tomcat, Jetty and Spring read as `/api`, or the other spellings of `..` some server reads as one (cut short by a NUL, or with dots and spaces after it). An entry must start with `/` and name something below the root; `""` and `"/"` are rejected because they would switch the shield off.
+
+A request for an exempt path is never scored, but it does not lift a block: a client blocked for what it did elsewhere is blocked there too. To let an address through whatever it does, put it in `allow_cidrs`.
 
 ### Requests a page made the browser send
 

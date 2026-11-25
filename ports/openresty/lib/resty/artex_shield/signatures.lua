@@ -155,43 +155,47 @@ end
 _M.is_pcre1 = is_pcre1
 
 local function failed(err, rx)
-    ngx.log(ngx.ERR, "artex-shield: pattern failed (", err, "), counted as no match: ", sub(rx, 1, 60))
+    ngx.log(ngx.ERR, "artex-shield: pattern failed (", err, "), counted as a match: ", sub(rx, 1, 60))
 end
 
 -- Does rx match anywhere in text? PCRE's JIT keeps its backtracking on a
 -- fixed stack (the edge module makes it 1 MB), and a repeated group over a
 -- very long text can run it out. Then, with PCRE2, the same pattern runs
 -- again without the JIT, which backtracks on the heap; with PCRE1 that would
--- crash the worker, so the failure is logged and counts as no match, as any
--- other failure does. text must be valid UTF-8.
+-- crash the worker, so the failure is logged and counts as a match, as any
+-- other failure (the match limit, say) does: as no match, text built to
+-- exhaust PCRE would carry a payload past the pattern. The patterns scan in
+-- linear time (tests/cost.lua), so text a visitor sends does not get here.
+-- text must be valid UTF-8.
 function _M.search(rx, text)
     local from, _, err = re_find(text, rx, OPTIONS)
     if err then
         if is_pcre1() then
             failed(err, rx)
-            return false
+            return true
         end
         from, _, err = re_find(text, rx, NO_JIT)
         if err then
             failed(err, rx)
-            return false
+            return true
         end
     end
     return from ~= nil
 end
 
--- The first capture of rx in text, "" when it matched without one, or nil.
+-- The first capture of rx in text, "" when it matched without one (or when
+-- PCRE failed on it: see search()), or nil.
 function _M.capture(rx, text)
     local m, err = re_match(text, rx, OPTIONS)
     if err then
         if is_pcre1() then
             failed(err, rx)
-            return nil
+            return ""
         end
         m, err = re_match(text, rx, NO_JIT)
         if err then
             failed(err, rx)
-            return nil
+            return ""
         end
     end
     if not m then

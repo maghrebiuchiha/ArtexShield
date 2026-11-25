@@ -134,7 +134,8 @@ final class Shield
         $ref = bin2hex(random_bytes(4));
         $enforce = $cfg['mode'] === 'enforce';
         $npath = Util::normPath($path);
-        $exempt = Util::under($path, $cfg['exempt_paths']) || Ip::inNets($ip, $this->allowed);
+        $allowed = Ip::inNets($ip, $this->allowed);
+        $exempt = !$allowed && Util::under($path, $cfg['exempt_paths']);
         $induced = !$cfg['score_induced'] && Util::induced($h);
         $sig = Signatures::get();
         $m = null;
@@ -142,7 +143,15 @@ final class Shield
         $hits = [];
 
         $this->stats['requests']++;
+        // An allowlisted address is never scored. Nor is a request for an exempt
+        // path, but a client blocked for what it did elsewhere stays blocked there too.
+        if ($allowed) {
+            return new Decision('pass', $enforce, 0.0, [], $ref, $ip);
+        }
         if ($exempt) {
+            if ($this->blocked($key, $now)) {
+                return new Decision('block', $enforce, $cfg['block_score'], ['blocklist'], $ref, $ip);
+            }
             return new Decision('pass', $enforce, 0.0, [], $ref, $ip);
         }
         if (!$this->identified($ip)) {

@@ -321,7 +321,8 @@ class Shield:
         ref = secrets.token_hex(4)
         enforce = cfg.mode == "enforce"
         npath = _norm_path(path)
-        exempt = _under(path, self._exempt) or _in_nets(ip, self._allowed)
+        allowed = _in_nets(ip, self._allowed)
+        exempt = not allowed and _under(path, self._exempt)
         induced = not cfg.score_induced and _induced(h)
         m = ASSESSMENT_UA.search(ua)
         hits: List[_Hit] = []
@@ -332,8 +333,14 @@ class Shield:
                 self._export_due = None             # an entry in the block file has expired: one rewrite, not one per request
                 self._want_export()
 
-            # IFF 1: operator allowlists.
+            # IFF 1: operator allowlists. An allowlisted address is never scored.
+            # Nor is a request for an exempt path, but a client blocked for what
+            # it did elsewhere stays blocked there too.
+            if allowed:
+                return Decision("pass", enforce, 0.0, [], ref, ip)
             if exempt:
+                if self._blocked(key, now):
+                    return Decision("block", enforce, cfg.block_score, ["blocklist"], ref, ip)
                 return Decision("pass", enforce, 0.0, [], ref, ip)
 
             # No address that stands for this client alone: scoring it would

@@ -52,7 +52,10 @@ final class Signatures
      * a small fixed stack, and a repeated group over a long text (a 30 KB
      * User-Agent, say) can run it out; then the same pattern runs again
      * without the JIT, which keeps backtracking on the heap. Any other PCRE
-     * failure is logged and counts as no match. */
+     * failure (the backtrack limit, say) is logged and counts as a match: as
+     * no match, text built to exhaust PCRE would carry a payload past the
+     * pattern. The patterns scan in linear time (tests/cost.php), so text a
+     * visitor sends does not get here. */
     public static function search(string $regex, string $text, ?array &$m = null): bool
     {
         $found = preg_match($regex, $text, $m);
@@ -60,8 +63,9 @@ final class Signatures
             $found = preg_match('~(*NO_JIT)' . substr($regex, 1), $text, $m);
         }
         if ($found === false) {
-            error_log('artex-shield: pattern failed (' . preg_last_error_msg() . '): ' . substr($regex, 0, 60));
-            return false;
+            error_log('artex-shield: pattern failed (' . preg_last_error_msg() . '), counted as a match: ' . substr($regex, 0, 60));
+            $m = [];
+            return true;
         }
         return $found === 1;
     }

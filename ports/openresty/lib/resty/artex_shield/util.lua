@@ -53,17 +53,30 @@ function _M.prefixes(entries, field)
     return out
 end
 
+-- Is this path segment a step up, as some server reads it? "..", and also
+-- "..;param" (Tomcat, Jetty and Spring drop the parameter), ".." cut short by
+-- a NUL, and dots and spaces after it, which some servers trim away.
+local function climbs(segment)
+    for _, stop in ipairs({";", "\0"}) do
+        local cut = find(segment, stop, 1, true)
+        if cut then
+            segment = sub(segment, 1, cut - 1)
+        end
+    end
+    return sub(segment, 1, 2) == ".." and not find(segment, "[^. ]")
+end
+
 local function segments_climb(p)
     local text = gsub(_M.decode(p), "\\", "/")
     for segment in (text .. "/"):gmatch("([^/]*)/") do
-        if segment == ".." then
+        if climbs(segment) then
             return true
         end
     end
     return false
 end
 
--- path is one of list or below one, by whole segments, never when it climbs with "..".
+-- path is one of list or below one, by whole segments, never when it climbs (see climbs).
 function _M.under(path, list)
     if not list[1] then
         return false

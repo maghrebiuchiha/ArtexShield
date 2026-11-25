@@ -71,7 +71,7 @@ Only the keys that change decisions. `soft_cap` defaults to 80% of `throttle_sco
 
 In this order; the first that applies decides.
 
-1. **Allowlisted:** path under `exempt_paths` (whole segments, and never a path containing `..` at any decoding depth), or address in `allow_cidrs`. Pass, score 0, no hits.
+1. **Allowlisted:** address in `allow_cidrs`: pass, score 0, no hits. Otherwise, path under `exempt_paths`: whole segments, and never a path that climbs at any decoding depth, where a segment climbs when, cut at its first `;` or NUL, it starts with `..` and holds only dots and spaces (`..`, `..;jsessionid=1`, `...`; not `..x`). If the address is blocked (in either mode): `block`, score = `block_score`, hits `["blocklist"]`, nothing scored. Otherwise pass, score 0, no hits.
 2. **Unidentified:** see above.
 3. **Assessment label:** a User-Agent with `ARTEX-Assessment/<version>`.
    - Matching an engagement's reference, source CIDR and time window: pass, `friendly`, hit `iff:engagement=<REF>`.
@@ -199,4 +199,4 @@ Notes per target:
 
 `pattern_probes` in the vectors checks a translation on the texts where these differ.
 
-Every pattern must run in linear time on hostile input. Before adding one, read the warning at the top of `signatures.py`.
+Every pattern must run in linear time on hostile input. Before adding one, read the warning at the top of `signatures.py`, and give each port's cost test the inputs the reference's has (`tests/test_shield.py`, `Cost`). An engine that can give up on a pattern (PCRE's backtrack and match limits) must count that as a match, never as no match: otherwise text built to make it give up would carry a payload past the pattern. Log it, since with linear patterns it means a bug.

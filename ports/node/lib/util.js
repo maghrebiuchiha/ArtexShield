@@ -33,12 +33,23 @@ function prefixes(entries, field) {
   return out;
 }
 
+/** Is this path segment a step up, as some server reads it? "..", and also
+ * "..;param" (Tomcat, Jetty and Spring drop the parameter), ".." cut short by
+ * a NUL, and dots and spaces after it, which some servers trim away. */
+function climbs(segment) {
+  for (const stop of [";", "\0"]) {
+    const cut = segment.indexOf(stop);
+    if (cut >= 0) segment = segment.slice(0, cut);
+  }
+  return segment.startsWith("..") && segment.replace(/[. ]/g, "") === "";
+}
+
 /** `path` is one of `prefixes` or below one, by whole segments, and never
- * when it climbs with ".." at any depth of encoding. */
+ * when it climbs (see climbs) at any depth of encoding. */
 function under(path, list) {
   if (!list.length) return false;
   const p = (path || "/").replace(/\/{2,}/g, "/");
-  if (decode(p).replace(/\\/g, "/").split("/").includes("..")) return false;
+  if (decode(p).replace(/\\/g, "/").split("/").some(climbs)) return false;
   return list.some((prefix) => p === prefix || p.startsWith(prefix + "/"));
 }
 

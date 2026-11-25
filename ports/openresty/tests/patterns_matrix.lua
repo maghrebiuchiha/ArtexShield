@@ -15,6 +15,12 @@ _M.ATOMS = {"a", "db", "a-", "a.", "/", " ", "\n", "\r\n ", "; ", ";\n", "/*", "
     "backup.", "/wp-config.php.a", "/swagger/", "/admin/", "x.oast", "-.", "curl/", "\195\169", "\196\177",
     "\226\128\168"}
 
+-- Starts of SQL, markup and paths a pattern can almost match, and runs to
+-- follow them: the same lists as the reference's (tests/test_shield.py).
+_M.LEADS = {"'", '"', "' or", "' or 1", "' or true", "' or '", "' )", "' ) or", "' or (", "union select a", "union select 1",
+    "or", "1", "<script", "javascript:", "../", "${", "{{"}
+_M.RUNS = {" ", "\t", "\n", ")", ") ", " )", "(", "1", "'"}
+
 function _M.patterns()
     local sig = signatures.get()
     local out = {}
@@ -45,30 +51,41 @@ function _M.run(budget)
     local out = {slow = {}, failed = {}, jit_stack = 0}
     local patterns = _M.patterns()
     out.count = #patterns
+    local function try(name, rx, what, subject)
+        local _, _, err = ngx.re.find(subject, rx, "ijou")
+        if err then
+            out.jit_stack = out.jit_stack + 1
+            if signatures.is_pcre1() then
+                out.failed[#out.failed + 1] = name .. " on " .. what .. ": " .. err
+            else
+                local _, _, again = ngx.re.find(subject, rx, "iou")
+                if again then
+                    out.failed[#out.failed + 1] = name .. " on " .. what .. ": " .. again
+                end
+            end
+        end
+        if not err or not signatures.is_pcre1() then
+            local took = math.min(seconds(function() signatures.search(rx, subject) end),
+                seconds(function() signatures.search(rx, subject) end))
+            if took >= budget then
+                out.slow[#out.slow + 1] = string.format("%s on %s: %.2f s", name, what, took)
+            end
+        end
+    end
     for _, p in ipairs(patterns) do
         local name, rx = p[1], p[2]
         for _, atom in ipairs(_M.ATOMS) do
             local text = string.rep(atom, math.floor(30000 / #atom))
             for _, subject in ipairs({text, "/" .. text .. "!"}) do
-                local _, _, err = ngx.re.find(subject, rx, "ijou")
-                if err then
-                    out.jit_stack = out.jit_stack + 1
-                    if signatures.is_pcre1() then
-                        out.failed[#out.failed + 1] = name .. " on " .. string.format("%q", atom) .. ": " .. err
-                    else
-                        local _, _, again = ngx.re.find(subject, rx, "iou")
-                        if again then
-                            out.failed[#out.failed + 1] = name .. " on " .. string.format("%q", atom) .. ": " .. again
-                        end
-                    end
-                end
-                if not err or not signatures.is_pcre1() then
-                    local took = math.min(seconds(function() signatures.search(rx, subject) end),
-                        seconds(function() signatures.search(rx, subject) end))
-                    if took >= budget then
-                        out.slow[#out.slow + 1] = string.format("%s on %q: %.2f s", name, atom, took)
-                    end
-                end
+                try(name, rx, string.format("%q", atom), subject)
+            end
+        end
+        -- Something a pattern almost matches, then one long run: a run that two
+        -- quantifiers can share (\s*\)?\s*) is retried split every way, and PCRE
+        -- gives up on it at its match limit.
+        for _, lead in ipairs(_M.LEADS) do
+            for _, run in ipairs(_M.RUNS) do
+                try(name, rx, string.format("%q + %q", lead, run), lead .. string.rep(run, math.floor(30000 / #run)) .. "!")
             end
         end
     end

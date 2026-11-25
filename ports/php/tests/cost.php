@@ -13,6 +13,11 @@ require __DIR__ . '/../artex-shield/autoload.php';
 require __DIR__ . '/check.php';
 
 const BUDGET = 0.25;
+// Starts of SQL, markup and paths a pattern can almost match, and runs to
+// follow them: the same lists as the reference's (tests/test_shield.py).
+const LEADS = ["'", '"', "' or", "' or 1", "' or true", "' or '", "' )", "' ) or", "' or (", 'union select a', 'union select 1',
+    'or', '1', '<script', 'javascript:', '../', '${', '{{'];
+const RUNS = [' ', "\t", "\n", ')', ') ', ' )', '(', '1', "'"];
 const BROWSER = ['User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36',
     'Accept' => 'text/html', 'Accept-Language' => 'en-US'];
 
@@ -63,6 +68,21 @@ check('every pattern scans in linear time, and none fails', function () {
                 }
             }
         }
+        // Something a pattern almost matches, then one long run: a run that two
+        // quantifiers can share (\s*\)?\s*) is retried split every way, and PCRE
+        // gives up on it at its backtrack limit.
+        foreach (LEADS as $lead) {
+            foreach (RUNS as $run) {
+                $subject = $lead . str_repeat($run, intdiv(30000, strlen($run))) . '!';
+                $took = timed(static fn () => Signatures::search($rx, $subject));
+                $python = preg_match($rx, $subject);
+                if ($python === false && preg_last_error() !== PREG_JIT_STACKLIMIT_ERROR) {
+                    $slow[] = "$name on " . json_encode($lead) . ' + ' . json_encode($run) . ': ' . preg_last_error_msg();
+                } elseif ($took >= BUDGET) {
+                    $slow[] = sprintf('%s on %s + %s: %.2f s', $name, json_encode($lead), json_encode($run), $took);
+                }
+            }
+        }
     }
     same([], $slow);
 });
@@ -78,6 +98,7 @@ check('oversized requests are checked quickly', function () {
         '8000-character path' => fn () => $s->check('192.0.2.91', 'GET', '/' . str_repeat('db', 4000) . '!', '', BROWSER),
         '60000-character query' => fn () => $s->check('192.0.2.92', 'GET', '/', str_repeat('a', 60000), BROWSER),
         '20000 query parameters' => fn () => $s->check('192.0.2.93', 'GET', '/', str_repeat('a=b&', 20000), BROWSER),
+        'a quote, then 60000 spaces' => fn () => $s->check('192.0.2.97', 'GET', '/', "q='+or" . str_repeat('+', 60000), BROWSER),
         '8000-character user agent' => fn () => $s->check('192.0.2.94', 'GET', '/', '', ['User-Agent' => str_repeat('Mozilla/5.0 ', 660)]),
         '8000-character referer' => fn () => $s->check('192.0.2.95', 'GET', '/', '', BROWSER + ['Host' => 'shop.example',
             'Referer' => 'https://' . str_repeat('a.', 4000)]),

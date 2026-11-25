@@ -8,6 +8,11 @@ const S = require("../lib/signatures");
 const { Shield } = require("../lib");
 
 const BUDGET = 0.25;
+// Starts of SQL, markup and paths a pattern can almost match, and runs to
+// follow them: the same lists as the reference's (tests/test_shield.py).
+const LEADS = ["'", '"', "' or", "' or 1", "' or true", "' or '", "' )", "' ) or", "' or (", "union select a", "union select 1",
+  "or", "1", "<script", "javascript:", "../", "${", "{{"];
+const RUNS = [" ", "\t", "\n", ")", ") ", " )", "(", "1", "'"];
 const CHROME = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36";
 const BROWSER = { "User-Agent": CHROME, Accept: "text/html", "Accept-Language": "en-US" };
 
@@ -45,6 +50,15 @@ test("every pattern scans in linear time", () => {
         if (took >= BUDGET) slow.push(`${name} on ${JSON.stringify(atom)}: ${took.toFixed(2)} s`);
       }
     }
+    // Something a pattern almost matches, then one long run: a run that two
+    // quantifiers can share (\s*\)?\s*) is retried split every way.
+    for (const lead of LEADS) {
+      for (const run of RUNS) {
+        const subject = lead + run.repeat(Math.floor(30000 / run.length)) + "!";
+        const took = timed(() => rx.test(subject));
+        if (took >= BUDGET) slow.push(`${name} on ${JSON.stringify(lead)} + ${JSON.stringify(run)}: ${took.toFixed(2)} s`);
+      }
+    }
   }
   assert.deepStrictEqual(slow, []);
 });
@@ -58,6 +72,7 @@ test("oversized requests are checked quickly", () => {
     "8000-character path": () => s.check("192.0.2.91", "GET", "/" + "db".repeat(4000) + "!", "", BROWSER),
     "60000-character query": () => s.check("192.0.2.92", "GET", "/", "a".repeat(60000), BROWSER),
     "20000 query parameters": () => s.check("192.0.2.93", "GET", "/", "a=b&".repeat(20000), BROWSER),
+    "a quote, then 60000 spaces": () => s.check("192.0.2.97", "GET", "/", "q='+or" + "+".repeat(60000), BROWSER),
     "8000-character user agent": () => s.check("192.0.2.94", "GET", "/", "", { "User-Agent": "Mozilla/5.0 ".repeat(660) }),
     "8000-character referer": () => s.check("192.0.2.95", "GET", "/", "", { ...BROWSER, Host: "shop.example",
       Referer: "https://" + "a.".repeat(4000) }),

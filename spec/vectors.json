@@ -19342,6 +19342,652 @@
    ]
   },
   {
+   "id": "ExemptPaths/test_a_blocked_client_stays_blocked_on_an_exempt_path#1",
+   "config": {
+    "mode": "enforce",
+    "exempt_paths": [
+     "/static"
+    ]
+   },
+   "steps": [
+    {
+     "at": 0,
+     "request": {
+      "ip": "203.0.113.94",
+      "method": "GET",
+      "path": "/static/app.js",
+      "headers": {
+       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+       "Accept": "text/html",
+       "Accept-Language": "en-US,en;q=0.9"
+      }
+     },
+     "expect": {
+      "action": "pass",
+      "hits": [],
+      "score": 0
+     }
+    },
+    {
+     "at": 0,
+     "request": {
+      "ip": "203.0.113.94",
+      "method": "GET",
+      "path": "/",
+      "headers": {
+       "User-Agent": "sqlmap/1.9"
+      }
+     },
+     "expect": {
+      "action": "block",
+      "hits": [
+       "tool:sqlmap"
+      ],
+      "score": 100
+     }
+    },
+    {
+     "at": 0,
+     "request": {
+      "ip": "203.0.113.94",
+      "method": "GET",
+      "path": "/static/app.js",
+      "headers": {
+       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+       "Accept": "text/html",
+       "Accept-Language": "en-US,en;q=0.9"
+      }
+     },
+     "expect": {
+      "action": "block",
+      "hits": [
+       "blocklist"
+      ],
+      "score": 100
+     }
+    },
+    {
+     "at": 0,
+     "request": {
+      "ip": "203.0.113.95",
+      "method": "GET",
+      "path": "/static/app.js",
+      "headers": {
+       "User-Agent": "sqlmap/1.9"
+      }
+     },
+     "expect": {
+      "action": "pass",
+      "hits": [],
+      "score": 0
+     }
+    }
+   ]
+  },
+  {
+   "id": "ExemptPaths/test_a_blocked_client_stays_blocked_on_an_exempt_path#2",
+   "config": {
+    "exempt_paths": [
+     "/static"
+    ]
+   },
+   "steps": [
+    {
+     "at": 0,
+     "request": {
+      "ip": "203.0.113.94",
+      "method": "GET",
+      "path": "/static/app.js",
+      "headers": {
+       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+       "Accept": "text/html",
+       "Accept-Language": "en-US,en;q=0.9"
+      }
+     },
+     "expect": {
+      "action": "pass",
+      "hits": [],
+      "score": 0
+     }
+    },
+    {
+     "at": 0,
+     "request": {
+      "ip": "203.0.113.94",
+      "method": "GET",
+      "path": "/",
+      "headers": {
+       "User-Agent": "sqlmap/1.9"
+      }
+     },
+     "expect": {
+      "action": "block",
+      "hits": [
+       "tool:sqlmap"
+      ],
+      "score": 100
+     }
+    },
+    {
+     "at": 0,
+     "request": {
+      "ip": "203.0.113.94",
+      "method": "GET",
+      "path": "/static/app.js",
+      "headers": {
+       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+       "Accept": "text/html",
+       "Accept-Language": "en-US,en;q=0.9"
+      }
+     },
+     "expect": {
+      "action": "block",
+      "hits": [
+       "blocklist"
+      ],
+      "score": 100
+     }
+    },
+    {
+     "at": 0,
+     "request": {
+      "ip": "203.0.113.95",
+      "method": "GET",
+      "path": "/static/app.js",
+      "headers": {
+       "User-Agent": "sqlmap/1.9"
+      }
+     },
+     "expect": {
+      "action": "pass",
+      "hits": [],
+      "score": 0
+     }
+    }
+   ]
+  },
+  {
+   "id": "ExemptPaths/test_a_climb_in_another_servers_spelling_is_under_nothing#1",
+   "config": {
+    "mode": "enforce",
+    "exempt_paths": [
+     "/static"
+    ]
+   },
+   "steps": [
+    {
+     "at": 0,
+     "request": {
+      "ip": "203.0.113.92",
+      "method": "GET",
+      "path": "/static/..;/api/items",
+      "headers": {
+       "User-Agent": "sqlmap/1.9"
+      }
+     },
+     "expect": {
+      "action": "block",
+      "hits": [
+       "tool:sqlmap"
+      ],
+      "score": 100
+     }
+    }
+   ]
+  },
+  {
+   "id": "ExemptPaths/test_a_climb_in_another_servers_spelling_is_under_nothing#2",
+   "config": {
+    "mode": "enforce",
+    "exempt_paths": [
+     "/static"
+    ]
+   },
+   "steps": [
+    {
+     "at": 0,
+     "request": {
+      "ip": "203.0.113.92",
+      "method": "GET",
+      "path": "/static/..;jsessionid=1/api",
+      "headers": {
+       "User-Agent": "sqlmap/1.9"
+      }
+     },
+     "expect": {
+      "action": "block",
+      "hits": [
+       "tool:sqlmap"
+      ],
+      "score": 100
+     }
+    }
+   ]
+  },
+  {
+   "id": "ExemptPaths/test_a_climb_in_another_servers_spelling_is_under_nothing#3",
+   "config": {
+    "mode": "enforce",
+    "exempt_paths": [
+     "/static"
+    ]
+   },
+   "steps": [
+    {
+     "at": 0,
+     "request": {
+      "ip": "203.0.113.92",
+      "method": "GET",
+      "path": "/static/%2e%2e;/api",
+      "headers": {
+       "User-Agent": "sqlmap/1.9"
+      }
+     },
+     "expect": {
+      "action": "block",
+      "hits": [
+       "tool:sqlmap"
+      ],
+      "score": 100
+     }
+    }
+   ]
+  },
+  {
+   "id": "ExemptPaths/test_a_climb_in_another_servers_spelling_is_under_nothing#4",
+   "config": {
+    "mode": "enforce",
+    "exempt_paths": [
+     "/static"
+    ]
+   },
+   "steps": [
+    {
+     "at": 0,
+     "request": {
+      "ip": "203.0.113.92",
+      "method": "GET",
+      "path": "/static/..%00/api",
+      "headers": {
+       "User-Agent": "sqlmap/1.9"
+      }
+     },
+     "expect": {
+      "action": "block",
+      "hits": [
+       "tool:sqlmap"
+      ],
+      "score": 100
+     }
+    }
+   ]
+  },
+  {
+   "id": "ExemptPaths/test_a_climb_in_another_servers_spelling_is_under_nothing#5",
+   "config": {
+    "mode": "enforce",
+    "exempt_paths": [
+     "/static"
+    ]
+   },
+   "steps": [
+    {
+     "at": 0,
+     "request": {
+      "ip": "203.0.113.92",
+      "method": "GET",
+      "path": "/static/.../api",
+      "headers": {
+       "User-Agent": "sqlmap/1.9"
+      }
+     },
+     "expect": {
+      "action": "block",
+      "hits": [
+       "tool:sqlmap"
+      ],
+      "score": 100
+     }
+    }
+   ]
+  },
+  {
+   "id": "ExemptPaths/test_a_climb_in_another_servers_spelling_is_under_nothing#6",
+   "config": {
+    "mode": "enforce",
+    "exempt_paths": [
+     "/static"
+    ]
+   },
+   "steps": [
+    {
+     "at": 0,
+     "request": {
+      "ip": "203.0.113.92",
+      "method": "GET",
+      "path": "/static/.. /api",
+      "headers": {
+       "User-Agent": "sqlmap/1.9"
+      }
+     },
+     "expect": {
+      "action": "block",
+      "hits": [
+       "tool:sqlmap"
+      ],
+      "score": 100
+     }
+    }
+   ]
+  },
+  {
+   "id": "ExemptPaths/test_a_climb_in_another_servers_spelling_is_under_nothing#7",
+   "config": {
+    "mode": "enforce",
+    "exempt_paths": [
+     "/static"
+    ]
+   },
+   "steps": [
+    {
+     "at": 0,
+     "request": {
+      "ip": "203.0.113.92",
+      "method": "GET",
+      "path": "/static/..+/api",
+      "headers": {
+       "User-Agent": "sqlmap/1.9"
+      }
+     },
+     "expect": {
+      "action": "block",
+      "hits": [
+       "tool:sqlmap"
+      ],
+      "score": 100
+     }
+    }
+   ]
+  },
+  {
+   "id": "ExemptPaths/test_a_climb_in_another_servers_spelling_is_under_nothing#8",
+   "config": {
+    "mode": "enforce",
+    "exempt_paths": [
+     "/static"
+    ]
+   },
+   "steps": [
+    {
+     "at": 0,
+     "request": {
+      "ip": "203.0.113.92",
+      "method": "GET",
+      "path": "/static/..;",
+      "headers": {
+       "User-Agent": "sqlmap/1.9"
+      }
+     },
+     "expect": {
+      "action": "block",
+      "hits": [
+       "tool:sqlmap"
+      ],
+      "score": 100
+     }
+    }
+   ]
+  },
+  {
+   "id": "ExemptPaths/test_a_climb_in_another_servers_spelling_is_under_nothing#9",
+   "config": {
+    "mode": "enforce",
+    "exempt_paths": [
+     "/static"
+    ]
+   },
+   "steps": [
+    {
+     "at": 0,
+     "request": {
+      "ip": "203.0.113.92",
+      "method": "GET",
+      "path": "/static/%252e%252e;/api",
+      "headers": {
+       "User-Agent": "sqlmap/1.9"
+      }
+     },
+     "expect": {
+      "action": "block",
+      "hits": [
+       "tool:sqlmap"
+      ],
+      "score": 100
+     }
+    }
+   ]
+  },
+  {
+   "id": "ExemptPaths/test_a_climb_in_another_servers_spelling_is_under_nothing#10",
+   "config": {
+    "mode": "enforce",
+    "exempt_paths": [
+     "/static"
+    ]
+   },
+   "steps": [
+    {
+     "at": 0,
+     "request": {
+      "ip": "203.0.113.93",
+      "method": "GET",
+      "path": "/static/app.js;v=2",
+      "headers": {
+       "User-Agent": "sqlmap/1.9"
+      }
+     },
+     "expect": {
+      "action": "pass",
+      "hits": [],
+      "score": 0
+     }
+    },
+    {
+     "at": 0,
+     "request": {
+      "ip": "203.0.113.93",
+      "method": "GET",
+      "path": "/static/..x/a.js",
+      "headers": {
+       "User-Agent": "sqlmap/1.9"
+      }
+     },
+     "expect": {
+      "action": "pass",
+      "hits": [],
+      "score": 0
+     }
+    },
+    {
+     "at": 0,
+     "request": {
+      "ip": "203.0.113.93",
+      "method": "GET",
+      "path": "/static/a..b.css",
+      "headers": {
+       "User-Agent": "sqlmap/1.9"
+      }
+     },
+     "expect": {
+      "action": "pass",
+      "hits": [],
+      "score": 0
+     }
+    },
+    {
+     "at": 0,
+     "request": {
+      "ip": "203.0.113.93",
+      "method": "GET",
+      "path": "/static/.well-known",
+      "headers": {
+       "User-Agent": "sqlmap/1.9"
+      }
+     },
+     "expect": {
+      "action": "pass",
+      "hits": [],
+      "score": 0
+     }
+    },
+    {
+     "at": 0,
+     "request": {
+      "ip": "203.0.113.93",
+      "method": "GET",
+      "path": "/static/x..",
+      "headers": {
+       "User-Agent": "sqlmap/1.9"
+      }
+     },
+     "expect": {
+      "action": "pass",
+      "hits": [],
+      "score": 0
+     }
+    },
+    {
+     "at": 0,
+     "request": {
+      "ip": "203.0.113.93",
+      "method": "GET",
+      "path": "/static/./app.js",
+      "headers": {
+       "User-Agent": "sqlmap/1.9"
+      }
+     },
+     "expect": {
+      "action": "pass",
+      "hits": [],
+      "score": 0
+     }
+    }
+   ]
+  },
+  {
+   "id": "ExemptPaths/test_an_allowlisted_address_is_never_blocked_even_inside_a_blocked_network#1",
+   "config": {
+    "mode": "enforce",
+    "allow_cidrs": [
+     "2001:db8:7:1::/64"
+    ],
+    "exempt_paths": [
+     "/static"
+    ],
+    "v6_escalate_after": 2
+   },
+   "steps": [
+    {
+     "at": 0,
+     "request": {
+      "ip": "2001:db8:7:2::1",
+      "method": "GET",
+      "path": "/",
+      "headers": {
+       "User-Agent": "sqlmap/1.9"
+      }
+     },
+     "expect": {
+      "action": "block",
+      "hits": [
+       "tool:sqlmap"
+      ],
+      "score": 100
+     }
+    },
+    {
+     "at": 0,
+     "request": {
+      "ip": "2001:db8:7:3::1",
+      "method": "GET",
+      "path": "/",
+      "headers": {
+       "User-Agent": "sqlmap/1.9"
+      }
+     },
+     "expect": {
+      "action": "block",
+      "hits": [
+       "tool:sqlmap"
+      ],
+      "score": 100
+     }
+    },
+    {
+     "at": 0,
+     "expect_blocklist": [
+      "2001:db8:7::/56"
+     ]
+    },
+    {
+     "at": 0,
+     "request": {
+      "ip": "2001:db8:7:4::1",
+      "method": "GET",
+      "path": "/static/app.js",
+      "headers": {
+       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+       "Accept": "text/html",
+       "Accept-Language": "en-US,en;q=0.9"
+      }
+     },
+     "expect": {
+      "action": "block",
+      "hits": [
+       "blocklist"
+      ],
+      "score": 100
+     }
+    },
+    {
+     "at": 0,
+     "request": {
+      "ip": "2001:db8:7:1::1",
+      "method": "GET",
+      "path": "/",
+      "headers": {
+       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+       "Accept": "text/html",
+       "Accept-Language": "en-US,en;q=0.9"
+      }
+     },
+     "expect": {
+      "action": "pass",
+      "hits": [],
+      "score": 0
+     }
+    },
+    {
+     "at": 0,
+     "request": {
+      "ip": "2001:db8:7:1::1",
+      "method": "GET",
+      "path": "/static/app.js",
+      "headers": {
+       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+       "Accept": "text/html",
+       "Accept-Language": "en-US,en;q=0.9"
+      }
+     },
+     "expect": {
+      "action": "pass",
+      "hits": [],
+      "score": 0
+     }
+    }
+   ]
+  },
+  {
    "id": "ExemptPaths/test_exemption_stops_at_the_segment_boundary#1",
    "config": {
     "mode": "enforce",

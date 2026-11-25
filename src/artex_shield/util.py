@@ -110,15 +110,26 @@ def _prefixes(entries: Iterable[str], field: str) -> List[str]:
     return out
 
 
+def _climbs(segment: str) -> bool:
+    """Is this path segment a step up, as some server reads it? "..", and also
+    "..;param" (Tomcat, Jetty and Spring drop the parameter), ".." cut short by
+    a NUL, and dots and spaces after it, which some servers trim away."""
+    for stop in (";", "\x00"):
+        cut = segment.find(stop)
+        if cut >= 0:
+            segment = segment[:cut]
+    return segment.startswith("..") and not segment.strip(". ")
+
+
 def _under(path: str, prefixes: List[str]) -> bool:
     """True when `path` is one of `prefixes` or lies below one: whole segments
     only, so "/static" covers "/static/app.js" and not "/static-admin". `path`
     is taken as the app will route it, without decoding it further, and a path
-    that climbs with ".." at any depth of encoding is under nothing."""
+    that climbs (see _climbs) at any depth of encoding is under nothing."""
     if not prefixes:
         return False
     p = re.sub(r"/{2,}", "/", path or "/")
-    if ".." in _decode(p).replace("\\", "/").split("/"):
+    if any(_climbs(segment) for segment in _decode(p).replace("\\", "/").split("/")):
         return False
     return any(p == prefix or p.startswith(prefix + "/") for prefix in prefixes)
 
