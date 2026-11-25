@@ -7,8 +7,8 @@ jobs:
       matrix:
         python-version: ["3.9", "3.11", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install .
@@ -31,8 +31,8 @@ jobs:
       run:
         working-directory: ports/node
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node-version }}
       - name: No runtime dependencies
@@ -52,7 +52,7 @@ jobs:
       run:
         working-directory: ports/php
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
@@ -83,7 +83,7 @@ jobs:
       COMPOSE: docker compose -f ports/php/tests/wordpress/docker-compose.yml
       SMOKE: ports/php/tests/wordpress/smoke.py
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: WordPress, MariaDB and WP-CLI
         run: $COMPOSE up -d --wait wordpress db
       - name: Install WordPress and activate the plugin
@@ -127,7 +127,7 @@ jobs:
       COMPOSE: docker compose -f examples/wordpress/docker-compose.yml
       ARTEX_SHIELD_HONEYTOKEN_SECRET: ci-only-honeytoken-secret
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build the image
         run: docker build -t artex-shield-proxy .
       - name: spec/vectors.json through the proxy, inside the image
@@ -168,8 +168,8 @@ jobs:
       IMAGE: openresty/openresty:${{ matrix.openresty }}
       COMPOSE: docker compose -f ports/openresty/examples/wordpress/docker-compose.yml
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"                    # unicode.lua holds this Python's Unicode data
       - name: patterns.lua and unicode.lua are up to date
