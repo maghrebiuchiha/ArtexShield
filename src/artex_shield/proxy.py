@@ -12,13 +12,17 @@ fed to the shield the way the Python adapters do.
 HTTP/1.1, strictly: requests whose framing is ambiguous (Content-Length and
 Transfer-Encoding together, conflicting lengths, folded headers, bad chunk
 sizes) are refused rather than guessed at, so the proxy cannot be used to
-smuggle a second request past it. Bodies stream in both directions without
-being held in memory. Keep-alive is kept with clients and backend connections
-are reused. WebSocket handshakes are checked like any request, then tunnelled;
-one with a body is refused, and the backend connection of one the backend
-turns down is closed, never reused. With honeytokens set, the first part of
-each request body is read before the request is decided on, and the optional
-client check's script and endpoint are answered by the proxy itself.
+smuggle a second request past it. A request's body is read whole before the
+backend is asked (in memory, then in a temporary file), so a visitor that
+sends slowly holds none of the site's connections; one that sends too slowly
+or too much is cut off, and past max_connections new visitors are answered
+503. Responses stream back without being held. Keep-alive is kept with clients
+and backend connections are reused. WebSocket handshakes are checked like any
+request, then tunnelled; one with a body is refused, and the backend
+connection of one the backend turns down is closed, never reused. With
+honeytokens set, the first part of each request body is read before the
+request is decided on, and the optional client check's script and endpoint are
+answered by the proxy itself.
 """
 from __future__ import annotations
 
@@ -31,12 +35,13 @@ import re
 import signal
 import ssl
 import sys
+import tempfile
 import time
 import urllib.parse
 from collections import deque
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Deque, Dict, List, Mapping, Optional, Tuple
+from typing import Any, AsyncIterator, Awaitable, Callable, Deque, Dict, List, Mapping, Optional, Tuple
 
 from .client_check import tag as client_check_tag
 from .core import Config, Engagement, Shield
@@ -55,7 +60,8 @@ _TOKEN = re.compile(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 _TARGET = re.compile(rb"[\x21-\x7e]+")
 _CHUNK_SIZE = re.compile(rb"[0-9A-Fa-f]{1,16}")
 _READ = 65536
-_REASONS = {400: "Bad Request", 408: "Request Timeout", 405: "Method Not Allowed", 431: "Request Header Fields Too Large",
+_REASONS = {400: "Bad Request", 408: "Request Timeout", 405: "Method Not Allowed", 413: "Content Too Large",
+            431: "Request Header Fields Too Large", 503: "Service Unavailable",
             501: "Not Implemented", 502: "Bad Gateway", 504: "Gateway Timeout", 505: "HTTP Version Not Supported"}
 
 
@@ -83,6 +89,11 @@ class Settings:
     idle_timeout: float = 75.0            # a client's keep-alive connection between requests
     max_header_bytes: int = 65536
     max_idle_backend: int = 32            # pooled backend connections kept open
+    buffer_requests: bool = True          # read a request's whole body before the backend is asked
+    body_buffer_bytes: int = 1048576      # a body is held in memory up to this, past it in a temporary file
+    max_body_bytes: int = 104857600       # larger request bodies are answered 413; 0 for no limit
+    min_body_rate: int = 500              # bytes a second a visitor must average while sending a body; 0: no minimum
+    max_connections: int = 0              # visitors' connections at once, then 503; 0 works it out from the open-file limit
     backend_idle_timeout: float = 4.0     # reuse a pooled connection only this long: under the backend's keep-alive
     access_log: bool = False
     shield: Config = field(default_factory=Config)
@@ -101,6 +112,9 @@ class Settings:
                 raise ValueError(f"{name} must be positive")
         if self.max_header_bytes < 1024:
             raise ValueError("max_header_bytes must be at least 1024")
+        for name in ("body_buffer_bytes", "max_body_bytes", "min_body_rate", "max_connections"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must not be negative")
 
 
 def _host_port(text: str) -> Tuple[str, int]:
@@ -326,9 +340,44 @@ def _framing(head: Head, http10: bool, request: bool) -> Tuple[Optional[int], bo
     return (0 if request else None), False
 
 
-async def _fixed(reader: asyncio.StreamReader, n: int, timeout: float) -> AsyncIterator[bytes]:
+class _Pace:
+    """How long a visitor may take over a request body. Each read may wait
+    read_timeout; all of them together, read_timeout plus a second for every
+    min_rate bytes received (the rule of Apache's mod_reqtimeout), so a body
+    cannot be dripped in to hold a connection open. Only time spent waiting
+    on the visitor counts, not time the backend takes over what was sent."""
+
+    def __init__(self, timeout: float, min_rate: int):
+        self.timeout, self.min_rate, self.waited, self.got = timeout, min_rate, 0.0, 0
+
+    async def read(self, start: Callable[[], Awaitable[bytes]]) -> bytes:
+        budget = self.timeout
+        if self.min_rate:
+            budget = min(budget, self.timeout + self.got / self.min_rate - self.waited)
+        if budget <= 0:
+            raise asyncio.TimeoutError
+        began = time.monotonic()
+        try:
+            data = await asyncio.wait_for(start(), budget)
+        finally:
+            self.waited += time.monotonic() - began
+        self.got += len(data)
+        return data
+
+
+def _waiter(timeout: float, pace: Optional[_Pace]):
+    """Await a read: within `pace` for a visitor's body, else within `timeout`."""
+    if pace is not None:
+        return pace.read
+    return lambda start: asyncio.wait_for(start(), timeout)
+
+
+async def _fixed(reader: asyncio.StreamReader, n: int, timeout: float,
+                 pace: Optional[_Pace] = None) -> AsyncIterator[bytes]:
+    wait = _waiter(timeout, pace)
     while n > 0:
-        data = await asyncio.wait_for(reader.read(min(n, _READ)), timeout)
+        k = min(n, _READ)
+        data = await wait(lambda: reader.read(k))
         if not data:
             raise ConnectionError("connection closed mid-body")
         n -= len(data)
@@ -343,12 +392,14 @@ async def _until_eof(reader: asyncio.StreamReader, timeout: float) -> AsyncItera
         yield data
 
 
-async def _chunked(reader: asyncio.StreamReader, timeout: float, request: bool) -> AsyncIterator[bytes]:
+async def _chunked(reader: asyncio.StreamReader, timeout: float, request: bool,
+                   pace: Optional[_Pace] = None) -> AsyncIterator[bytes]:
     """The data of a chunked body. Trailers are read and dropped."""
     err = (lambda why: ClientError(400, why)) if request else BackendError
+    wait = _waiter(timeout, pace)
     while True:
         try:
-            line = await asyncio.wait_for(reader.readuntil(b"\r\n"), timeout)
+            line = await wait(lambda: reader.readuntil(b"\r\n"))
         except (asyncio.LimitOverrunError, asyncio.IncompleteReadError):
             raise err("malformed chunk") from None
         size = line[:-2].split(b";", 1)[0].strip(b" \t")
@@ -358,27 +409,41 @@ async def _chunked(reader: asyncio.StreamReader, timeout: float, request: bool) 
         if remaining == 0:
             while True:
                 try:
-                    trailer = await asyncio.wait_for(reader.readuntil(b"\r\n"), timeout)
+                    trailer = await wait(lambda: reader.readuntil(b"\r\n"))
                 except (asyncio.LimitOverrunError, asyncio.IncompleteReadError):
                     raise err("malformed trailer") from None
                 if trailer == b"\r\n":
                     return
         while remaining:
-            data = await asyncio.wait_for(reader.read(min(remaining, _READ)), timeout)
+            k = min(remaining, _READ)
+            data = await wait(lambda: reader.read(k))
             if not data:
                 raise ConnectionError("connection closed mid-chunk")
             remaining -= len(data)
             yield data
-        if await asyncio.wait_for(reader.readexactly(2), timeout) != b"\r\n":
+        if await wait(lambda: reader.readexactly(2)) != b"\r\n":
             raise err("chunk not followed by CRLF")
 
 
-async def _from_client(body: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+async def _from_client(body: AsyncIterator[bytes], limit: int) -> AsyncIterator[bytes]:
+    """A visitor's request body, at most `limit` bytes (0: no limit)."""
+    size = 0
     try:
         async for data in body:
+            size += len(data)
+            if limit and size > limit:
+                raise ClientError(413, f"a request body over max_body_bytes ({limit})")
             yield data
     except asyncio.TimeoutError:
-        raise ClientError(408, "request body timed out") from None
+        raise ClientError(408, "request body too slow") from None
+
+
+async def _spooled(spool) -> AsyncIterator[bytes]:
+    while True:
+        data = spool.read(_READ)
+        if not data:
+            return
+        yield data
 
 
 async def _prefetch(body: AsyncIterator[bytes], limit: int) -> Tuple[List[bytes], bool]:
@@ -476,6 +541,22 @@ class Backend:
 
 
 # ---- the proxy ---------------------------------------------------------------------
+def _connection_cap(settings: Settings) -> int:
+    """max_connections, or when that is 0 what the open-file limit allows: a
+    visitor's connection can hold one to the backend as well, and the pool and
+    the process need some files of their own."""
+    if settings.max_connections:
+        return settings.max_connections
+    try:
+        import resource
+        soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    except (ImportError, OSError, ValueError):
+        return 512
+    if soft == resource.RLIM_INFINITY:
+        return 10000
+    return max(16, min(10000, (soft - 64 - settings.max_idle_backend) // 2))
+
+
 class Proxy:
     def __init__(self, settings: Settings, shield: Optional[Shield] = None):
         self.settings = settings
@@ -486,6 +567,8 @@ class Proxy:
         self.waiting: Dict[asyncio.Task, asyncio.StreamWriter] = {}     # connections between requests
         self.linger: set = set()                                            # writers to close gently
         self.stopping = False
+        self.max_connections = _connection_cap(settings)
+        self._busy_logged = float("-inf")
 
     async def start(self, host: Optional[str] = None, port: Optional[int] = None) -> asyncio.AbstractServer:
         self.server = await asyncio.start_server(
@@ -511,6 +594,8 @@ class Proxy:
 
     # -- one client connection: requests one after another ---------------------------------
     async def _connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if len(self.connections) >= self.max_connections:
+            return await self._busy(writer)
         task = asyncio.current_task()
         self.connections.add(task)
         peer = (writer.get_extra_info("peername") or ("",))[0] or ""
@@ -548,6 +633,22 @@ class Proxy:
                     await self._linger(reader, writer)
             _close(writer)
             self.connections.discard(task)
+
+    async def _busy(self, writer: asyncio.StreamWriter) -> None:
+        """Past max_connections: a 503, and the connection closed, unread."""
+        now = time.monotonic()
+        if now - self._busy_logged >= 60:
+            self._busy_logged = now
+            log.warning("max_connections (%d) reached: new connections are answered 503", self.max_connections)
+        body = b"503 Service Unavailable\n"
+        try:
+            writer.write(b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                         b"Content-Length: %d\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n%s" % (len(body), body))
+            await asyncio.wait_for(writer.drain(), 5)
+        except (OSError, asyncio.TimeoutError):
+            pass
+        finally:
+            _close(writer)
 
     async def _error(self, writer: asyncio.StreamWriter, status: int, why: str) -> None:
         """Answer and mark the connection for closing; _connection lingers before it closes.
@@ -594,6 +695,8 @@ class Proxy:
         http10 = version == "HTTP/1.0"
         length, chunked = _framing(head, http10, request=True)
         has_body = chunked or bool(length)
+        if s.max_body_bytes and length and length > s.max_body_bytes:
+            raise ClientError(413, f"a request body over max_body_bytes ({s.max_body_bytes})")
         conn = head.tokens("connection")
         keep = ("keep-alive" in conn) if http10 else ("close" not in conn)
         upgrade = "upgrade" in conn and any(t == "websocket" for t in head.tokens("upgrade")) and method == "GET"
@@ -620,8 +723,9 @@ class Proxy:
 
         ip = shield.client_ip(peer, h.get("x-forwarded-for"))
         started = time.perf_counter()
-        upload = _from_client(_chunked(reader, s.read_timeout, True) if chunked else _fixed(reader, length, s.read_timeout)) \
-            if has_body else None
+        pace = _Pace(s.read_timeout, s.min_body_rate)
+        upload = _from_client(_chunked(reader, s.read_timeout, True, pace) if chunked else
+                              _fixed(reader, length, s.read_timeout, pace), s.max_body_bytes) if has_body else None
         continued = "100-continue" in head.tokens("expect") and has_body and not http10
         prefix, limit = None, shield.cfg.honeytoken_body_limit
         if upload is not None and shield.cfg.honeytokens and limit:
@@ -658,52 +762,77 @@ class Proxy:
             writer.write(b"HTTP/1.1 100 Continue\r\n\r\n")      # the backend is not asked: the shield said yes
             await writer.drain()
 
-        forward = self._forward_head(head, method, target, peer, trusted, h, length, chunked, upgrade)
-        if upgrade:
-            return await self._tunnel(forward, reader, writer, peer, ip, path, d, method, target, started)
+        spool = None
+        try:
+            if upload is not None and s.buffer_requests:
+                # The whole body first, then the backend: a visitor that sends
+                # slowly holds a connection of the proxy's, never one of the site's.
+                spool, length = await self._buffer(upload)
+                upload, chunked = _spooled(spool), False
+            forward = self._forward_head(head, method, target, peer, trusted, h, length, chunked, upgrade)
+            if upgrade:
+                return await self._tunnel(forward, reader, writer, peer, ip, path, d, method, target, started)
 
-        retry = method in IDEMPOTENT and not has_body
-        for attempt in (1, 2):
-            bw, reused = None, False
-            try:
-                br, bw, reused = await self.backend.acquire()
-                bw.write(forward)
-                await _send(bw, upload, chunked)
-                response = await self.backend.read_head(br)
-                break
-            except ConnectionError as e:
+            retry = method in IDEMPOTENT and not has_body
+            for attempt in (1, 2):
+                bw, reused = None, False
+                try:
+                    br, bw, reused = await self.backend.acquire()
+                    bw.write(forward)
+                    await _send(bw, upload, chunked)
+                    response = await self.backend.read_head(br)
+                    break
+                except ConnectionError as e:
+                    _close(bw)
+                    if reused and retry and attempt == 1:
+                        continue                                    # a pooled connection the backend had closed
+                    await self._error(writer, 502, str(e) or "backend closed the connection")
+                    return False
+                except asyncio.TimeoutError:                       # before OSError: from 3.11 it is one
+                    _close(bw)
+                    await self._error(writer, 504, "backend did not answer in time")
+                    return False
+                except (BackendError, OSError) as e:
+                    _close(bw)
+                    await self._error(writer, 502, str(e) or "backend error")
+                    return False
+                except ClientError:
+                    _close(bw)
+                    raise
+            while response.first[1].startswith("1") and response.first[1] != "101":   # interim responses
+                if response.first[1] != "100" and not http10:
+                    writer.write(self._head_bytes(response, []))
+                    await writer.drain()
+                try:
+                    response = await self.backend.read_head(br)
+                except (BackendError, ConnectionError, asyncio.TimeoutError):
+                    _close(bw)
+                    await self._error(writer, 502, "backend failed after an interim response")
+                    return False
+            if response.first[1] == "101":
                 _close(bw)
-                if reused and retry and attempt == 1:
-                    continue                                    # a pooled connection the backend had closed
-                await self._error(writer, 502, str(e) or "backend closed the connection")
+                await self._error(writer, 502, "backend switched protocols unasked")
                 return False
-            except asyncio.TimeoutError:                       # before OSError: from 3.11 it is one
-                _close(bw)
-                await self._error(writer, 504, "backend did not answer in time")
-                return False
-            except (BackendError, OSError) as e:
-                _close(bw)
-                await self._error(writer, 502, str(e) or "backend error")
-                return False
-            except ClientError:
-                _close(bw)
-                raise
-        while response.first[1].startswith("1") and response.first[1] != "101":   # interim responses
-            if response.first[1] != "100" and not http10:
-                writer.write(self._head_bytes(response, []))
-                await writer.drain()
-            try:
-                response = await self.backend.read_head(br)
-            except (BackendError, ConnectionError, asyncio.TimeoutError):
-                _close(bw)
-                await self._error(writer, 502, "backend failed after an interim response")
-                return False
-        if response.first[1] == "101":
-            _close(bw)
-            await self._error(writer, 502, "backend switched protocols unasked")
-            return False
-        return await self._respond(response, br, bw, writer, method, version, keep, peer, ip, target, path, d,
-                                   started)
+            return await self._respond(response, br, bw, writer, method, version, keep, peer, ip, target, path, d,
+                                       started)
+        finally:
+            if spool is not None:
+                spool.close()
+
+    async def _buffer(self, upload: AsyncIterator[bytes]) -> Tuple[Any, int]:
+        """A request's whole body and its size: in memory up to body_buffer_bytes,
+        past that in a temporary file (deleted when closed)."""
+        spool = tempfile.SpooledTemporaryFile(max_size=max(1, self.settings.body_buffer_bytes))
+        size = 0
+        try:
+            async for data in upload:
+                spool.write(data)
+                size += len(data)
+            spool.seek(0)
+        except BaseException:
+            spool.close()
+            raise
+        return spool, size
 
     async def _client_check(self, route, writer, method, query, h, ip, trusted, keep, peer, target, d,
                             started) -> bool:
@@ -910,8 +1039,9 @@ async def serve(settings: Settings) -> None:
     await proxy.start()
     for sock in proxy.server.sockets:
         host, port = sock.getsockname()[:2]
-        log.warning("artex-shield-proxy listening on %s:%s, forwarding to %s, mode %s",
-                    f"[{host}]" if ":" in host else host, port, settings.backend, settings.shield.mode)
+        log.warning("artex-shield-proxy listening on %s:%s, forwarding to %s, mode %s, up to %d connections",
+                    f"[{host}]" if ":" in host else host, port, settings.backend, settings.shield.mode,
+                    proxy.max_connections)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):

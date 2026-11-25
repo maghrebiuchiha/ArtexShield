@@ -312,6 +312,11 @@ Every setting has an environment variable named `ARTEX_SHIELD_` plus the setting
 | `backend_idle_timeout` | 4 s | How long an idle backend connection is reused. Keep it below the backend's own keep-alive timeout |
 | `max_idle_backend` | 32 | Idle backend connections kept open |
 | `max_header_bytes` | 65536 | Larger request heads are answered 431 |
+| `buffer_requests` | true | Read a request's whole body before the site is asked. `false` streams bodies to the site as they arrive, for a site that needs that, and gives up the protection below |
+| `body_buffer_bytes` | 1048576 | A body is held in memory up to this size, past it in a temporary file (in `TMPDIR`) |
+| `max_body_bytes` | 104857600 | Larger request bodies are answered 413. `0` for no limit |
+| `min_body_rate` | 500 | Bytes a second a visitor must average while sending a body: it gets `read_timeout`, plus a second for every 500 bytes it has sent. Slower is answered 408. `0` for no minimum |
+| `max_connections` | automatic | Visitors' connections at once; past it, new ones are answered 503 with `Retry-After`. `0`, the default, takes half the open-file limit (`ulimit -n`), up to 10,000 |
 | `access_log` | false | One line per request on stderr |
 
 Under `[shield]` goes any `Config` field from "Scoring" and the sections above (`mode`, `trusted_proxies`, `exempt_paths`, `allow_cidrs`, the thresholds, `client_check` and its settings, and the rest). Two more make decoys from a secret you keep: `canary_secret` (and `canary_count`, default 3) for canary paths, and `honeytoken_secret` (and `honeytoken_count`, default 2) for credential honeytokens. Authorised assessments are `[[shield.engagements]]` tables with `reference`, `cidrs`, `start` and `end`. Events go to stderr as JSON lines, as from the middleware.
@@ -321,7 +326,9 @@ A site behind the proxy may not be written in Python, so it cannot call the help
 ### What it does with HTTP
 
 - **Client addresses.** From an untrusted peer, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host` and `Forwarded` are thrown away and replaced: the site receives the peer's address and `http`. From a peer in `trusted_proxies` they are kept, and the peer is appended to `X-Forwarded-For`.
-- **Bodies stream both ways**, sized or chunked, and are never held whole in memory. There are two exceptions. An answer of 64 KiB or less with a `Content-Length` is sent out together with its head. With honeytokens set, the first `honeytoken_body_limit` bytes (64 KiB) of a request body are read before the shield decides; the rest then streams. `Expect: 100-continue` is answered by the proxy once the shield has allowed the request, or, with honeytokens set and a body coming, before reading it. Interim answers such as `103 Early Hints` are passed on.
+- **Request bodies are read whole before the site is asked**, as nginx does by default: in memory up to `body_buffer_bytes`, then in a temporary file that is deleted afterwards. A visitor that sends slowly, on purpose or not, holds a connection of the proxy's and never one of the site's, so a few slow uploads cannot take every PHP or app worker. The site receives the body with a `Content-Length`, even when the visitor sent it chunked. A body sent more slowly than `min_body_rate` is answered 408, one over `max_body_bytes` 413. `buffer_requests = false` streams bodies to the site instead, as they arrive.
+- **Answers stream back**, sized or chunked, and are never held whole; one of 64 KiB or less with a `Content-Length` is sent out together with its head. With honeytokens set, the first `honeytoken_body_limit` bytes (64 KiB) of a request body are read before the shield decides. `Expect: 100-continue` is answered by the proxy once the shield has allowed the request, or, with honeytokens set and a body coming, before reading it. Interim answers such as `103 Early Hints` are passed on.
+- **Too many visitors at once.** Past `max_connections`, a new connection is answered 503 with `Retry-After: 5` and closed, and the log says so once a minute.
 - **The client check**, when on, is answered by the proxy: it serves the script at `/_artex/check.js` and the check at `/_artex/check`, and neither reaches the site. The cookie is marked `Secure` when a trusted proxy in front says the visitor used HTTPS. Each answer's `Content-Type` is passed to the shield, which is how it knows which clients were served HTML pages. Put the tag on your pages (see `--print-decoys`) and set `client_check_secret`, so cookies survive a restart.
 - **Keep-alive.** Visitors' connections are kept open between requests, and pipelined requests are answered in order, each checked by the shield. Connections to the site are pooled. A `GET`, `HEAD` or other idempotent request without a body, sent on a pooled connection the site had just closed, is retried once on a new one. A `POST` never is.
 - **WebSockets.** The handshake is checked like any other request. After the site answers `101`, bytes pass both ways untouched; messages on the socket are not inspected.
@@ -336,15 +343,16 @@ Measured with `python examples/bench_proxy.py` on a 4-vCPU cloud container with 
 
 | | Straight to the site, p50 | Through the proxy, p50 | Added, p50 | Through the proxy, p99 |
 | --- | --- | --- | --- | --- |
-| One request at a time | 0.09–0.10 ms | 0.45–0.56 ms | **0.36–0.45 ms** | 1.1–1.6 ms |
-| 32 connections at once | 0.7–1.1 ms | 6.6–10 ms | 6–9 ms, queueing | 10–17 ms |
+| One request at a time | 0.08–0.10 ms | 0.38–0.44 ms | **0.30–0.35 ms** | 0.8–1.0 ms |
+| 32 connections at once | 0.8–1.2 ms | 7.4–7.8 ms | 6.4–7.0 ms, queueing | 12.5–15 ms |
 
-One proxy process handled 3,400–4,600 requests a second on that machine. Below that rate it adds about 0.4 ms to a request; above it, requests queue, as the 32-connection row shows. About 120 µs of each request is the shield's own decision, and the rest is HTTP handling in Python.
+One proxy process handled 3,700–4,100 requests a second on that machine. Below that rate it adds about 0.3 ms to a request; above it, requests queue, as the 32-connection row shows. About 120 µs of each request is the shield's own decision, and the rest is HTTP handling in Python. A request with a body also waits for the body to arrive whole before the site is asked (see `buffer_requests`).
 
 ### Limits of the proxy
 
 - **One process.** Scores and blocks live in that process's memory and are lost on restart. Set `blocklist_export_path` to keep blocks at your edge as well (see "Pushing blocks to the edge"). Several proxy processes would each keep their own scores; see "Limits".
 - **HTTP/1.1 to the site.** The proxy does not terminate TLS and does not speak HTTP/2; the terminator in front of it does both.
+- **Connections, not addresses.** `max_connections` is one limit for everyone: a client that opens enough connections fills it, and new visitors get 503 until those close. Each must still send a request head within `idle_timeout`, and a body at `min_body_rate`, but one address is not held to a share. Limit connections per address in the firewall or the terminator in front if that matters to you.
 
 ## Node.js and Express
 

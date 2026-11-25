@@ -14,6 +14,11 @@ listen = "0.0.0.0:8080"             # also "[::]:8080", or a bare port
 # backend_idle_timeout = 4.0        # keep below the backend's own keep-alive timeout
 # max_idle_backend = 32
 # max_header_bytes = 65536
+# buffer_requests = true            # read a request's whole body before the site is asked
+# body_buffer_bytes = 1048576       # held in memory up to this, then in a temporary file (TMPDIR)
+# max_body_bytes = 104857600        # larger bodies are answered 413; 0 for no limit
+# min_body_rate = 500               # bytes a second a visitor must average while sending a body; 0: no minimum
+# max_connections = 0               # visitors' connections at once, then 503; 0: half the open-file limit
 # access_log = false                # one line per request on stderr
 
 [shield]
