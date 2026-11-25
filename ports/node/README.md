@@ -4,6 +4,8 @@ Detection and blocking of [ARTEX](https://github.com/BaaRai/ARTEX)-style automat
 
 This is a port of the Python package in this repository, which is the reference. Both are held to the same cases, `spec/vectors.json`, and the same rules, `spec/SPEC.md`. The main [README](../../README.md) explains what the shield looks for, how scoring works, and its limits. This page covers what is specific to Node.
 
+It is not on npm. Install it from a copy of this repository: `npm install /path/to/ArtexShield/ports/node`. That gives your app `require("artex-shield")`.
+
 ## Express
 
 ```js

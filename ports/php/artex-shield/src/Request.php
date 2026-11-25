@@ -6,9 +6,7 @@
  */
 declare(strict_types=1);
 
-namespace ArtexShield\WordPress;
-
-use ArtexShield\Py;
+namespace ArtexShield;
 
 final class Request
 {

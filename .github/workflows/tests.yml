@@ -12,7 +12,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install .
-      - run: python -W error -m unittest discover -s tests
+      - name: The tests, every case in spec/vectors.json and the READMEs' setup steps among them
+        run: python -W error -m unittest discover -s tests
       - name: spec/vectors.json matches the test suite
         run: python spec/export_vectors.py --check
       - run: python examples/simulate.py
@@ -57,7 +58,7 @@ jobs:
           php-version: ${{ matrix.php }}
           coverage: none
       - name: Every file parses
-        run: find artex-shield tests -name '*.php' -print0 | xargs -0 -n1 php -l
+        run: find artex-shield examples tests -name '*.php' -print0 | xargs -0 -n1 php -l
       - name: spec/vectors.json, state in memory
         run: php tests/vectors.php
       - name: spec/vectors.json, state in files
@@ -68,6 +69,8 @@ jobs:
         run: php tests/cost.php
       - name: The plugin's request path and settings
         run: php tests/plugin.php
+      - name: Any PHP site, through auto_prepend_file
+        run: php tests/prepend.php
 
   wordpress:
     name: WordPress plugin (${{ matrix.tag }})
@@ -191,6 +194,19 @@ jobs:
           python3 ports/openresty/tests/smoke.py
       - name: No pattern failed and no worker crashed
         run: if docker logs smoke 2>&1 | grep -E 'pattern failed|exited on signal|\[(error|crit|alert|emerg)\]'; then exit 1; fi
+      - name: A static site, served by OpenResty (examples/static.conf)
+        env:
+          ARTEX_SHIELD_CANARY_SECRET: ci-only-canary-secret
+        run: |
+          docker run -d --name static -p 8085:8080 -e ARTEX_SHIELD_MODE=enforce -e ARTEX_SHIELD_CANARY_SECRET \
+            -e ARTEX_SHIELD_TRUSTED_PROXIES=172.16.0.0/12 \
+            -v "$PWD/ports/openresty/lib:/opt/artex-shield/lib:ro" \
+            -v "$PWD/ports/openresty/examples/artex_settings.lua:/opt/artex-shield/artex_settings.lua:ro" \
+            -v "$PWD/ports/openresty/examples/static.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro" \
+            -v "$PWD/ports/openresty/tests/static-site:/var/www/site:ro" $IMAGE
+          for i in $(seq 1 40); do curl -s -o /dev/null http://127.0.0.1:8085/_artex/health && break; sleep 0.5; done
+          python3 ports/openresty/tests/static.py http://127.0.0.1:8085
+          if docker logs static 2>&1 | grep -E 'pattern failed|exited on signal|\[(error|crit|alert|emerg)\]'; then exit 1; fi
       - name: WordPress behind OpenResty, in enforce mode
         if: matrix.openresty == '1.27.1.2-bookworm-fat'
         env:
@@ -219,5 +235,5 @@ jobs:
       - name: Clean up
         if: always()
         run: |
-          docker rm -f harness smoke || true
+          docker rm -f harness smoke static || true
           $COMPOSE down -v || true

@@ -99,6 +99,10 @@ docker compose -f ports/openresty/examples/wordpress/docker-compose.yml run --rm
 
 `examples/nginx.conf` is its configuration, and a starting point for your own.
 
+### A static site
+
+`examples/static.conf` serves a directory of files with the shield in front, and needs nothing behind nginx. nginx's own 404s for missing files go back to the shield, so a client guessing paths is scored as it would be in front of an app. Missing images, styles and scripts cost a visitor nothing, as everywhere. Install it as `nginx.conf` next to `mime.types`, with the site in `/var/www/site`. CI runs it in enforce mode with `tests/static.py`.
+
 ## What it does with a request
 
 - **The request as sent.** The path comes from the request line the client sent, percent-decoded once, as the reference's servers decode it. nginx's own `$uri` has already resolved `..`, which would hide a traversal. The query is passed on as sent.
@@ -168,7 +172,7 @@ Two more suites run against real nginx, started with `openresty -c tests/nginx/<
   - hostile header text read in linear time;
   - every pattern on the 30 KB hostile inputs, inside nginx with the JIT stack `configure()` sets.
 
-CI runs all of them on OpenResty 1.21.4.3 (PCRE1) and 1.27.1.2 (PCRE2), and WordPress behind OpenResty (`examples/wordpress/`) in enforce mode on 1.27.
+CI runs all of them on OpenResty 1.21.4.3 (PCRE1) and 1.27.1.2 (PCRE2), with `examples/static.conf` serving a static site (`tests/static.py`), and WordPress behind OpenResty (`examples/wordpress/`) in enforce mode on 1.27.
 
 ## Porting notes
 

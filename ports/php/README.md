@@ -1,6 +1,6 @@
 # artex-shield for PHP and WordPress
 
-`artex-shield/` is a WordPress plugin, and inside it a dependency-free PHP port of the shield (`src/`, namespace `ArtexShield`). It needs PHP 8.1 or newer.
+`artex-shield/` is a WordPress plugin, and inside it a dependency-free PHP port of the shield (`src/`, namespace `ArtexShield`). It needs PHP 8.1 or newer. Any other PHP site can run the same shield before every script with `examples/prepend.php` (see "Any other PHP site").
 
 This is a port of the Python package in this repository, which is the reference. Both are held to the same cases, `spec/vectors.json`, and the same rules, `spec/SPEC.md`. The main [README](../../README.md) explains what the shield looks for, how scoring works, and its limits. This page covers what is specific to PHP and WordPress.
 
@@ -53,19 +53,61 @@ Measured on a 4-vCPU cloud container with PHP 8.3, for a first-seen visitor with
 
 The first request a PHP worker serves also compiles the patterns, about 2 ms. Run `build.php` after changing them, and OPcache keeps the translated patterns (`artex-shield/patterns.php`) in memory. Object cache cost depends on the backend: one get and one set per request.
 
-## Using the shield without WordPress
+## Any other PHP site
+
+`examples/prepend.php` runs the shield before every script, through PHP's `auto_prepend_file`. The site's code does not change. Point the setting at it, in `php.ini`, a `.user.ini` in the document root, or the PHP-FPM pool:
+
+```ini
+auto_prepend_file = /opt/artex-shield/examples/prepend.php
+; PHP-FPM pool:  php_admin_value[auto_prepend_file] = /opt/artex-shield/examples/prepend.php
+; Apache:        php_value auto_prepend_file /opt/artex-shield/examples/prepend.php
+```
+
+**Settings.** It reads its settings from `ARTEX_SHIELD_*` environment variables, or you can edit the array at its top:
+
+| Variable | Setting |
+| --- | --- |
+| `ARTEX_SHIELD_MODE` | `monitor` (the default) or `enforce` |
+| `ARTEX_SHIELD_SECRET` | a long random string you keep; it decides the canaries, the fake credentials and the client check's key |
+| `ARTEX_SHIELD_TRUSTED_PROXIES`, `ARTEX_SHIELD_ALLOW_CIDRS`, `ARTEX_SHIELD_EXEMPT_PATHS` | lists, separated by commas or spaces |
+| `ARTEX_SHIELD_CLIENT_CHECK` | `1` to turn on the client check |
+| `ARTEX_SHIELD_DATA_DIR` | where scores and blocks are kept, shared by every PHP worker; by default a directory in the system's temporary directory |
+
+PHP-FPM passes the environment on with `clear_env = no`, or with an `env[ARTEX_SHIELD_MODE] = enforce` line per variable in the pool.
+
+**What it does.** As the plugin does:
+
+- It decides on each request before the site's code runs, and answers stopped ones itself.
+- It feeds back the status the site answered with when the script ends, and answers the client check's own paths.
+- A setting it cannot use goes to the PHP error log, and the site carries on. The command line (cron jobs, `artisan`, `drush`) is left alone.
+
+**What it sees.** Only requests PHP handles:
+
+- With a front controller (Laravel, Symfony, Drupal, most frameworks), that is every request. Files the web server serves itself never reach PHP, so their 404s are not counted.
+- The client check's script ends in `.js`, so it needs a server that sends missing paths to the front controller, as `try_files $uri $uri/ /index.php` does.
+
+**What to plant.** Print it with the same secret:
+
+```bash
+ARTEX_SHIELD_SECRET='...' php /opt/artex-shield/examples/decoys.php
+```
+
+`tests/prepend.php` runs all of this under PHP's built-in server, with `auto_prepend_file` set.
+
+**From your own code.** `ArtexShield\Guard::protect($shield)` is what both the plugin and `prepend.php` call. To decide and answer yourself:
 
 ```php
 require 'artex-shield/autoload.php';
 
 $shield = new ArtexShield\Shield(['mode' => 'monitor', 'trusted_proxies' => ['10.0.0.0/8']],
     new ArtexShield\Store\FileStore('/var/lib/artex-shield'));
-$ip = $shield->clientIp($_SERVER['REMOTE_ADDR'], $_SERVER['HTTP_X_FORWARDED_FOR'] ?? null);
-$d = $shield->check($ip, $_SERVER['REQUEST_METHOD'], $path, $query, $headers);   // ->action, ->stop(), ->hits, ->ref
-// ... after the response: $shield->observe($ip, $path, $status, $d->induced, $contentType);
+$request = ArtexShield\Request::fromGlobals($_SERVER);            // read as the plugin reads it
+$ip = $shield->clientIp($request->peer, $request->headers['x-forwarded-for'] ?? null);
+$d = $shield->check($ip, $request->method, $request->path, $request->query, $request->headers);   // ->action, ->stop(), ->hits, ->ref
+// ... after the response: $shield->observe($ip, $request->path, $status, $d->induced, $contentType);
 ```
 
-Settings use the reference's snake_case names (`throttle_score`, `exempt_paths`, ...); unknown names are refused. `ArtexShield\WordPress\Request::fromGlobals($_SERVER)` reads a request the way the plugin does.
+Settings use the reference's snake_case names (`throttle_score`, `exempt_paths`, ...); unknown names are refused.
 
 ## Tests
 
@@ -75,6 +117,7 @@ php tests/vectors.php --files    # the same, every call reading its state back f
 php tests/vectors.php --cache    # the same, through the object-cache store
 php tests/cost.php               # every pattern timed on hostile input
 php tests/plugin.php             # the plugin's request path under php -S, and its settings
+php tests/prepend.php            # examples/prepend.php as auto_prepend_file, in front of a stand-in site
 ```
 
 `tests/plugin.php` runs the plugin in front of a stand-in for WordPress (`tests/wp/`) under PHP's built-in server: stops, 404 feedback, planted decoys, bodies, the client check, proxies and the settings sanitizer.
