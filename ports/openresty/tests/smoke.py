@@ -202,13 +202,22 @@ expect(f"the check answers 204 with a signed cookie ({status})",
 expect("the origin saw neither", origin_saw("198.51.100.60") == 0)
 
 # ---- the admin location ----------------------------------------------------------------------------
-status, _, body = raw(b"GET /_artex/admin HTTP/1.1\r\nHost: shop.example\r\nConnection: close\r\n\r\n")
-listed = [b["network"] for b in json.loads(body).get("blocks", [])] if status == 200 else []
-expect(f"the admin location lists the blocks ({status})", "203.0.113.10" in listed and "203.0.113.20" in listed, body)
+# smoke.conf sets admin_token: without it, or with another, the location answers 401 and lifts nothing.
+TOKEN = b"Authorization: Bearer smoke-admin-token-0123456789\r\n"
 form_body = b"ip=203.0.113.10"
-status, _, body = raw(b"POST /_artex/admin HTTP/1.1\r\nHost: shop.example\r\nConnection: close\r\n"
-                      b"Content-Type: application/x-www-form-urlencoded\r\nContent-Length: %d\r\n\r\n%s"
-                      % (len(form_body), form_body))
+unblock = (b"POST /_artex/admin HTTP/1.1\r\nHost: shop.example\r\nConnection: close\r\n%s"
+           b"Content-Type: application/x-www-form-urlencoded\r\nContent-Length: %d\r\n\r\n%s")
+for label, auth in (("no token", b""), ("another token", b"Authorization: Bearer smoke-admin-token-0123456788\r\n"),
+                    ("a token in the wrong scheme", b"Authorization: Basic smoke-admin-token-0123456789\r\n")):
+    status, headers, body = raw(b"GET /_artex/admin HTTP/1.1\r\nHost: shop.example\r\nConnection: close\r\n%s\r\n" % auth)
+    expect(f"with {label}, the admin location answers 401 ({status})", status == 401 and b"203.0.113" not in body, body)
+    status, _, body = raw(unblock % (auth, len(form_body), form_body))
+    expect(f"and lifts no block ({status})", status == 401, body)
+status, _, body = raw(b"GET /_artex/admin HTTP/1.1\r\nHost: shop.example\r\nConnection: close\r\n%s\r\n" % TOKEN)
+listed = [b["network"] for b in json.loads(body).get("blocks", [])] if status == 200 else []
+expect(f"with admin_token, the admin location lists the blocks ({status})",
+       "203.0.113.10" in listed and "203.0.113.20" in listed, body)
+status, _, body = raw(unblock % (TOKEN, len(form_body), form_body))
 expect(f"and unblocks one ({status})", status == 200 and json.loads(body).get("unblocked") is True, body)
 status, _, _ = fetch("/", "203.0.113.10")
 expect(f"which every worker then lets through ({status})", status == 200)
