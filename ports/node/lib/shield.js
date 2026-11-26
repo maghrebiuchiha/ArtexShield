@@ -54,7 +54,7 @@ class Track {
     this.times = new Ring(history);
     this.notFound = new Ring(512);
     this.slow = new Ring(Math.max(slowBudget, 1));
-    this.missing = new Map();       // missing paths already counted -> last asked for
+    this.missing = new Map();       // missing paths already counted (digests) -> last asked for
     this.soft = new Map();          // soft label -> when it last counted
     this.strikes = 0;
     this.throttledUntil = 0;
@@ -255,9 +255,12 @@ class Shield {
   }
 
   newlyMissing(t, npath, now) {
-    const last = t.missing.get(npath);
-    t.missing.delete(npath);
-    t.missing.set(npath, now);
+    // Keyed by a digest of the path, as in the other ports: kept whole, 128
+    // long paths a client chose would make its track hold megabytes.
+    const k = crypto.createHash("md5").update(npath).digest("hex").slice(0, 16);
+    const last = t.missing.get(k);
+    t.missing.delete(k);
+    t.missing.set(k, now);
     while (t.missing.size > MISSING_MEMORY) t.missing.delete(t.missing.keys().next().value);
     return last === undefined || now - last > this.cfg.halfLife;
   }

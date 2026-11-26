@@ -63,6 +63,18 @@ test("every pattern scans in linear time", () => {
   assert.deepStrictEqual(slow, []);
 });
 
+test("a client's track stays small however long the paths it asks for", () => {
+  // The 404s a client has been told about are remembered by digest, not by
+  // path: 128 paths of 15 KB each must not make its track hold megabytes.
+  const s = new Shield({ enum404Threshold: 1e6, slowEnumBudget: 0, logger: null });    // guessing is not scored here
+  s.check("198.51.100.1", "GET", "/", "", BROWSER);
+  for (let j = 0; j < 200; j += 1) s.observe("198.51.100.1", "/" + String(j).padStart(4, "0") + "a".repeat(15000), 404);
+  const t = s.tracks.get("198.51.100.1");
+  assert.strictEqual(t.missing.size, 128);
+  const held = [...t.missing.keys()].reduce((n, k) => n + k.length, 0);
+  assert.ok(held <= 128 * 16, `${held} characters of keys`);
+});
+
 test("oversized requests are checked quickly", () => {
   const s = new Shield({ mode: "enforce", logger: null });
   const padded = { ...BROWSER };

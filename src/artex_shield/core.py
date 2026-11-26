@@ -11,7 +11,8 @@ import secrets
 import statistics
 import threading
 import time
-from collections import OrderedDict, deque
+from array import array
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -26,6 +27,14 @@ from .util import (_decode, _extension, _file_lock, _hop_ip, _in_nets, _induced,
 
 _Hit = Tuple[str, float, bool]       # label, points, soft?
 _MISSING_MEMORY = 128                # missing paths remembered per client, so repeats are not recounted
+_NOT_FOUND_MEMORY = 512              # newly missing paths' times kept for the enumeration window
+
+
+def _push(times: "array", t: float, cap: int) -> None:
+    """Append to a history, dropping the oldest entries past `cap`."""
+    if len(times) >= cap:
+        del times[:len(times) - cap + 1]
+    times.append(t)
 
 
 @dataclass
@@ -195,17 +204,23 @@ class Decision:
 
 
 class _Track:
-    __slots__ = ("hard", "soft_points", "updated", "times", "not_found", "slow", "missing", "soft", "strikes",
-                 "throttled_until", "page_at", "checked_at", "automation_at")
+    """One client's state. A table holds up to Config.max_tracks of these, and
+    whoever controls a /48 can fill it, so they are kept small: each history
+    is an array of 8-byte times, oldest first, not a deque of float objects.
+    With its entry in the table a track takes about 0.8 KB after one request,
+    and at most about 7 KB (it was 42 KB), so 50,000 take 40 to 350 MB."""
+    __slots__ = ("hard", "soft_points", "updated", "times", "not_found", "slow", "missing_keys", "missing_at",
+                 "soft", "strikes", "throttled_until", "page_at", "checked_at", "automation_at")
 
-    def __init__(self, now: float, history: int = 512, slow_budget: int = 0):
+    def __init__(self, now: float):
         self.hard = 0.0              # points from signals that repeat on every hit
         self.soft_points = 0.0       # points from once-per-half-life signals, capped at Config.soft_cap
         self.updated = now
-        self.times: deque = deque(maxlen=history)       # sized so that the flood limit can be reached
-        self.not_found: deque = deque(maxlen=512)       # when each newly missing path was first asked for
-        self.slow: deque = deque(maxlen=max(slow_budget, 1))        # the same, kept for the hourly allowance
-        self.missing: "OrderedDict[int, float]" = OrderedDict()     # missing paths already counted -> last asked
+        self.times = array("d")      # recent requests; as many as the flood limit needs (Shield._history)
+        self.not_found = array("d")  # when each newly missing path was first asked for
+        self.slow = array("d")       # the same, kept for the hourly allowance (slow_enum_budget of them)
+        self.missing_keys = array("q")   # missing paths already counted (hashes), least recently asked first,
+        self.missing_at = array("d")     # and when each was last asked for
         self.soft: Dict[str, float] = {}
         self.strikes = 0
         self.throttled_until = 0.0
@@ -408,7 +423,7 @@ class Shield:
             self._decay(t, now)
             hits += self._radar(t, now, seen)
             hits += self._client_hits(t, now, checked)
-            t.times.append(now)
+            _push(t.times, now, self._history)
 
             # A throttled client that keeps coming inside Retry-After is not backing off.
             # Only if it was told: in monitor mode nobody sent it a Retry-After.
@@ -451,18 +466,20 @@ class Shield:
             # already counted (polling, a reload, the same dead link on every
             # page) adds nothing, however often it happens.
             if guess and self._newly_missing(t, npath, now):
-                t.not_found.append(now)
+                _push(t.not_found, now, _NOT_FOUND_MEMORY)
                 # The allowance for the longer window: full, and its oldest
                 # entry still inside the window, means this one is past it.
                 if cfg.slow_enum_budget:
-                    if len(t.slow) == t.slow.maxlen and now - t.slow[0] <= cfg.slow_enum_window:
+                    if len(t.slow) == cfg.slow_enum_budget and now - t.slow[0] <= cfg.slow_enum_window:
                         hits.append(("behavior:slow-enumeration", cfg.slow_enum_points, False))
-                    t.slow.append(now)
-            while t.not_found and now - t.not_found[0] > cfg.enum_window:
-                t.not_found.popleft()
+                    _push(t.slow, now, cfg.slow_enum_budget)
+            stale = 0
+            while stale < len(t.not_found) and now - t.not_found[stale] > cfg.enum_window:
+                stale += 1
+            del t.not_found[:stale]
             if len(t.not_found) >= cfg.enum_404_threshold:
                 hits.append(("behavior:path-enumeration", 40.0, False))
-                t.not_found.clear()
+                del t.not_found[:]
             if not hits:
                 return
             self._add(t, hits)
@@ -477,12 +494,20 @@ class Shield:
     def _newly_missing(self, t: _Track, npath: str, now: float) -> bool:
         """True the first time this client is told `npath` does not exist, and
         again only after a half-life without asking for it."""
-        k = hash(npath)
-        last = t.missing.get(k)
-        t.missing[k] = now
-        t.missing.move_to_end(k)
-        while len(t.missing) > _MISSING_MEMORY:
-            t.missing.popitem(last=False)
+        k, last = hash(npath), None
+        try:
+            i = t.missing_keys.index(k)
+        except ValueError:
+            pass
+        else:                                       # asked before: move it to the most recent end
+            last = t.missing_at[i]
+            del t.missing_keys[i]
+            del t.missing_at[i]
+        t.missing_keys.append(k)
+        t.missing_at.append(now)
+        if len(t.missing_keys) > _MISSING_MEMORY:
+            del t.missing_keys[0]
+            del t.missing_at[0]
         return last is None or now - last > self.cfg.half_life
 
     # ---- honeytokens ----------------------------------------------------------
@@ -648,7 +673,7 @@ class Shield:
         recent = [x for x in t.times if now - x <= cfg.rate_window]
         if len(recent) + 1 > cfg.rate_limit:
             hits.append(("behavior:request-flood", 30.0, False))
-            t.times.clear()
+            del t.times[:]
         # Cadence: ARTEX's noise profiles and paced scanners (-rate N) space
         # requests evenly. People and browsers arrive in bursts and pauses.
         elif len(t.times) >= cfg.cadence_samples:
@@ -699,7 +724,7 @@ class Shield:
         self._set_block(key, now + ttl)
         t.hard = t.soft_points = 0.0     # served its sentence when the block expires
         t.throttled_until = 0.0
-        t.not_found.clear()
+        del t.not_found[:]
         self._want_export(self._escalate(key, now))
 
     def _escalate(self, key: str, now: float) -> List[str]:
@@ -829,7 +854,7 @@ class Shield:
     def _track(self, key: str, now: float) -> _Track:
         t = self._tracks.get(key)
         if t is None:
-            t = self._tracks[key] = _Track(now, self._history, self.cfg.slow_enum_budget)
+            t = self._tracks[key] = _Track(now)
             while len(self._tracks) > self.cfg.max_tracks:
                 self._tracks.popitem(last=False)
         else:

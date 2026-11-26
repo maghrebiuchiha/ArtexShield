@@ -1535,6 +1535,30 @@ class Cost(unittest.TestCase):
         for name, fn in cases.items():
             self.assertLess(self.timed(fn), self.BUDGET, name)
 
+    def test_a_track_stays_small_however_it_is_filled(self):
+        # Whoever holds a /48 can make max_tracks of these, so each must stay
+        # small: a full request history, and 200 long missing paths, in a few KB.
+        import sys
+        from collections import deque
+
+        def size(value):
+            n = sys.getsizeof(value)                  # an array's numbers are in its own size
+            if isinstance(value, dict):
+                n += sum(sys.getsizeof(k) + sys.getsizeof(v) for k, v in value.items())
+            elif isinstance(value, (deque, list)):
+                n += sum(sys.getsizeof(v) for v in value)
+            return n
+        s, c = shield(enum_404_threshold=10 ** 6, slow_enum_budget=0)
+        for _ in range(240):
+            c.t += 0.3
+            s.check("192.0.2.150", "GET", "/", headers=BROWSER)
+        for j in range(200):
+            s.observe("192.0.2.150", f"/{j:04d}" + "a" * 15000, 404)
+        t = s._tracks["192.0.2.150"]
+        self.assertEqual(len(t.times), 240)
+        held = sys.getsizeof(t) + sum(size(getattr(t, name)) for name in t.__slots__)
+        self.assertLess(held, 8 * 1024)                   # it was 42 KB as deques and an OrderedDict
+
     def test_request_scanning_does_not_hold_the_lock(self):
         # Decoding and pattern matching depend only on the request. Doing them
         # under the lock would make every other request wait behind a slow one.
