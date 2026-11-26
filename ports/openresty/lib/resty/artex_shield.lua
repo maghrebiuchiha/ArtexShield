@@ -19,6 +19,7 @@
 -- See ports/openresty/README.md.
 
 local core = require "resty.artex_shield.core"
+local crypto = require "resty.artex_shield.crypto"
 local decoys = require "resty.artex_shield.decoys"
 local py = require "resty.artex_shield.py"
 local util = require "resty.artex_shield.util"
@@ -28,11 +29,11 @@ local find, sub, lower, gsub, concat, sort = string.find, string.sub, string.low
 
 local _M = {_VERSION = "1.0.0"}
 
-local shield, honeytoken_set
+local shield, honeytoken_set, admin_token
 
 -- Settings the edge adds to the shield's own, as artex-shield-proxy does.
 local EDGE = {tracks_dict = true, blocks_dict = true, clock = true, canary_secret = true, canary_count = true,
-    honeytoken_secret = true, honeytoken_count = true}
+    honeytoken_secret = true, honeytoken_count = true, admin_token = true}
 
 -- PCRE's JIT keeps its backtracking on a stack that is 32 KB unless told
 -- otherwise, and several patterns need more on a long header or URL: 1 MB
@@ -56,6 +57,7 @@ end
 --   canary_secret, canary_count (3)          derive canary_paths from a secret you keep
 --   honeytoken_secret, honeytoken_count (2)  derive honeytokens from a secret you keep
 --   tracks_dict, blocks_dict                 lua_shared_dict names (artex_shield, artex_shield_blocks)
+--   admin_token                              admin() then wants "Authorization: Bearer <admin_token>"
 function _M.configure(settings)
     settings = settings or {}
     grow_jit_stack()
@@ -81,6 +83,13 @@ function _M.configure(settings)
             list[#list + 1] = v
         end
         options.honeytokens = list
+    end
+    admin_token = nil
+    if edge.admin_token ~= nil then
+        if type(edge.admin_token) ~= "string" or #edge.admin_token < 16 or find(edge.admin_token, "%s") then
+            error("artex-shield: admin_token must be at least 16 characters, with no spaces", 2)
+        end
+        admin_token = edge.admin_token
     end
     shield = core.new(options, {tracks = edge.tracks_dict, blocks = edge.blocks_dict, clock = edge.clock})
     return shield
@@ -350,13 +359,26 @@ function _M.decoys()
     return (gsub(concat(out, "\n"), "%s+$", ""))
 end
 
--- content_by_lua for an admin location you protect (allow/deny, auth):
--- GET lists the active blocks as JSON; POST ip=<address> lifts a block.
+-- content_by_lua for an admin location: GET lists the active blocks as JSON;
+-- POST ip=<address> lifts a block. Serve it from a server of its own that
+-- listens on loopback only: behind a TLS terminator or another proxy on the
+-- same host, every visitor reaches the public server from 127.0.0.1, so an
+-- "allow 127.0.0.1" there lets them all in. With admin_token set, a request
+-- without "Authorization: Bearer <admin_token>" is answered 401.
 function _M.admin()
     local s = _M.shield()
     local cjson = require("cjson.safe").new()
     ngx.header["Content-Type"] = "application/json"
     ngx.header["Cache-Control"] = "no-store"
+    if admin_token then
+        local given = string.match(ngx.var.http_authorization or "", "^[Bb][Ee][Aa][Rr][Ee][Rr] +(%S+) *$")
+        if not given or not crypto.equal(given, admin_token) then
+            ngx.status = 401
+            ngx.header["WWW-Authenticate"] = 'Bearer realm="artex-shield"'
+            ngx.say(cjson.encode({error = "send Authorization: Bearer <admin_token>"}))
+            return ngx.exit(ngx.HTTP_OK)
+        end
+    end
     local method = ngx.req.get_method()
     if method == "POST" then
         ngx.req.read_body()

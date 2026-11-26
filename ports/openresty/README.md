@@ -49,6 +49,7 @@ http {
 | `canary_secret`, `canary_count` (3) | derive `canary_paths` from a secret |
 | `honeytoken_secret`, `honeytoken_count` (2) | add fake credentials derived from a secret to `honeytokens` |
 | `tracks_dict`, `blocks_dict` | name other shared dicts than `artex_shield` and `artex_shield_blocks` |
+| `admin_token` | 16 characters or more: the admin location then answers 401 to a request without `Authorization: Bearer <admin_token>` |
 | `on_event` | a function called with each event, instead of logging it |
 
 **Events.** Each block, throttle and score is logged to nginx's error log at `warn`, one JSON line per event. nginx's default level is `error`, which hides them, so set `error_log ... warn` as above.
@@ -73,17 +74,25 @@ It prints:
 
 ### Blocks, by hand
 
-`require("resty.artex_shield").admin()` answers a location you protect yourself:
+`require("resty.artex_shield").admin()` answers an admin location:
 
 - `GET` lists the active blocks as JSON;
 - `POST ip=<address>` lifts the block on that address.
 
+Serve it from a server of its own that listens on loopback, never from the public one. Behind a TLS terminator, a load balancer or another proxy on the same host, every visitor reaches the public server from 127.0.0.1, so an `allow 127.0.0.1` there would let all of them list your blocks and lift their own. Set `admin_token` as well, and the location answers 401 to any request without `Authorization: Bearer <admin_token>` (compared in constant time). `examples/nginx.conf` does both, and `examples/artex_settings.lua` reads the token from `ARTEX_SHIELD_ADMIN_TOKEN`.
+
 ```nginx
-location = /_artex/admin {
-    allow 127.0.0.1;
-    deny all;
-    content_by_lua_block { require("resty.artex_shield").admin() }
+server {
+    listen 127.0.0.1:8081;                # loopback only, and not the port your proxy forwards to
+
+    location = /_artex/admin {
+        content_by_lua_block { require("resty.artex_shield").admin() }
+    }
 }
+```
+
+```bash
+curl -H "Authorization: Bearer $ARTEX_SHIELD_ADMIN_TOKEN" http://127.0.0.1:8081/_artex/admin
 ```
 
 From Lua, `require("resty.artex_shield").shield()` is the shield, with `blocklist()` and `unblock(ip)`.

@@ -56,6 +56,15 @@ t.check("a setting the reference refuses stops start-up, naming it", function()
     end
 end)
 
+t.check("an admin_token too short to keep anyone out stops start-up", function()
+    for _, bad in ipairs({"short", "sixteen chars w/ spaces", 12345678901234567, ""}) do
+        local ok, err = pcall(edge.configure, {admin_token = bad, on_event = function() end})
+        t.truthy(not ok and tostring(err):find("admin_token", 1, true), tostring(bad))
+    end
+    t.truthy(pcall(edge.configure, {admin_token = "a-long-enough-token-0123", on_event = function() end}))
+    edge.configure({on_event = function() end})
+end)
+
 t.check("stopped requests get the reference's answers", function()
     local r = edge.reply({action = "block", ref = "0123abcd", retry_after = 0})
     t.same({403, "Request blocked. Reference: 0123abcd\n"}, {r.status, r.body})
